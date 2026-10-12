@@ -23,9 +23,14 @@ Android 视频聚合播放器。核心产品逻辑只有一句话：**用户自�
 安装到已连接的设备 / 模拟器：
 
 ```bash
-ADB=/g/android-sdk/platform-tools/adb.exe
-$ADB install -r "app/build/outputs/apk/release/app-release.apk"
-$ADB shell am start -n net.cinehub/.MainActivity
+adb install -r app/build/outputs/apk/release/app-release.apk
+adb shell am start -n net.cinehub/.MainActivity
+```
+
+首次构建前需要在 `local.properties` 里指定 SDK 路径（该文件已 gitignore）：
+
+```properties
+sdk.dir=/path/to/android-sdk
 ```
 
 ### 构建与签名
@@ -55,7 +60,7 @@ keytool -genkeypair -keystore .signing/cinehub-release.jks -alias cinehub \
 
 Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。打包后 2.6 MB，debug 包 26 MB。
 
-> 本机依赖全部来自 `G:\.gradle` 缓存，加 `--offline` 会明显更快。`local.properties` 里已写死 `sdk.dir=G:\android-sdk`。
+如果依赖已经在本地 Gradle 缓存里，加 `--offline` 会明显更快。
 
 
 ---
@@ -191,8 +196,7 @@ val MEDIA_EXT = listOf(".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mpd", ".mov")
 ## 七、在模拟器上手工验证
 
 ```bash
-ADB=/g/android-sdk/platform-tools/adb.exe
-$ADB shell pm clear net.cinehub && $ADB shell am start -n net.cinehub/.MainActivity
+adb shell pm clear net.cinehub && adb shell am start -n net.cinehub/.MainActivity
 ```
 
 两点工具上的坑：
