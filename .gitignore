@@ -1,0 +1,21 @@
+# Gradle / 构建产物
+.gradle/
+build/
+.kotlin/
+local.properties
+.idea/
+*.iml
+.cxx/
+captures/
+
+# Release 签名：私钥与口令绝不入库
+keystore.properties
+.signing/
+*.jks
+*.keystore
+
+# 发布包走 GitHub Releases，不进仓库
+dist/
+
+# 本地过程产物（截图、抓取的页面样本等）
+.scratch/

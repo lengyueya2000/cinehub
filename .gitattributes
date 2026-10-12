@@ -1,0 +1,20 @@
+# gradlew is a shell script: CRLF makes it fail on Linux/macOS with
+# "bad interpreter: /bin/sh^M". Keep it LF everywhere.
+gradlew text eol=lf
+*.sh text eol=lf
+
+# Source and build files: normalize to LF in the repo, whatever the
+# local core.autocrlf happens to be.
+*.kt text eol=lf
+*.kts text eol=lf
+*.xml text eol=lf
+*.pro text eol=lf
+*.properties text eol=lf
+*.md text eol=lf
+
+# Binary assets — git must not touch these bytes.
+*.png binary
+*.jpg binary
+*.jks binary
+*.keystore binary
+*.jar binary

@@ -1,0 +1,88 @@
+package net.cinehub.data.model
+
+/** 媒体条目。同一部片在不同源里 id 不同，聚合后靠 [key] 归并。 */
+data class Media(
+    val id: String,
+    val title: String,
+    val cover: String? = null,
+    val year: String? = null,
+    val category: String? = null,
+    val remark: String? = null,
+    val score: String? = null,
+    val area: String? = null,
+    val actors: String? = null,
+    val director: String? = null,
+    val intro: String? = null,
+    val sourceId: String,
+) {
+    /**
+     * 归并键：标题 + 年份。
+     *
+     * 同一个片名在各源的写法差别很大（「暗影蜘蛛侠 黑白版」/「暗影蜘蛛侠（黑白版）」/
+     * 「暗影蜘蛛侠：黑白版」），所以这里去掉空白与标点再比对，
+     * 否则跨源归并会漏掉本该合并的条目。
+     */
+    val key: String
+        get() = buildString {
+            append(title.filterNot { it.isWhitespace() || it in PUNCT })
+            year?.take(4)?.let { append('|').append(it) }
+        }
+
+    private companion object {
+        /** 归并时忽略的标点：全半角括号、冒号、破折号、顿号等。 */
+        val PUNCT = setOf(
+            '(', ')', '（', '）', '[', ']', '【', '】', ':', '：', '·', '.', '。',
+            '-', '_', '—', '～', '~', '、', '，', ',', '!', '！', '?', '？', '"', '\'',
+        )
+    }
+}
+
+/** 一个可播放的剧集 / 分集。 */
+data class Episode(
+    val name: String,
+    val index: Int,
+    val playUrl: String? = null,
+)
+
+/** 一个源内的一条线路（同一部片的多套地址）。 */
+data class PlayLine(
+    val name: String,
+    val episodes: List<Episode>,
+)
+
+/** 详情：媒体 + 各线路。 */
+data class MediaDetail(
+    val media: Media,
+    val lines: List<PlayLine>,
+    val intro: String? = null,
+) {
+    val episodeCount: Int get() = lines.maxOfOrNull { it.episodes.size } ?: 0
+}
+
+/** 源健康状态。 */
+enum class Health { Ok, Slow, Down, Unknown }
+
+data class HealthReport(
+    val health: Health,
+    val latencyMs: Long? = null,
+    val detail: String? = null,
+    val checkedAt: Long = System.currentTimeMillis(),
+)
+
+/** 跨源聚合后的一条搜索结果：一部片 + 它在各源的可播情况。 */
+data class AggregatedMedia(
+    val media: Media,
+    val availability: List<SourceAvailability>,
+) {
+    val playableCount: Int get() = availability.count { it.health == Health.Ok || it.health == Health.Slow }
+}
+
+data class SourceAvailability(
+    val sourceId: String,
+    val sourceName: String,
+    val item: Media,
+    val health: Health,
+    val quality: String? = null,
+    val latencyMs: Long? = null,
+    val note: String? = null,
+)

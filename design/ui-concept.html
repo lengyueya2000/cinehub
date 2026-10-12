@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>影枢 CineHub · Android 视频聚合播放器 UI 概念稿</title>
+<style>
+  :root{
+    --ink-000:#000000; --ink-050:#08080A; --ink-100:#0C0C0D; --ink-200:#16161A;
+    --ink-300:#1F1F24; --ink-400:#2A2A31; --ink-500:#3A3A44;
+    --snow:#F8FAFC; --snow-dim:#94A3B8; --snow-faint:#5B6474;
+    --play-400:#FB7185; --play-500:#E11D48; --play-600:#BE123C;
+    --src-400:#67E8F9; --src-500:#22D3EE; --src-600:#0891B2;
+    --ok-500:#34D399; --warn-500:#FBBF24; --err-500:#F87171; --gold:#F5C451;
+
+    --bg:var(--ink-000); --surface:var(--ink-100); --surface-2:var(--ink-200); --surface-3:var(--ink-300);
+    --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.15);
+    --text:var(--snow); --text-dim:var(--snow-dim); --text-faint:var(--snow-faint);
+
+    --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px;
+    --r-sm:8px; --r-md:12px; --r-lg:16px; --r-xl:20px; --r-full:999px;
+    --font:"Inter","HarmonyOS Sans SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-font-smoothing:antialiased;}
+  body{
+    background:var(--ink-050);
+    background-image:
+      radial-gradient(900px 520px at 10% -10%, rgba(225,29,72,.11), transparent 62%),
+      radial-gradient(780px 480px at 90% 2%, rgba(34,211,238,.075), transparent 60%),
+      linear-gradient(rgba(255,255,255,.017) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.017) 1px, transparent 1px);
+    background-size:auto,auto,44px 44px,44px 44px;
+    font-family:var(--font); color:var(--text);
+    padding:46px 40px 70px; min-width:1360px;
+  }
+
+  /* ============ page header ============ */
+  .page-head{max-width:1322px;margin:0 auto 40px;}
+  .brand-row{display:flex;align-items:center;gap:14px;margin-bottom:13px;}
+  .brand-mark{width:44px;height:44px;border-radius:13px;flex:none;background:linear-gradient(145deg,var(--play-500),#7F1D3A);display:grid;place-items:center;box-shadow:0 8px 26px rgba(225,29,72,.38);}
+  .brand-mark svg{width:24px;height:24px;}
+  h1{font-size:25px;font-weight:700;letter-spacing:-.02em;}
+  h1 span{color:var(--text-faint);font-weight:500;font-size:14.5px;letter-spacing:0;margin-left:10px;}
+  .page-sub{color:var(--text-dim);font-size:13.5px;line-height:1.8;max-width:940px;}
+  .page-sub b{color:var(--snow);font-weight:600;}
+  .page-sub em{color:var(--src-500);font-style:normal;font-weight:600;}
+  .token-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:19px;}
+  .token{display:flex;align-items:center;gap:7px;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--r-full);padding:6px 12px 6px 7px;font-size:11.5px;color:var(--text-dim);font-weight:500;}
+  .swatch{width:14px;height:14px;border-radius:5px;flex:none;border:1px solid rgba(255,255,255,.14);}
+
+  /* ============ grid ============ */
+  .grid{max-width:1322px;margin:0 auto;display:grid;grid-template-columns:repeat(3,390px);gap:54px 36px;}
+  .screen{display:flex;flex-direction:column;gap:13px;}
+  .screen-cap{display:flex;align-items:baseline;gap:9px;}
+  .screen-idx{font-size:11px;font-weight:700;color:var(--play-400);border:1px solid rgba(251,113,133,.35);background:rgba(225,29,72,.10);border-radius:var(--r-sm);padding:3px 7px;letter-spacing:.06em;flex:none;}
+  .screen-name{font-size:14.5px;font-weight:600;}
+  .screen-note{font-size:11.5px;color:var(--text-faint);margin-left:auto;text-align:right;line-height:1.5;}
+
+  /* ============ phone ============ */
+  .phone{width:390px;height:844px;flex:none;position:relative;overflow:hidden;border-radius:42px;background:var(--bg);
+    display:flex;flex-direction:column;
+    border:1px solid rgba(255,255,255,.13);
+    box-shadow:0 0 0 9px #0B0B0E, 0 0 0 10px rgba(255,255,255,.07), 0 34px 70px -18px rgba(0,0,0,.95), 0 0 90px -30px rgba(225,29,72,.20);}
+  .phone::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:60;background:linear-gradient(128deg,rgba(255,255,255,.05) 0%,transparent 32%);}
+
+  .status{height:46px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 26px 0 30px;font-size:13.5px;font-weight:600;position:relative;z-index:40;}
+  .status .icons{display:flex;align-items:center;gap:6px;}
+  .notch{position:absolute;top:11px;left:50%;transform:translateX(-50%);width:104px;height:26px;border-radius:var(--r-full);background:#000;z-index:50;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);}
+  .body{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;z-index:10;}
+  .scroll{flex:1;min-height:0;overflow:hidden;}
+  .pad{padding:0 18px;}
+
+  /* ============ bottom nav ============ */
+  .tabbar{flex:none;height:74px;padding:9px 14px 0;display:grid;grid-template-columns:repeat(4,1fr);
+    background:linear-gradient(to top,rgba(0,0,0,.98) 55%,rgba(0,0,0,.72));border-top:1px solid var(--border);position:relative;z-index:30;}
+  .tab{display:flex;flex-direction:column;align-items:center;gap:5px;color:var(--text-faint);font-size:10.5px;font-weight:600;}
+  .tab.on{color:var(--snow);} .tab.on svg{color:var(--play-400);}
+  .tab svg{width:22px;height:22px;}
+  .home-ind{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);width:132px;height:5px;border-radius:3px;background:rgba(255,255,255,.30);}
+
+  /* ============ atoms ============ */
+  .pill{display:inline-flex;align-items:center;gap:5px;border-radius:var(--r-full);font-size:11px;font-weight:600;padding:4px 9px;line-height:1;}
+  .pill-cyan{background:rgba(34,211,238,.14);color:var(--src-500);border:1px solid rgba(34,211,238,.30);}
+  .pill-ghost{background:rgba(255,255,255,.07);color:var(--text-dim);border:1px solid var(--border);}
+  .dot{width:6px;height:6px;border-radius:50%;flex:none;}
+  .dot-ok{background:var(--ok-500);box-shadow:0 0 7px rgba(52,211,153,.85);}
+  .dot-warn{background:var(--warn-500);box-shadow:0 0 7px rgba(251,191,36,.8);}
+  .dot-err{background:var(--err-500);box-shadow:0 0 7px rgba(248,113,113,.8);}
+  .sec-head{display:flex;align-items:center;justify-content:space-between;margin:20px 0 12px;}
+  .sec-title{font-size:16px;font-weight:700;letter-spacing:-.01em;}
+  .sec-more{font-size:11.5px;color:var(--text-faint);display:flex;align-items:center;gap:3px;}
+  .icon-btn{width:36px;height:36px;flex:none;border-radius:var(--r-full);background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--text-dim);}
+  .prog{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.16);}
+  .prog i{display:block;height:100%;background:var(--play-500);}
+
+  /* ============ S1 HOME ============ */
+  .home-top{display:flex;align-items:center;gap:12px;padding:4px 18px 12px;}
+  .wordmark{display:flex;align-items:center;gap:7px;flex:none;}
+  .wordmark .m{width:26px;height:26px;border-radius:8px;background:linear-gradient(145deg,var(--play-500),#7F1D3A);display:grid;place-items:center;}
+  .wordmark .m svg{width:15px;height:15px;}
+  .wordmark b{font-size:16px;font-weight:800;letter-spacing:-.02em;}
+  .searchbar{flex:1;height:36px;border-radius:var(--r-full);background:var(--surface-2);border:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 13px;color:var(--text-faint);font-size:12.5px;}
+
+  .hero{position:relative;height:222px;border-radius:var(--r-xl);overflow:hidden;background:#0A0A12;}
+  .hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  .hero .shade{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.97) 2%,rgba(0,0,0,.60) 40%,transparent 74%);}
+  .hero .meta{position:absolute;left:16px;right:16px;bottom:14px;}
+  .hero h2{font-size:21px;font-weight:800;letter-spacing:-.02em;margin-bottom:7px;text-shadow:0 2px 12px rgba(0,0,0,.85);}
+  .hero .line{display:flex;align-items:center;gap:7px;font-size:11.5px;color:#CBD5E1;margin-bottom:11px;}
+  .hero .line .sep{opacity:.4;}
+  .hero .acts{display:flex;align-items:center;gap:9px;}
+  .btn-play{height:34px;padding:0 17px;border-radius:var(--r-full);border:none;background:linear-gradient(180deg,var(--play-400),var(--play-500) 62%);color:#fff;font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:6px;box-shadow:0 6px 20px -4px rgba(225,29,72,.65);font-family:var(--font);}
+  .btn-ghost{height:34px;padding:0 14px;border-radius:var(--r-full);background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.20);color:#fff;font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:6px;font-family:var(--font);}
+  .hero-src{position:absolute;top:12px;left:12px;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.62);border:1px solid rgba(34,211,238,.32);border-radius:var(--r-full);padding:5px 10px;font-size:10.5px;font-weight:600;color:var(--src-500);}
+  .dots{position:absolute;bottom:82px;right:18px;display:flex;gap:4px;}
+  .dots i{width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.32);}
+  .dots i.on{width:14px;border-radius:3px;background:var(--play-500);}
+
+  .chips{display:flex;gap:8px;padding:16px 0 2px;}
+  .chip{flex:none;padding:7px 14px;border-radius:var(--r-full);font-size:12.5px;font-weight:600;color:var(--text-dim);background:var(--surface-2);border:1px solid var(--border);}
+  .chip.on{color:#fff;background:rgba(225,29,72,.16);border-color:rgba(225,29,72,.45);}
+
+  .rail{display:grid;grid-template-columns:repeat(3,1fr);gap:11px;}
+  .card{position:relative;}
+  .card .art{position:relative;aspect-ratio:2/3;border-radius:var(--r-md);overflow:hidden;background:#141422;border:1px solid var(--border);}
+  .card .art img{width:100%;height:100%;object-fit:cover;}
+  .card .art .scrim{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.80),transparent 52%);}
+  .card .t{font-size:11.5px;font-weight:600;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .card .s{font-size:10px;color:var(--text-faint);margin-top:3px;}
+  .rank{position:absolute;top:6px;left:6px;min-width:19px;height:19px;border-radius:6px;display:grid;place-items:center;font-size:10.5px;font-weight:800;color:#fff;background:rgba(0,0,0,.68);border:1px solid rgba(255,255,255,.16);}
+  .rank.top{background:linear-gradient(145deg,var(--play-400),var(--play-600));border-color:transparent;}
+  .badge-tr{position:absolute;top:6px;right:6px;font-size:9.5px;font-weight:700;padding:3px 6px;border-radius:6px;background:rgba(0,0,0,.66);border:1px solid rgba(34,211,238,.34);color:var(--src-500);}
+  .wide{position:relative;border-radius:var(--r-lg);overflow:hidden;aspect-ratio:16/9;background:#141422;border:1px solid var(--border);}
+  .wide img{width:100%;height:100%;object-fit:cover;}
+  .wide .shade{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.92),transparent 62%);}
+  .wide .txt{position:absolute;left:12px;right:12px;bottom:11px;}
+  .wide .txt b{font-size:13.5px;font-weight:700;display:block;margin-bottom:2px;}
+  .wide .txt span{font-size:10.5px;color:var(--text-dim);}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:11px;}
+
+  /* ============ S2 SEARCH RESULTS ============ */
+  .search-top{display:flex;align-items:center;gap:11px;padding:4px 18px 12px;}
+  .search-input{flex:1;height:38px;border-radius:var(--r-full);background:var(--surface-2);border:1px solid rgba(225,29,72,.42);display:flex;align-items:center;gap:9px;padding:0 14px;box-shadow:0 0 0 3px rgba(225,29,72,.10);}
+  .search-input span{font-size:13px;color:var(--snow);font-weight:500;}
+  .caret{width:1.5px;height:15px;background:var(--play-400);}
+  .cancel{font-size:13px;color:var(--text-dim);font-weight:500;flex:none;}
+
+  .filters{display:flex;gap:7px;padding:0 18px 12px;}
+  .fchip{flex:none;padding:6px 12px;border-radius:var(--r-full);font-size:12px;font-weight:600;color:var(--text-dim);background:var(--surface-2);border:1px solid var(--border);}
+  .fchip.on{color:#fff;background:rgba(225,29,72,.16);border-color:rgba(225,29,72,.45);}
+
+  .aggbar{display:flex;align-items:center;gap:9px;margin-bottom:14px;padding:10px 12px;border-radius:var(--r-md);background:rgba(34,211,238,.055);border:1px solid rgba(34,211,238,.20);}
+  .aggbar .ic{width:26px;height:26px;border-radius:8px;background:rgba(34,211,238,.14);display:grid;place-items:center;flex:none;color:var(--src-500);}
+  .aggbar p{font-size:10.5px;color:var(--text-dim);line-height:1.5;}
+  .aggbar b{color:var(--snow);font-weight:600;}
+
+  .res{display:flex;gap:11px;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.055);}
+  .res:first-child{padding-top:0;}
+  .res-art{width:58px;height:82px;border-radius:9px;overflow:hidden;flex:none;background:#141422;border:1px solid var(--border);}
+  .res-art img{width:100%;height:100%;object-fit:cover;}
+  .res-main{flex:1;min-width:0;padding-top:2px;}
+  .res-main b{font-size:14px;font-weight:700;display:block;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .res-meta{font-size:10.5px;color:var(--text-faint);margin-bottom:8px;display:flex;align-items:center;gap:6px;}
+  .res-meta .sep{opacity:.4;}
+  .res-src{display:flex;flex-wrap:wrap;gap:5px;}
+  .sbadge{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;font-weight:600;padding:3px 7px;border-radius:6px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text-dim);}
+  .sbadge.on{color:var(--src-500);border-color:rgba(34,211,238,.30);background:rgba(34,211,238,.09);}
+  .sbadge.dim{opacity:.45;}
+  .res-right{flex:none;display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;padding-top:2px;}
+  .res-go{width:28px;height:28px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--text-dim);}
+
+  /* ============ S3 DETAIL ============ */
+  .d-backdrop{position:relative;height:240px;flex:none;}
+  .d-backdrop img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.72;}
+  .d-backdrop .fade{position:absolute;inset:0;background:linear-gradient(to top,var(--bg) 2%,rgba(0,0,0,.78) 30%,rgba(0,0,0,.30) 100%);}
+  .d-nav{position:absolute;top:0;left:0;right:0;height:46px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;z-index:5;}
+  .d-head{position:absolute;left:18px;right:18px;bottom:12px;display:flex;gap:14px;align-items:flex-end;z-index:5;}
+  .d-poster{width:94px;height:134px;border-radius:var(--r-md);overflow:hidden;flex:none;border:1px solid rgba(255,255,255,.18);box-shadow:0 12px 30px -8px rgba(0,0,0,.9);background:#16162A;}
+  .d-poster img{width:100%;height:100%;object-fit:cover;}
+  .d-info{flex:1;min-width:0;padding-bottom:3px;}
+  .d-info h2{font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.24;margin-bottom:6px;}
+  .d-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);margin-bottom:8px;flex-wrap:wrap;}
+  .d-meta .sep{opacity:.35;}
+  .d-score{display:flex;align-items:center;gap:5px;font-size:13px;font-weight:800;color:var(--gold);}
+
+  .action-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px;}
+  .act{display:flex;flex-direction:column;align-items:center;gap:6px;padding:11px 0;border-radius:var(--r-md);background:var(--surface-2);border:1px solid var(--border);color:var(--text-dim);font-size:10.5px;font-weight:600;}
+  .act svg{width:19px;height:19px;}
+  .act.on{color:var(--play-400);border-color:rgba(225,29,72,.32);background:rgba(225,29,72,.09);}
+
+  .srcsel{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:13px;margin-top:16px;}
+  .srcsel-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;}
+  .srcsel-top b{font-size:12.5px;font-weight:700;}
+  .srcsel-top span{font-size:10.5px;color:var(--src-500);font-weight:600;display:flex;align-items:center;gap:4px;}
+  .src-list{display:flex;gap:8px;}
+  .src-item{flex:1;border-radius:var(--r-md);padding:10px 11px;background:var(--surface-2);border:1px solid var(--border);}
+  .src-item.on{background:rgba(225,29,72,.10);border-color:rgba(225,29,72,.48);}
+  .src-item .nm{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;margin-bottom:7px;}
+  .src-item .sub{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-faint);}
+
+  .eps{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;}
+  .ep{height:38px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;font-size:12px;font-weight:600;color:var(--text-dim);position:relative;}
+  .ep.on{background:linear-gradient(180deg,var(--play-400),var(--play-500));color:#fff;border-color:transparent;box-shadow:0 5px 16px -5px rgba(225,29,72,.7);}
+  .ep.u4k::after{content:"";position:absolute;top:4px;right:4px;width:5px;height:5px;border-radius:50%;background:var(--src-500);}
+  .desc{font-size:12px;line-height:1.78;color:var(--text-dim);margin-top:10px;}
+
+  .cta-bar{flex:none;padding:12px 18px 24px;background:linear-gradient(to top,var(--bg) 58%,rgba(0,0,0,.6));border-top:1px solid var(--border);display:flex;gap:11px;align-items:center;}
+  .cta-main{flex:1;height:46px;border-radius:var(--r-md);border:none;background:linear-gradient(180deg,var(--play-400),var(--play-500) 58%);color:#fff;font-size:14.5px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 10px 26px -8px rgba(225,29,72,.8);font-family:var(--font);}
+  .cta-ic{width:46px;height:46px;border-radius:var(--r-md);background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--text-dim);flex:none;}
+
+  /* ============ S4 PLAYER ============ */
+  .player{background:#000;position:relative;flex:1;min-height:0;display:flex;flex-direction:column;}
+  .stage{position:relative;flex:1;min-height:0;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;}
+  .stage .vid{position:absolute;inset:0;background:linear-gradient(160deg,#0B1220,#05070C 60%,#000);}
+  .stage .vid img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.40;}
+  .stage .bars{position:absolute;left:0;right:0;top:0;height:70px;background:linear-gradient(to bottom,rgba(0,0,0,.86),transparent);}
+  .stage .bars-b{position:absolute;left:0;right:0;bottom:0;height:180px;background:linear-gradient(to top,rgba(0,0,0,.95),transparent);}
+  .p-top{position:absolute;top:0;left:0;right:0;height:46px;display:flex;align-items:center;gap:12px;padding:0 16px;z-index:6;}
+  .p-title{flex:1;min-width:0;}
+  .p-title b{display:block;font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .p-title span{font-size:10px;color:var(--text-dim);}
+  .center-play{position:relative;z-index:5;width:64px;height:64px;border-radius:50%;background:rgba(0,0,0,.42);border:1.5px solid rgba(255,255,255,.30);display:grid;place-items:center;}
+  .center-play svg{width:27px;height:27px;margin-left:3px;}
+  .render-tag{position:absolute;top:56px;left:16px;z-index:6;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.58);border:1px solid rgba(34,211,238,.30);border-radius:var(--r-full);padding:5px 10px;font-size:10px;font-weight:600;color:var(--src-500);}
+  .src-rail{position:absolute;right:12px;top:46%;transform:translateY(-50%);z-index:7;display:flex;flex-direction:column;gap:8px;}
+  .src-fab{width:46px;border-radius:var(--r-md);padding:9px 0;text-align:center;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.14);font-size:9.5px;font-weight:700;color:var(--text-dim);line-height:1.35;}
+  .src-fab.on{background:rgba(225,29,72,.26);border-color:rgba(225,29,72,.6);color:#fff;}
+  .src-fab i{display:block;font-style:normal;font-size:8.5px;opacity:.72;font-weight:600;}
+  .p-bottom{position:absolute;left:0;right:0;bottom:0;padding:0 18px 16px;z-index:8;}
+  .scrub{display:flex;align-items:center;gap:11px;margin-bottom:12px;}
+  .scrub .t{font-size:10.5px;color:#CBD5E1;flex:none;}
+  .track{flex:1;height:3.5px;border-radius:2px;background:rgba(255,255,255,.22);position:relative;}
+  .track .buf{position:absolute;left:0;top:0;bottom:0;width:62%;background:rgba(255,255,255,.30);border-radius:2px;}
+  .track .fill{position:absolute;left:0;top:0;bottom:0;width:38%;background:linear-gradient(90deg,var(--play-400),var(--play-500));border-radius:2px;}
+  .track .knob{position:absolute;left:38%;top:50%;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%;background:#fff;box-shadow:0 0 12px rgba(225,29,72,.9);}
+  .p-ctrl{display:flex;align-items:center;justify-content:space-between;}
+  .p-ctrl .grp{display:flex;align-items:center;gap:16px;}
+  .p-btn{display:flex;align-items:center;gap:5px;color:#E2E8F0;font-size:11px;font-weight:600;}
+  .p-btn svg{width:19px;height:19px;}
+  .p-btn.on{color:var(--src-500);}
+  .p-chip{font-size:10.5px;font-weight:700;border:1px solid rgba(255,255,255,.26);border-radius:6px;padding:3px 7px;color:#fff;}
+
+  .ep-drawer{flex:none;height:180px;background:var(--ink-100);border-top:1px solid var(--border);padding:13px 18px 0;position:relative;}
+  .drawer-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;}
+  .drawer-h b{font-size:12.5px;font-weight:700;}
+  .drawer-h .r{font-size:10.5px;color:var(--text-faint);display:flex;align-items:center;gap:7px;}
+  .ep-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;}
+  .ep-sm{height:32px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;font-size:11.5px;font-weight:600;color:var(--text-dim);}
+  .ep-sm.on{background:rgba(225,29,72,.18);border-color:rgba(225,29,72,.5);color:var(--play-400);}
+  .drawer-f{position:absolute;left:18px;right:18px;bottom:24px;display:flex;align-items:center;justify-content:space-between;padding-top:12px;border-top:1px solid rgba(255,255,255,.06);}
+
+  /* ============ S5 SOURCES ============ */
+  .nav-bar{height:50px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;}
+  .nav-bar h1{font-size:17px;font-weight:700;flex:1;letter-spacing:-.01em;}
+  .nav-bar h1 span{display:block;font-size:10.5px;color:var(--text-faint);font-weight:500;margin:2px 0 0;letter-spacing:0;}
+  .add-btn{height:32px;padding:0 13px;border-radius:var(--r-full);border:none;flex:none;background:linear-gradient(180deg,var(--play-400),var(--play-500) 60%);color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;gap:5px;font-family:var(--font);box-shadow:0 6px 18px -6px rgba(225,29,72,.75);}
+  .sum-card{background:linear-gradient(150deg,rgba(34,211,238,.09),rgba(34,211,238,.02));border:1px solid rgba(34,211,238,.22);border-radius:var(--r-lg);padding:14px;}
+  .sum-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+  .sum-top b{font-size:13px;font-weight:700;}
+  .rescan{font-size:11px;font-weight:600;color:var(--src-500);border:1px solid rgba(34,211,238,.34);background:rgba(34,211,238,.10);border-radius:var(--r-full);padding:5px 11px;display:flex;align-items:center;gap:5px;}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+  .stat b{display:block;font-size:19px;font-weight:800;letter-spacing:-.02em;}
+  .stat span{font-size:10.5px;color:var(--text-faint);}
+  .stat.ok b{color:var(--ok-500);} .stat.warn b{color:var(--warn-500);}
+
+  .list{display:flex;flex-direction:column;gap:10px;}
+  .row{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:13px;display:flex;gap:12px;align-items:flex-start;}
+  .row.err{border-color:rgba(248,113,113,.26);background:rgba(248,113,113,.035);}
+  .row.on{border-color:rgba(34,211,238,.28);}
+  .ava{width:40px;height:40px;border-radius:12px;flex:none;display:grid;place-items:center;font-size:14px;font-weight:800;color:#fff;}
+  .ava.a{background:linear-gradient(145deg,#3B82F6,#1E3A8A);}
+  .ava.b{background:linear-gradient(145deg,#F59E0B,#B45309);}
+  .ava.c{background:linear-gradient(145deg,#64748B,#334155);}
+  .row-main{flex:1;min-width:0;}
+  .row-t{display:flex;align-items:center;gap:7px;margin-bottom:5px;}
+  .row-t b{font-size:13.5px;font-weight:700;}
+  .row-url{font-size:10.5px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:9px;}
+  .row-tags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+  .tagx{font-size:9.5px;font-weight:600;padding:2.5px 6px;border-radius:5px;background:rgba(255,255,255,.06);border:1px solid var(--border);color:var(--text-dim);}
+  .tagx.cy{color:var(--src-500);border-color:rgba(34,211,238,.26);background:rgba(34,211,238,.09);}
+  .tagx.rd{color:var(--play-400);border-color:rgba(225,29,72,.26);background:rgba(225,29,72,.09);}
+  .row-right{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:9px;}
+  .switch{width:40px;height:23px;border-radius:var(--r-full);background:var(--ink-400);position:relative;flex:none;}
+  .switch.on{background:var(--src-600);}
+  .switch i{position:absolute;top:2.5px;left:2.5px;width:18px;height:18px;border-radius:50%;background:#fff;}
+  .switch.on i{left:19.5px;}
+  .lat{font-size:10px;color:var(--text-faint);display:flex;align-items:center;gap:4px;}
+  .grip{color:var(--text-faint);opacity:.6;}
+
+  /* ============ S6 SHEET ============ */
+  .scrim{position:absolute;inset:0;background:rgba(0,0,0,.68);z-index:20;}
+  .sheet{position:absolute;left:0;right:0;bottom:0;z-index:30;background:var(--ink-100);border-radius:26px 26px 0 0;border-top:1px solid var(--border-strong);padding:10px 20px 26px;box-shadow:0 -20px 60px rgba(0,0,0,.9);}
+  .handle{width:38px;height:4px;border-radius:3px;background:rgba(255,255,255,.24);margin:0 auto 15px;}
+  .sheet h3{font-size:17px;font-weight:700;margin-bottom:4px;letter-spacing:-.01em;}
+  .sheet .sub{font-size:11.5px;color:var(--text-faint);line-height:1.6;margin-bottom:18px;}
+  .field{margin-bottom:14px;}
+  .label{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;font-weight:600;color:var(--text-dim);margin-bottom:7px;}
+  .label em{font-style:normal;font-size:10.5px;color:var(--text-faint);font-weight:500;}
+  .input{height:44px;border-radius:var(--r-md);background:var(--surface-2);border:1px solid var(--border);display:flex;align-items:center;gap:9px;padding:0 13px;font-size:13px;color:var(--snow);}
+  .input.ph{color:var(--text-faint);}
+  .input.focus{border-color:rgba(34,211,238,.5);box-shadow:0 0 0 3px rgba(34,211,238,.10);}
+  .input .caret{background:var(--src-500);}
+  .type-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;}
+  .type{border-radius:var(--r-md);background:var(--surface-2);border:1px solid var(--border);padding:11px 8px;text-align:center;}
+  .type.on{background:rgba(225,29,72,.10);border-color:rgba(225,29,72,.46);}
+  .type svg{width:20px;height:20px;margin-bottom:7px;color:var(--text-dim);}
+  .type.on svg{color:var(--play-400);}
+  .type b{display:block;font-size:11.5px;font-weight:700;margin-bottom:3px;}
+  .type span{font-size:9.5px;color:var(--text-faint);line-height:1.35;display:block;}
+  .prio{display:flex;gap:8px;}
+  .prio div{flex:1;height:38px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;font-size:11.5px;font-weight:600;color:var(--text-dim);}
+  .prio div.on{background:rgba(34,211,238,.12);border-color:rgba(34,211,238,.42);color:var(--src-500);}
+  .test-box{display:flex;align-items:center;gap:11px;padding:12px 13px;border-radius:var(--r-md);background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.26);margin-bottom:18px;}
+  .test-box .ic{width:32px;height:32px;border-radius:10px;background:rgba(52,211,153,.15);display:grid;place-items:center;flex:none;color:var(--ok-500);}
+  .test-box b{font-size:12.5px;font-weight:700;display:block;margin-bottom:3px;color:var(--ok-500);}
+  .test-box span{font-size:10.5px;color:var(--text-dim);line-height:1.5;}
+  .sheet-acts{display:flex;gap:11px;}
+  .btn-sec{flex:1;height:46px;border-radius:var(--r-md);background:var(--surface-2);border:1px solid var(--border);color:var(--text-dim);font-size:14px;font-weight:600;display:grid;place-items:center;font-family:var(--font);}
+  .btn-pri{flex:1.6;height:46px;border-radius:var(--r-md);border:none;background:linear-gradient(180deg,var(--play-400),var(--play-500) 58%);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:7px;box-shadow:0 10px 26px -8px rgba(225,29,72,.8);font-family:var(--font);}
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <div class="brand-row">
+    <div class="brand-mark">
+      <svg viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="#fff"/></svg>
+    </div>
+    <h1>影枢 CineHub<span>Android 视频聚合播放器 · UI 概念稿</span></h1>
+  </div>
+  <p class="page-sub">
+    产品逻辑：<b>用户自带播放源，应用统一重渲染</b>。在设置里录入站点（如 4kvm.net、dongpiandi.ai）→ 应用抓取页面、解析出真实流地址、归一化成统一播放列表 →
+    用自家的播放器与界面呈现。<em>用户看到的永远是影枢的画面，不是网页套壳</em>。多源同时接入后，同一部片可跨源切换，进度互相同步。
+  </p>
+  <div class="token-row">
+    <div class="token"><span class="swatch" style="background:#000000"></span>背景 #000000</div>
+    <div class="token"><span class="swatch" style="background:#0C0C0D"></span>卡片 #0C0C0D</div>
+    <div class="token"><span class="swatch" style="background:#16161A"></span>次级面 #16161A</div>
+    <div class="token"><span class="swatch" style="background:#E11D48"></span>播放红 #E11D48</div>
+    <div class="token"><span class="swatch" style="background:#22D3EE"></span>源 / 渲染青 #22D3EE</div>
+    <div class="token"><span class="swatch" style="background:#34D399"></span>正常 #34D399</div>
+    <div class="token"><span class="swatch" style="background:#FBBF24"></span>超时 #FBBF24</div>
+    <div class="token"><span class="swatch" style="background:#F8FAFC"></span>正文 #F8FAFC</div>
+    <div class="token">OLED 深黑 · 影院感 · 4/8dp 栅格 · Inter</div>
+  </div>
+</div>
+
+<div class="grid">
+
+<!-- ══════════════════════ 01 首页 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">01</span><span class="screen-name">首页</span>
+    <span class="screen-note">顶部搜索 + 首屏 Hero<br>聚合后的统一信息流</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#F8FAFC"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#F8FAFC"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#F8FAFC" stroke-opacity=".45"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#F8FAFC"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#F8FAFC" fill-opacity=".45"/></svg>
+      </span>
+    </div>
+    <div class="body">
+      <div class="home-top">
+        <div class="wordmark">
+          <span class="m"><svg viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4" fill="#fff"/></svg></span>
+          <b>影枢</b>
+        </div>
+        <div class="searchbar">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+          搜索影片、演员、播放源
+        </div>
+        <div class="icon-btn">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11a9 9 0 0 1 18 0"/><rect x="2" y="11" width="4.5" height="7" rx="1.6"/><rect x="17.5" y="11" width="4.5" height="7" rx="1.6"/></svg>
+        </div>
+      </div>
+
+      <div class="scroll pad">
+        <div class="hero">
+          <img src="assets/hero.svg" alt="">
+          <div class="shade"></div>
+          <div class="hero-src"><span class="dot dot-ok"></span>4K影视 · 4K HDR 已就绪</div>
+          <div class="dots"><i class="on"></i><i></i><i></i><i></i></div>
+          <div class="meta">
+            <h2>深海迷航</h2>
+            <div class="line">
+              <span>2026</span><span class="sep">·</span><span>科幻 / 悬疑</span><span class="sep">·</span><span>全 12 集</span>
+              <span class="pill pill-cyan" style="margin-left:2px">4K</span>
+            </div>
+            <div class="acts">
+              <button class="btn-play">
+                <svg width="13" height="13" viewBox="0 0 24 24"><polygon points="6 3 21 12 6 21 6 3" fill="#fff"/></svg>
+                立即播放
+              </button>
+              <button class="btn-ghost">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                收藏
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="chips">
+          <span class="chip on">推荐</span><span class="chip">电影</span><span class="chip">剧集</span><span class="chip">动漫</span><span class="chip">综艺</span><span class="chip">短剧</span>
+        </div>
+
+        <div class="sec-head">
+          <span class="sec-title">热播榜</span>
+          <span class="sec-more">全部
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="m9 5 7 7-7 7"/></svg>
+          </span>
+        </div>
+        <div class="rail">
+          <div class="card">
+            <div class="art"><img src="assets/poster1.svg" alt=""><div class="scrim"></div><span class="rank top">1</span><span class="badge-tr">4K</span></div>
+            <div class="t">长安十二时</div><div class="s">更新至 24 集</div>
+          </div>
+          <div class="card">
+            <div class="art"><img src="assets/poster2.svg" alt=""><div class="scrim"></div><span class="rank top">2</span><span class="badge-tr">HDR</span></div>
+            <div class="t">山海秘境</div><div class="s">全 36 集</div>
+          </div>
+          <div class="card">
+            <div class="art"><img src="assets/poster3.svg" alt=""><div class="scrim"></div><span class="rank top">3</span><div class="prog"><i style="width:64%"></i></div></div>
+            <div class="t">雾都疑云</div><div class="s">看到 第 8 集</div>
+          </div>
+        </div>
+
+        <div class="sec-head">
+          <span class="sec-title">继续观看</span>
+          <span class="sec-more">管理</span>
+        </div>
+        <div class="two">
+          <div class="wide">
+            <img src="assets/wide1.svg" alt="">
+            <div class="shade"></div>
+            <div class="txt"><b>静默之海</b><span>第 5 集 · 剩余 21 分钟</span></div>
+            <div class="prog"><i style="width:42%"></i></div>
+          </div>
+          <div class="wide">
+            <img src="assets/wide2.svg" alt="">
+            <div class="shade"></div>
+            <div class="txt"><b>北纬三十度</b><span>第 2 集 · 剩余 34 分钟</span></div>
+            <div class="prog"><i style="width:18%"></i></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabbar">
+        <div class="tab on">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V10Z"/></svg>首页
+        </div>
+        <div class="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></svg>片库
+        </div>
+        <div class="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4 20h16"/></svg>下载
+        </div>
+        <div class="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>我的
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 02 搜索结果 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">02</span><span class="screen-name">跨源搜索结果</span>
+    <span class="screen-note">一条结果聚合多源<br>直接看出哪个源可播</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#F8FAFC"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#F8FAFC"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#F8FAFC" stroke-opacity=".45"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#F8FAFC"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#F8FAFC" fill-opacity=".45"/></svg>
+      </span>
+    </div>
+    <div class="body">
+      <div class="search-top">
+        <div class="search-input">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+          <span>深海迷航</span><span class="caret"></span>
+        </div>
+        <span class="cancel">取消</span>
+      </div>
+
+      <div class="filters">
+        <span class="fchip on">全部 47</span><span class="fchip">电影</span><span class="fchip">剧集</span><span class="fchip">动漫</span><span class="fchip">综艺</span>
+      </div>
+
+      <div class="scroll pad">
+        <div class="aggbar">
+          <span class="ic">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4.2"/></svg>
+          </span>
+          <p>已同时检索 <b>3 个播放源</b>，命中 <b>47</b> 条，按清晰度与延迟排序，重复条目已合并。</p>
+        </div>
+
+        <div class="res">
+          <div class="res-art"><img src="assets/poster4.svg" alt=""></div>
+          <div class="res-main">
+            <b>深海迷航</b>
+            <div class="res-meta"><span>2026</span><span class="sep">·</span><span>剧集</span><span class="sep">·</span><span>全 12 集</span></div>
+            <div class="res-src">
+              <span class="sbadge on"><span class="dot dot-ok"></span>4K影视 4K</span>
+              <span class="sbadge on"><span class="dot dot-ok"></span>懂片帝 1080P</span>
+            </div>
+          </div>
+          <div class="res-right">
+            <span class="pill pill-cyan">4K</span>
+            <span class="res-go">
+              <svg width="13" height="13" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4" fill="currentColor"/></svg>
+            </span>
+          </div>
+        </div>
+
+        <div class="res">
+          <div class="res-art"><img src="assets/poster5.svg" alt=""></div>
+          <div class="res-main">
+            <b>深海迷航：起源</b>
+            <div class="res-meta"><span>2025</span><span class="sep">·</span><span>电影</span><span class="sep">·</span><span>128 分钟</span></div>
+            <div class="res-src">
+              <span class="sbadge on"><span class="dot dot-ok"></span>懂片帝 1080P</span>
+              <span class="sbadge dim"><span class="dot dot-warn"></span>4K影视 未收录</span>
+            </div>
+          </div>
+          <div class="res-right">
+            <span class="pill pill-ghost">1080P</span>
+            <span class="res-go">
+              <svg width="13" height="13" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4" fill="currentColor"/></svg>
+            </span>
+          </div>
+        </div>
+
+        <div class="res">
+          <div class="res-art"><img src="assets/poster6.svg" alt=""></div>
+          <div class="res-main">
+            <b>深海迷航 幕后纪实</b>
+            <div class="res-meta"><span>2026</span><span class="sep">·</span><span>纪录片</span><span class="sep">·</span><span>6 集</span></div>
+            <div class="res-src">
+              <span class="sbadge on"><span class="dot dot-ok"></span>4K影视 4K</span>
+              <span class="sbadge dim"><span class="dot dot-err"></span>备用源 超时</span>
+            </div>
+          </div>
+          <div class="res-right">
+            <span class="pill pill-cyan">4K</span>
+            <span class="res-go">
+              <svg width="13" height="13" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4" fill="currentColor"/></svg>
+            </span>
+          </div>
+        </div>
+
+        <div class="res">
+          <div class="res-art"><img src="assets/poster7.svg" alt=""></div>
+          <div class="res-main">
+            <b>静默之海</b>
+            <div class="res-meta"><span>2026</span><span class="sep">·</span><span>剧集</span><span class="sep">·</span><span>更新至 9 集</span></div>
+            <div class="res-src">
+              <span class="sbadge on"><span class="dot dot-ok"></span>4K影视 4K</span>
+              <span class="sbadge on"><span class="dot dot-ok"></span>懂片帝 1080P</span>
+            </div>
+          </div>
+          <div class="res-right">
+            <span class="pill pill-cyan">4K</span>
+            <span class="res-go">
+              <svg width="13" height="13" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4" fill="currentColor"/></svg>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 03 详情选集 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">03</span><span class="screen-name">详情 / 选集</span>
+    <span class="screen-note">多源切换是主交互<br>同剧跨源续播</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status" style="color:#fff">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#fff"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#fff"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#fff" stroke-opacity=".5"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#fff"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#fff" fill-opacity=".5"/></svg>
+      </span>
+    </div>
+    <div class="body">
+      <div class="d-backdrop">
+        <img src="assets/hero.svg" alt="">
+        <div class="fade"></div>
+        <div class="d-nav">
+          <div class="icon-btn" style="background:rgba(0,0,0,.5)">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m15 5-7 7 7 7"/></svg>
+          </div>
+          <div style="display:flex;gap:9px">
+            <div class="icon-btn" style="background:rgba(0,0,0,.5)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7.5-4.6-7.5-10A4.5 4.5 0 0 1 12 7.6 4.5 4.5 0 0 1 19.5 11c0 5.4-7.5 10-7.5 10Z"/></svg>
+            </div>
+            <div class="icon-btn" style="background:rgba(0,0,0,.5)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg>
+            </div>
+          </div>
+        </div>
+        <div class="d-head">
+          <div class="d-poster"><img src="assets/poster4.svg" alt=""></div>
+          <div class="d-info">
+            <h2>深海迷航</h2>
+            <div class="d-meta">
+              <span>2026</span><span class="sep">·</span><span>剧集</span><span class="sep">·</span><span>全 12 集</span>
+              <span class="pill pill-cyan">4K HDR</span>
+            </div>
+            <div class="d-score">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="#F5C451"><path d="m12 2.6 2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.5 6.1 20.6l1.2-6.5L2.5 9.5l6.6-.9L12 2.6Z"/></svg>
+              9.1<span style="color:#5B6474;font-size:10.5px;font-weight:600">/ 12.4万人评</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="scroll pad">
+        <div class="action-row">
+          <div class="act on">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7.5-4.6-7.5-10A4.5 4.5 0 0 1 12 7.6 4.5 4.5 0 0 1 19.5 11c0 5.4-7.5 10-7.5 10Z"/></svg>
+            已收藏
+          </div>
+          <div class="act">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4 20h16"/></svg>
+            缓存
+          </div>
+          <div class="act">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="M12 16V3"/><path d="m8 7 4-4 4 4"/></svg>
+            分享
+          </div>
+          <div class="act">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 12h10M4 19h16"/></svg>
+            更多
+          </div>
+        </div>
+
+        <div class="srcsel">
+          <div class="srcsel-top">
+            <b>播放源</b>
+            <span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              重新检测
+            </span>
+          </div>
+          <div class="src-list">
+            <div class="src-item on">
+              <div class="nm"><span class="dot dot-ok"></span>4K影视</div>
+              <div class="sub"><span class="pill pill-cyan" style="padding:2px 5px;font-size:9px">4K</span><span>42ms</span></div>
+            </div>
+            <div class="src-item">
+              <div class="nm"><span class="dot dot-ok"></span>懂片帝AI</div>
+              <div class="sub"><span class="pill pill-ghost" style="padding:2px 5px;font-size:9px">1080P</span><span>88ms</span></div>
+            </div>
+            <div class="src-item" style="opacity:.55">
+              <div class="nm"><span class="dot dot-warn"></span>备用源</div>
+              <div class="sub"><span class="pill pill-ghost" style="padding:2px 5px;font-size:9px">1080P</span><span>超时</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-head" style="margin:18px 0 11px">
+          <span class="sec-title" style="font-size:14px">选集 <span style="color:#5B6474;font-weight:500;font-size:11.5px">共 12 集 · 蓝点为 4K 画质</span></span>
+          <span class="sec-more">倒序</span>
+        </div>
+        <div class="eps">
+          <div class="ep on u4k">1</div>
+          <div class="ep u4k">2</div>
+          <div class="ep u4k">3</div>
+          <div class="ep">4</div>
+          <div class="ep u4k">5</div>
+          <div class="ep u4k">6</div>
+          <div class="ep u4k">7</div>
+          <div class="ep">8</div>
+          <div class="ep u4k">9</div>
+          <div class="ep u4k">10</div>
+          <div class="ep">11</div>
+          <div class="ep u4k">12</div>
+        </div>
+
+        <div class="sec-head" style="margin:18px 0 0">
+          <span class="sec-title" style="font-size:14px">简介</span>
+        </div>
+        <p class="desc">深海科考队失联四十七小时后，唯一的幸存者带回了不该存在的录像……</p>
+      </div>
+
+      <div class="cta-bar">
+        <div class="cta-ic">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4 20h16"/></svg>
+        </div>
+        <button class="cta-main">
+          <svg width="15" height="15" viewBox="0 0 24 24"><polygon points="6 3 21 12 6 21 6 3" fill="#fff"/></svg>
+          播放 第 1 集
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 04 播放器 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">04</span><span class="screen-name">播放器</span>
+    <span class="screen-note">自家渲染层：右侧竖排切源<br>弹幕 / 倍速 / 清晰度</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#F8FAFC"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#F8FAFC"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#F8FAFC" stroke-opacity=".45"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#F8FAFC"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#F8FAFC" fill-opacity=".45"/></svg>
+      </span>
+    </div>
+    <div class="player">
+      <div class="stage">
+        <div class="vid"><img src="assets/hero.svg" alt=""></div>
+        <div class="bars"></div>
+        <div class="bars-b"></div>
+
+        <div class="p-top">
+          <div class="icon-btn" style="background:rgba(0,0,0,.42)">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m15 5-7 7 7 7"/></svg>
+          </div>
+          <div class="p-title">
+            <b>深海迷航 · 第 1 集</b>
+            <span>正在播放 · 4K影视</span>
+          </div>
+          <div class="icon-btn" style="background:rgba(0,0,0,.42)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 8-8h6"/><path d="m14 1 4 3-4 3"/><path d="M20 12a8 8 0 0 1-8 8H6"/><path d="m10 23-4-3 4-3"/></svg>
+          </div>
+        </div>
+
+        <div class="render-tag">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4.2"/></svg>
+          影枢渲染层 · HDR 增强已开
+        </div>
+
+        <div class="center-play">
+          <svg viewBox="0 0 24 24"><polygon points="6 3 21 12 6 21 6 3" fill="#fff"/></svg>
+        </div>
+
+        <div class="src-rail">
+          <div class="src-fab on">4K<i>42ms</i></div>
+          <div class="src-fab">懂片<i>88ms</i></div>
+          <div class="src-fab" style="opacity:.5">备用<i>超时</i></div>
+        </div>
+
+        <div class="p-bottom">
+          <div class="scrub">
+            <span class="t">12:04</span>
+            <div class="track"><span class="buf"></span><span class="fill"></span><span class="knob"></span></div>
+            <span class="t">31:48</span>
+          </div>
+          <div class="p-ctrl">
+            <div class="grp">
+              <span class="p-btn on">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4.5" width="19" height="14" rx="2.4"/><path d="M7 9h3M8.5 7.5v3M14.5 9.5h2.5"/></svg>
+                弹幕
+              </span>
+              <span class="p-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.2 2"/></svg>
+                跳过片头
+              </span>
+            </div>
+            <div class="grp">
+              <span class="p-chip">1.0x</span>
+              <span class="p-chip" style="border-color:rgba(34,211,238,.5);color:#22D3EE">4K</span>
+              <span class="p-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 15v5h-5M4 15v5h5M20 9V4h-5"/></svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="ep-drawer">
+        <div class="drawer-h">
+          <b>选集 · 深海迷航</b>
+          <span class="r">
+            <span class="dot dot-ok"></span>4K影视
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#5B6474" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
+          </span>
+        </div>
+        <div class="ep-grid">
+          <div class="ep-sm on">1</div><div class="ep-sm">2</div><div class="ep-sm">3</div><div class="ep-sm">4</div><div class="ep-sm">5</div>
+          <div class="ep-sm">6</div><div class="ep-sm">7</div><div class="ep-sm">8</div><div class="ep-sm">9</div><div class="ep-sm">10</div>
+        </div>
+        <div class="drawer-f">
+          <span style="font-size:10.5px;color:#5B6474">播放进度已跨源同步</span>
+          <span style="font-size:10.5px;color:#22D3EE;font-weight:600">切换源不丢进度</span>
+        </div>
+        <div class="home-ind"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 05 播放源管理 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">05</span><span class="screen-name">设置 · 播放源管理</span>
+    <span class="screen-note">核心页面：增删源<br>健康检测 / 优先级</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#F8FAFC"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#F8FAFC"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#F8FAFC" stroke-opacity=".45"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#F8FAFC"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#F8FAFC" fill-opacity=".45"/></svg>
+      </span>
+    </div>
+    <div class="body">
+      <div class="nav-bar">
+        <div class="icon-btn" style="background:transparent;border-color:transparent;width:24px">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#F8FAFC" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m15 5-7 7 7 7"/></svg>
+        </div>
+        <h1>播放源管理<span>影枢会解析并重渲染以下站点的内容</span></h1>
+        <button class="add-btn">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          添加
+        </button>
+      </div>
+
+      <div class="scroll pad">
+        <div class="sum-card">
+          <div class="sum-top">
+            <b>源健康状态</b>
+            <span class="rescan">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              全部重测
+            </span>
+          </div>
+          <div class="stats">
+            <div class="stat"><b>3</b><span>已接入源</span></div>
+            <div class="stat ok"><b>2</b><span>正常</span></div>
+            <div class="stat warn"><b>1</b><span>异常</span></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:12px;font-size:10.5px;color:#94A3B8">
+            <span class="dot dot-ok"></span>上次检测 2 分钟前 · 平均响应 65ms · 可播放资源 31,206 条
+          </div>
+        </div>
+
+        <div class="sec-head" style="margin:20px 0 11px">
+          <span class="sec-title" style="font-size:13.5px">已接入</span>
+          <span class="sec-more">长按拖动排序优先级</span>
+        </div>
+
+        <div class="list">
+          <div class="row on">
+            <div class="ava a">4K</div>
+            <div class="row-main">
+              <div class="row-t"><b>4K影视</b><span class="pill pill-cyan" style="padding:2px 6px;font-size:9px">默认</span></div>
+              <div class="row-url">https://4kvm.net</div>
+              <div class="row-tags"><span class="tagx cy">4K HDR</span><span class="tagx">网页解析</span><span class="tagx rd">免广告</span></div>
+            </div>
+            <div class="row-right">
+              <span class="switch on"><i></i></span>
+              <span class="lat"><span class="dot dot-ok"></span>42ms</span>
+              <span class="grip"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 7h8M8 12h8M8 17h8"/></svg></span>
+            </div>
+          </div>
+
+          <div class="row on">
+            <div class="ava b">懂</div>
+            <div class="row-main">
+              <div class="row-t"><b>懂片帝AI</b></div>
+              <div class="row-url">https://dongpiandi.ai</div>
+              <div class="row-tags"><span class="tagx cy">1080P</span><span class="tagx">AI 找片</span><span class="tagx">JSON 接口</span></div>
+            </div>
+            <div class="row-right">
+              <span class="switch on"><i></i></span>
+              <span class="lat"><span class="dot dot-ok"></span>88ms</span>
+              <span class="grip"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 7h8M8 12h8M8 17h8"/></svg></span>
+            </div>
+          </div>
+
+          <div class="row err">
+            <div class="ava c">备</div>
+            <div class="row-main">
+              <div class="row-t"><b>备用源</b><span class="pill pill-ghost" style="padding:2px 6px;font-size:9px;color:#F87171;border-color:rgba(248,113,113,.3)">连接失败</span></div>
+              <div class="row-url">https://backup.example.com</div>
+              <div class="row-tags"><span class="tagx">1080P</span><span class="tagx">网页解析</span><span class="tagx" style="color:#F87171;border-color:rgba(248,113,113,.3);background:rgba(248,113,113,.08)">DNS 解析超时</span></div>
+            </div>
+            <div class="row-right">
+              <span class="switch"><i></i></span>
+              <span class="lat"><span class="dot dot-err"></span>超时</span>
+              <span class="grip"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 7h8M8 12h8M8 17h8"/></svg></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-head" style="margin:22px 0 11px">
+          <span class="sec-title" style="font-size:13.5px">渲染与播放</span>
+        </div>
+        <div class="list">
+          <div class="row" style="align-items:center">
+            <div class="ava" style="background:linear-gradient(145deg,#E11D48,#7F1D3A);width:34px;height:34px;border-radius:10px">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4.2"/></svg>
+            </div>
+            <div class="row-main">
+              <div class="row-t" style="margin-bottom:3px"><b style="font-size:13px">画面增强渲染</b></div>
+              <div class="row-url" style="margin-bottom:0;white-space:normal;line-height:1.5">统一色彩管理、HDR 映射与超分，屏蔽源站画质差异</div>
+            </div>
+            <div class="row-right"><span class="switch on"><i></i></span></div>
+          </div>
+          <div class="row" style="align-items:center">
+            <div class="ava" style="background:linear-gradient(145deg,#22D3EE,#0E7490);width:34px;height:34px;border-radius:10px">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+            </div>
+            <div class="row-main">
+              <div class="row-t" style="margin-bottom:3px"><b style="font-size:13px">跨源自动续播</b></div>
+              <div class="row-url" style="margin-bottom:0;white-space:normal;line-height:1.5">当前源失效时自动切到同内容的其他源，并从原进度继续</div>
+            </div>
+            <div class="row-right"><span class="switch on"><i></i></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 06 添加播放源 ══════════════════════ -->
+<div class="screen">
+  <div class="screen-cap">
+    <span class="screen-idx">06</span><span class="screen-name">添加播放源</span>
+    <span class="screen-note">底部弹层表单<br>带连通性测试反馈</span>
+  </div>
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="status">
+      <span>9:41</span>
+      <span class="icons">
+        <svg width="17" height="11" viewBox="0 0 17 11" fill="#F8FAFC"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="#F8FAFC"><path d="M8 10.4 5.7 7.9a3.4 3.4 0 0 1 4.6 0L8 10.4Zm-3.8-4.2L2.6 4.5a7.9 7.9 0 0 1 10.8 0l-1.6 1.7a5.6 5.6 0 0 0-7.6 0Z"/></svg>
+        <svg width="25" height="11" viewBox="0 0 25 11" fill="none"><rect x=".6" y=".6" width="20" height="9.8" rx="2.6" stroke="#F8FAFC" stroke-opacity=".45"/><rect x="2.4" y="2.4" width="14.5" height="6.2" rx="1.4" fill="#F8FAFC"/><path d="M22.6 4v3a2 2 0 0 0 0-3Z" fill="#F8FAFC" fill-opacity=".45"/></svg>
+      </span>
+    </div>
+    <div class="body">
+      <div class="nav-bar">
+        <div class="icon-btn" style="background:transparent;border-color:transparent;width:24px">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#F8FAFC" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m15 5-7 7 7 7"/></svg>
+        </div>
+        <h1>播放源管理<span>影枢会解析并重渲染以下站点的内容</span></h1>
+        <button class="add-btn">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          添加
+        </button>
+      </div>
+      <div class="scroll pad" style="opacity:.45">
+        <div class="sum-card">
+          <div class="sum-top"><b>源健康状态</b><span class="rescan">全部重测</span></div>
+          <div class="stats">
+            <div class="stat"><b>3</b><span>已接入源</span></div>
+            <div class="stat ok"><b>2</b><span>正常</span></div>
+            <div class="stat warn"><b>1</b><span>异常</span></div>
+          </div>
+        </div>
+        <div class="list" style="margin-top:18px">
+          <div class="row"><div class="ava a">4K</div><div class="row-main"><div class="row-t"><b>4K影视</b></div><div class="row-url">https://4kvm.net</div></div></div>
+          <div class="row"><div class="ava b">懂</div><div class="row-main"><div class="row-t"><b>懂片帝AI</b></div><div class="row-url">https://dongpiandi.ai</div></div></div>
+        </div>
+      </div>
+
+      <div class="scrim"></div>
+
+      <div class="sheet">
+        <div class="handle"></div>
+        <h3>添加播放源</h3>
+        <p class="sub">填入站点地址，影枢会自动识别站点类型、抓取资源并生成统一播放列表。</p>
+
+        <div class="field">
+          <div class="label"><span>名称</span><em>用于界面展示</em></div>
+          <div class="input">4K影视</div>
+        </div>
+
+        <div class="field">
+          <div class="label"><span>站点地址</span><em>支持 http / https</em></div>
+          <div class="input focus"><span>https://4kvm.net</span><span class="caret"></span></div>
+        </div>
+
+        <div class="field">
+          <div class="label"><span>接入方式</span><em>已自动识别</em></div>
+          <div class="type-grid">
+            <div class="type on">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4.2"/></svg>
+              <b>自动识别</b><span>推荐</span>
+            </div>
+            <div class="type">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4.5" width="19" height="14" rx="2.4"/><path d="M2.5 9h19"/></svg>
+              <b>网页解析</b><span>抓取页面</span>
+            </div>
+            <div class="type">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4H5.5A1.5 1.5 0 0 0 4 5.5v13A1.5 1.5 0 0 0 5.5 20H8"/><path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H16"/><path d="M13 8.5 9.5 12l3.5 3.5"/></svg>
+              <b>JSON 接口</b><span>标准 API</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="label"><span>优先级</span><em>数字越小越优先</em></div>
+          <div class="prio"><div class="on">1 · 最高</div><div>2</div><div>3</div><div>4</div></div>
+        </div>
+
+        <div class="test-box">
+          <span class="ic">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+          </span>
+          <div>
+            <b>连接成功</b>
+            <span>识别到 12,480 个资源 · 平均延迟 42ms · 支持 4K HDR 与弹幕</span>
+          </div>
+        </div>
+
+        <div class="sheet-acts">
+          <div class="btn-sec">取消</div>
+          <button class="btn-pri">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            保存并启用
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+</body>
+</html>
