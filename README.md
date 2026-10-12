@@ -72,9 +72,10 @@ app/src/main/java/net/cinehub/
 ├─ MainActivity.kt              单 Activity，edge-to-edge
 ├─ data/
 │  ├─ SourceRepository.kt       播放源持久化（DataStore Preferences）+ 五个内置源
-│  ├─ MediaRepository.kt        跨源聚合、健康检测、直链解析（StreamResolution）
+│  ├─ MediaRepository.kt        跨源聚合、健康检测、直链解析
 │  ├─ model/
 │  │  ├─ Models.kt              Media / Episode / PlayLine / AggregatedMedia / Health
+│  │  ├─ StreamResolution.kt    直链解析结果 + VideoPlatforms + StreamUrls
 │  │  └─ SourceConfig.kt        SourceConfig / SourceKind / HtmlRules / ApiRules
 │  ├─ net/Http.kt               共用 OkHttp 客户端、UA、鉴权头、失败原因中文化
 │  └─ source/
@@ -114,7 +115,7 @@ app/src/main/java/net/cinehub/
 
 | 优先级 | 名称 | 地址 | 类型 | 说明 |
 |---|---|---|---|---|
-| 1 | 4K影视 | `https://4kvm.net` | 网页解析 | 用户提供。详情页即播放页，直链需站内会话，故不解析（`resolveMode = none`） |
+| 1 | 4K影视 | `https://4kvm.net` | 网页解析 | 用户提供。详情页即播放页，直链由站点自己的 WASM 现算签名，故不解析（`resolveMode = clientScript`） |
 | 2 | 北觅影视 | `https://v.luttt.com` | 网页解析 | 用户提供。苹果 CMS 模板站，走 `player_aaaa` 直链解析 |
 | 3 | 西瓜影院 | `https://xiguazx.cc` | JSON 接口 | 用户提供。标准 maccms API，10 万+ 片库 |
 | 4 | 懂片帝AI | `https://dongpiandi.ai` | 网页解析 | 用户提供。通用兜底规则 |
@@ -124,7 +125,7 @@ app/src/main/java/net/cinehub/
 
 ---
 
-## 四、两件值得单独说的事
+## 四、三件值得单独说的事
 
 ### 1. 苹果 CMS 的 `player_aaaa`
 
@@ -137,29 +138,44 @@ var player_aaaa = { "flag":"...", "url":"https://.../index.m3u8", ... }
 这是**公开的页面数据**，不是绕过登录，所以 `HtmlAdapter` 照读。但它被限制在显式开关后面：
 
 ```kotlin
-val resolveMode: String = MODE_NONE   // 默认不解析
-const val MODE_MACCMS_PLAYER = "maccmsPlayer"  // 只有声明了才去读 player_aaaa
+val resolveMode: String = MODE_NONE            // 默认不解析
+const val MODE_MACCMS_PLAYER = "maccmsPlayer"  // 声明了才去读 player_aaaa
+const val MODE_CLIENT_SCRIPT = "clientScript"  // 地址由站点脚本现算，不解析
+const val MODE_SESSION = "session"             // 只对登录用户开放，不代为登录
 ```
 
-只有 `DefaultRules.maccms` / `indexPhp` 声明了 `MODE_MACCMS_PLAYER`。其它站点留在 `none`，`resolveStream` 直接返回 `null`，上层如实说明拿不到直链，而不是猜一个地址丢给播放器。
+只有 `DefaultRules.maccms` / `indexPhp` 声明了 `MODE_MACCMS_PLAYER`，`DefaultRules.k4` 声明 `MODE_CLIENT_SCRIPT`。没配规则的站点留在 `none`。
 
-### 2. 「拿不到直链」分三种，不是一个可空字符串
+### 2. 「拿不到直链」分几种，不是一个可空字符串
 
-`MediaRepository.StreamResolution` 是密封接口，因为三种情况对用户意味着完全不同的下一步：
+`StreamResolution` 是密封接口，因为每种情况对用户意味着完全不同的下一步 —— 提示语混为一谈等于没提示：
 
 | 结果 | 含义 | 播放器里的说法 |
 |---|---|---|
 | `Ready(url)` | 拿到了能直接交给 ExoPlayer 的地址 | 正常播放 |
-| `ThirdPartyPage(pageUrl)` | 源只给了爱奇艺 / 腾讯 / B 站那种播放页链接 | 「这个源只提供了第三方平台的播放页链接，影枢不解析也不转码别人的页面。右侧可以切换到能给出直链的源。」 |
-| `NeedsSession` | 直链藏在站内登录态后面 | 「该源的直链需要站内登录态，影枢不代为登录。可在「播放源管理」里填入你自己的站点凭证，或切换到其它源。」 |
+| `ThirdPartyPage(pageUrl, platform)` | 源给的是腾讯视频 / 优酷 / 爱奇艺 / B 站那类平台的播放页 | 「这个源给的是腾讯视频的播放页，不是视频文件本身。影枢只在本机解码直链，不会去解析、转码别人的页面。」 |
+| `NeedsSession` | 直链只对登录用户开放 —— 填自己的凭证有可能走通 | 「直链只对登录用户开放，影枢不代为登录。可以在「播放源管理」里填入你自己的站点凭证，让影枢只做转发。」 |
+| `NeedsClientScript` | 地址由源站自己的页面脚本现算（WASM 签名），不执行脚本就构造不出请求 —— **填凭证也没用** | 「直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。影枢不执行站点脚本、也不逆它的签名，所以这里只能如实说拿不到 —— 填凭证也解决不了这一步。」 |
+| `Failed(reason)` | 规则缺失、模板改版、网络错误 | 「解析直链失败：<原因>」 |
 
-配套地，`MaccmsAdapter.resolveStream` 只放行媒体后缀的地址：
+四种「拿不到」的情况下，面板都会同时给出「重试」和「用右侧的源切换 →」，右侧的切源按钮在任何状态下都可用。点播放会**立刻**切进播放器并显示「正在解析直链…」，解析完再换成结论 —— 点下去就有反馈，不会出现「点了没反应」的观感。
 
-```kotlin
-val MEDIA_EXT = listOf(".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mpd", ".mov")
-```
+成因由**适配器自己**判断（只有它知道自己那个站的规则），`MediaRepository` 只负责在适配器抛异常时兜底。早先这里按 `episodeUrl.startsWith("http")` 归因，结果把「源自己的播放页」也误报成「第三方平台的播放页」—— 4K影视 就是这么被冤枉的。
 
-所以 `xiguazx.cc` 返回的第三方播放页 URL 永远不会被当作流交给播放器（那只会让 ExoPlayer 抛一个用户看不懂的错）。
+判断第三方平台用域名白名单（`VideoPlatforms.platformOf`：`v.qq.com` / `youku.com` / `iqiyi.com` / `bilibili.com` …），不是看它是不是 http 地址。
+
+`MaccmsAdapter` 只放行媒体后缀的地址（`.m3u8 .mp4 .mkv .flv .ts .mpd .mov`），所以 `xiguazx.cc` 返回的第三方播放页 URL 永远不会被当作流交给播放器（那只会让 ExoPlayer 抛一个用户看不懂的错）。
+
+### 3. 4K影视 的直链是 WASM 现算的
+
+这是排查「点了播放没反应」时查清的机制，记录在此以免下次重复踩：
+
+- 播放页 `/play/{id}` 的静态 HTML 里**零**出现 `m3u8` / `.mp4` / `player_aaaa` / `videoUrl` / `playUrl`。
+- 真实地址由 `/static/wasm/nbmovie_wasm.<hash>.js` 导出的 `build_play_url(dataid, secret_key, quality, play_key)` 现算，再 `fetch(url)`。参数来自页面：`dataid` 是分集锚点上的 `dataid` 属性，`secret_key` 是 href 里 `/play/` 之后那段，`play_key` 是页面里的 `window.myuserlink`（匿名时是页面生成的一串 base64）。
+- 把它跑出来长这样：`/video/play?p=40112&v=ch4n6z3tg&q=1080&s=<32位签名>&t=<毫秒时间戳>&k=<base64>`，其中 `s` 是 WASM 里算的。
+- 即使把地址正确构造出来，服务端仍然回 `{"code":401,"message":"请先登录并开通VIP会员"}`。**所以这个源对匿名用户本来就不给直链**，不是影枢的解析器写错了。
+
+影枢不去执行对方的脚本、也不逆它的签名 —— 那既是在绕对方的反爬，也不稳定。应用做的是把成因说清楚（`NeedsClientScript`），并让用户能一键切到能给出直链的源。
 
 `Http.failureReason()` 同样把状态码翻成人话：`567 → 安全策略拦截`、`403 → 拒绝访问`、`404 → 地址不存在`、`429 → 请求过于频繁`、`5xx → 站点异常 N`。源卡片上的红色标签因此是有信息量的，不是一句「连接失败」了事。
 
@@ -189,7 +205,7 @@ val MEDIA_EXT = listOf(".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mpd", ".mov")
 | `v.luttt.com` 从模拟器返回 **HTTP 567**（腾讯 EdgeOne 安全拦截页），但从宿主机 `curl` 返回 200 —— 即使两者出口 IP 相同 | 设备侧网络环境被拦。换 UA、补全 Chrome 请求头、退 HTTP/1.1、锁 TLS 1.2 均无效（宿主 curl 8.21/Schannel 通，设备 curl 8.0.1/BoringSSL 不通）。应用如实显示为「连接失败 · 安全策略拦截 · 不可用」，不假装可用 |
 | `xiguazx.cc` 的图片主机 `img.bwcgee.cn` 对封面返回 **403**（带 Referer、换 https 都不行） | 该源搜索结果行的封面会留空。详情页用的 `vcover-vt-pic.puui.qpic.cn` 正常返回 200 |
 
-另外，`西瓜影院` 的播放线路指向 `m.yichengwlkj.com` 这类 Next.js 客户端应用，服务端渲染的 HTML 里**没有** `__NEXT_DATA__`，也**零**出现 `m3u8` / `videoUrl` / `playUrl`。不执行客户端 JS 就拿不到地址，所以该源被正确归类为 `ThirdPartyPage`，而不是硬塞一个坏地址给播放器。
+另外，`西瓜影院` 的播放线路指向 `m.yichengwlkj.com` 这类 Next.js 客户端应用，服务端渲染的 HTML 里**没有** `__NEXT_DATA__`，也**零**出现 `m3u8` / `videoUrl` / `playUrl`。不执行客户端 JS 就拿不到地址，所以该源被正确归类为「拿不到直链」，而不是硬塞一个坏地址给播放器。（`西瓜影院` 的 `vod_play_url` 给的是腾讯 / 优酷 / B 站 / 爱奇艺 的播放页，所以点播放时提示的是「这个源给的是腾讯视频的播放页」。）
 
 ---
 
@@ -199,12 +215,13 @@ val MEDIA_EXT = listOf(".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mpd", ".mov")
 adb shell pm clear net.cinehub && adb shell am start -n net.cinehub/.MainActivity
 ```
 
-两点工具上的坑：
+三点工具上的坑：
 
-1. `adb shell input text` **不能注入非 ASCII**（`InputShellCommand.sendText` 会抛 `NullPointerException`）。自动化测试请用 ASCII 关键词，例如 `man`、`spider`。
+1. `adb shell input text` **不能注入非 ASCII**（`InputShellCommand.sendText` 会抛 `NullPointerException`）。要测中文关键词得装一个 ADBKeyboard（`com.android.adbkeyboard/.AdbIME`），并先让输入框拿到焦点，再 `am broadcast -a ADB_INPUT_TEXT --es msg "功夫女足"`。装完还要 `settings put secure enabled_input_methods "com.android.adbkeyboard/.AdbIME:<原来的输入法>"`，光 `ime enable` 在有些模拟器上选不中。
 2. 别凭肉眼估坐标点。用 `adb shell uiautomator dump` 拿真实 bounds 再点 —— Compose 的命中区域和视觉位置经常差几十像素。
+3. `uiautomator dump /sdcard/u.xml` 在 Git Bash 下会被 MSYS 路径转换改写成 `G:/git/Git/sdcard/u.xml`，导致 `adb pull` 找不到文件。用 `/data/local/tmp/u.xml` 当落点，或者 `MSYS_NO_PATHCONV=1`。
 
-验证「本机解码」这条链路：把除「演示源」外的源全部停用 → 首页 Hero 会变成演示源 → 进去点「播放 正片」。播放器应显示真实画面与 `00:0x / 10:34` 的进度（该测试流为 HLS，约 10 分 34 秒），这就证明画面是 Media3 在本机解出来的，而不是套了谁的网页。
+验证「本机解码」这条链路：把除「演示源」外的源全部停用 → 重启应用 → 首页 Hero 会变成演示源 → 进去点「播放 正片」。播放器应显示真实画面与 `00:0x / 10:34` 的进度（该测试流为 HLS，约 10 分 34 秒），这就证明画面是 Media3 在本机解出来的，而不是套了谁的网页。测完记得把源都打开 —— 停用是持久化的。
 
 ---
 

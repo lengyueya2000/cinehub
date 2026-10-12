@@ -13,6 +13,9 @@ import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
 import net.cinehub.data.model.SourceConfig
+import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.StreamUrls
+import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.net.Http
 
 /**
@@ -90,20 +93,15 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
     /**
      * 接口返回的未必都是直链。
      *
-     * 只认媒体文件后缀的地址；像 iqiyi / qq / bilibili 那种「播放页链接」
-     * 交给播放器只会报错，所以这里返回 null，让上层如实说明拿不到直链。
+     * 苹果 CMS 的 `vod_play_url` 里混着两类地址：真正的媒体文件，
+     * 以及爱奇艺 / 腾讯 / B 站那种「播放页」。后者交给播放器只会报错，
+     * 所以这里按域名如实归类，让上层说清楚是哪个平台。
      */
-    override suspend fun resolveStream(episodeUrl: String): String? =
-        episodeUrl.takeIf { it.isMediaUrl() }
-
-    private fun String.isMediaUrl(): Boolean {
-        if (!startsWith("http")) return false
-        val path = substringBefore('?').lowercase()
-        return MEDIA_EXT.any { path.endsWith(it) }
-    }
-
-    private companion object {
-        val MEDIA_EXT = listOf(".m3u8", ".mp4", ".mkv", ".flv", ".ts", ".mpd", ".mov")
+    override suspend fun resolveStream(episodeUrl: String): StreamResolution = when {
+        StreamUrls.isMediaUrl(episodeUrl) -> StreamResolution.Ready(episodeUrl)
+        else -> VideoPlatforms.platformOf(episodeUrl)
+            ?.let { StreamResolution.ThirdPartyPage(episodeUrl, it) }
+            ?: StreamResolution.Failed("接口给的地址既不是媒体文件，也不是已知平台的播放页")
     }
 
     private fun firstListItem(root: JsonObject): JsonObject? {

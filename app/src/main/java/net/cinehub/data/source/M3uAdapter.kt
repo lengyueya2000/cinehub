@@ -5,6 +5,7 @@ import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
 import net.cinehub.data.model.SourceConfig
+import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.net.Http
 
 /**
@@ -71,8 +72,9 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     /** m3u 里存的本身就是直链。 */
-    override suspend fun resolveStream(episodeUrl: String): String? =
-        episodeUrl.takeIf { it.startsWith("http") }
+    override suspend fun resolveStream(episodeUrl: String): StreamResolution =
+        if (episodeUrl.startsWith("http")) StreamResolution.Ready(episodeUrl)
+        else StreamResolution.Failed("播放列表里这一项不是可直接播放的地址")
 
     private fun parse(text: String): List<Media> {
         val out = ArrayList<Media>()

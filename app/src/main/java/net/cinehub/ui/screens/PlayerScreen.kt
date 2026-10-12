@@ -86,6 +86,7 @@ fun PlayerScreen(
     val health by vm.health.collectAsState()
     val detail by vm.detail.collectAsState()
     val resumeFrom by vm.resumePosition.collectAsState()
+    val resolving by vm.resolving.collectAsState()
 
     var pos by remember { mutableLongStateOf(resumeFrom) }
     var dur by remember { mutableLongStateOf(0L) }
@@ -237,25 +238,44 @@ fun PlayerScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        "这个源拿不到直链",
+                        if (resolving) "正在解析直链…" else "这个源拿不到直链",
                         color = Color.White,
                         fontSize = Fs.sec,
                         fontWeight = FontWeight.Bold,
                     )
                     Spacer8()
                     Text(
-                        playing?.note ?: "未知原因",
+                        if (resolving) {
+                            "已收到你的播放请求，正在向「${playing?.sourceName ?: ""}」取这一集的地址。"
+                        } else {
+                            playing?.note ?: "未知原因"
+                        },
                         color = T.TextDim,
                         fontSize = Fs.xs,
                         lineHeight = Fs.xs * 1.7f,
                     )
-                    Spacer12()
-                    Text(
-                        "用右侧的源切换 →",
-                        color = T.Src500,
-                        fontSize = Fs.sm,
-                        fontWeight = FontWeight.SemiBold,
-                    )
+                    if (!resolving) {
+                        Spacer12()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "重试",
+                                color = Color.White,
+                                fontSize = Fs.sm,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clip(R.full)
+                                    .background(Color.White.copy(alpha = .14f))
+                                    .clickable { vm.retryPlay() }
+                                    .padding(horizontal = 16.dp, vertical = 7.dp),
+                            )
+                            Spacer8()
+                            Text(
+                                "用右侧的源切换 →",
+                                color = T.Src500,
+                                fontSize = Fs.sm,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
                 }
             } else if (!isPlaying) {
                 Box(
@@ -346,13 +366,24 @@ fun PlayerScreen(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    val noStream = playing?.streamUrl == null
                     Text(
-                        if (isPlaying) "⏸ 暂停" else "▶ 播放",
-                        color = Color(0xFFE2E8F0),
+                        when {
+                            resolving -> "◌ 解析中"
+                            noStream -> "↻ 重新解析"
+                            isPlaying -> "⏸ 暂停"
+                            else -> "▶ 播放"
+                        },
+                        color = if (noStream) T.Src500 else Color(0xFFE2E8F0),
                         fontSize = Fs.xs,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.clickable {
-                            if (isPlaying) player.pause() else player.play()
+                            when {
+                                resolving -> Unit
+                                noStream -> vm.retryPlay()
+                                isPlaying -> player.pause()
+                                else -> player.play()
+                            }
                         },
                     )
                     Box(Modifier.weight(1f))

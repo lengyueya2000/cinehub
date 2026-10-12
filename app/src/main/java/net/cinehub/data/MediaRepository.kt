@@ -12,25 +12,11 @@ import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
+import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.net.Http
 import net.cinehub.data.source.SourceAdapters
 import java.util.concurrent.ConcurrentHashMap
-
-/**
- * 直链解析结果。
- *
- * 分成三种而不是一个可空的字符串，是因为三种情况对用户意味着完全不同的下一步。
- */
-sealed interface StreamResolution {
-    /** 拿到了能直接交给播放器的地址。 */
-    data class Ready(val url: String) : StreamResolution
-
-    /** 源只给了一个第三方播放页（爱奇艺 / 腾讯 / B 站那种），本机没法解码。 */
-    data class ThirdPartyPage(val pageUrl: String) : StreamResolution
-
-    /** 源把直链藏在登录态后面，影枢不代为登录。 */
-    data object NeedsSession : StreamResolution
-}
 
 /**
  * 跨源聚合。
@@ -140,17 +126,17 @@ class MediaRepository(private val sources: SourceRepository) {
     /**
      * 解析直链。
      *
-     * 拿不到时连原因一起带回来 —— 「这个源需要登录」和「这个源只给了一个
-     * 第三方播放页链接」对用户来说是两件事，提示语不该混为一谈。
+     * 成因由适配器自己判断（只有它知道自己那个站的规则），这里只做一件事：
+     * 适配器抛异常时兜底，别让用户看到一个没头没尾的失败。
      */
     suspend fun resolveStream(cfg: SourceConfig, episodeUrl: String): StreamResolution =
         withContext(Dispatchers.IO) {
-            val url = runCatching { SourceAdapters.create(cfg).resolveStream(episodeUrl) }.getOrNull()
-            when {
-                url != null -> StreamResolution.Ready(url)
-                episodeUrl.startsWith("http") -> StreamResolution.ThirdPartyPage(episodeUrl)
-                else -> StreamResolution.NeedsSession
-            }
+            runCatching { SourceAdapters.create(cfg).resolveStream(episodeUrl) }
+                .getOrElse { e ->
+                    VideoPlatforms.platformOf(episodeUrl)
+                        ?.let { StreamResolution.ThirdPartyPage(episodeUrl, it) }
+                        ?: StreamResolution.Failed(e.message ?: "解析直链时出错")
+                }
         }
 
     /**

@@ -117,7 +117,7 @@ fun DetailScreen(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 96.dp),
         ) {
-            item { Backdrop(d, fav) { fav = !fav } }
+            item { Backdrop(d, fav, onBack) { fav = !fav } }
 
             item {
                 Row(
@@ -270,7 +270,7 @@ fun DetailScreen(
 }
 
 @Composable
-private fun Backdrop(d: MediaDetail, fav: Boolean, onFav: () -> Unit) {
+private fun Backdrop(d: MediaDetail, fav: Boolean, onBack: () -> Unit, onFav: () -> Unit) {
     Box(Modifier.fillMaxWidth().height(240.dp)) {
         if (!d.media.cover.isNullOrBlank()) {
             AsyncImage(
@@ -293,10 +293,10 @@ private fun Backdrop(d: MediaDetail, fav: Boolean, onFav: () -> Unit) {
             Modifier.fillMaxWidth().padding(Sp.s4),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            CircleIcon(Icons.Filled.ArrowBack) {}
+            CircleIcon(Icons.Filled.ArrowBack, onBack)
             Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                 CircleIcon(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, onFav)
-                CircleIcon(Icons.Filled.MoreVert) {}
+                CircleIcon(Icons.Filled.MoreVert, {})
             }
         }
         Row(

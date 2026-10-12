@@ -3,6 +3,7 @@ package net.cinehub.data.source
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.SourceConfig
+import net.cinehub.data.model.StreamResolution
 
 /**
  * 一个播放源的读写接口。
@@ -26,10 +27,11 @@ interface SourceAdapter {
     /**
      * 解析某一集的真实播放地址。
      *
-     * 有些站点的列表页是公开的、但真实地址需要登录态或签名，
-     * 这里返回 null 表示「本机拿不到直链」，上层会给出明确提示而不是假装能播。
+     * 只有适配器自己知道「拿不到直链」是哪一种成因（登录态？第三方播放页？
+     * 地址要靠站点脚本现算？），所以这里直接返回 [StreamResolution]，
+     * 上层只负责把它翻译成给用户看的话，不再靠猜。
      */
-    suspend fun resolveStream(episodeUrl: String): String?
+    suspend fun resolveStream(episodeUrl: String): StreamResolution
 }
 
 /** 适配器工厂：按 [SourceConfig.kind] 选择实现。 */

@@ -11,7 +11,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
-import net.cinehub.data.StreamResolution
 import net.cinehub.data.model.AggregatedMedia
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
@@ -20,6 +19,7 @@ import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
+import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.source.SourceAdapters
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -92,8 +92,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val sourceName: String,
         val sourceId: String,
         val streamUrl: String?,
+        /** 该集的播放页地址，用于「重试」时重新解析。 */
+        val episodeUrl: String? = null,
         val note: String? = null,
     )
+
+    /** 正在解析直链 —— 播放器靠它显示「已收到你的点击」，而不是一个不动的黑屏。 */
+    private val _resolving = MutableStateFlow(false)
+    val resolving: StateFlow<Boolean> = _resolving.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -261,8 +267,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 起播。
      *
-     * 如果这个源拿不到直链，会带着 [note] 告诉用户原因，
-     * 并且其它源的切换按钮依然可用 —— 用户能立刻换一个能播的源。
+     * 先落一个 streamUrl 为 null 的 Playing，让播放器立刻切过去并显示「正在解析直链」——
+     * 这样点下去就有反馈，不会出现「点了没反应」的观感。
+     * 解析完成后要么填入直链，要么带上如实的原因；两种情况下右侧的切源按钮都可用。
      */
     fun play(
         sourceId: String,
@@ -275,28 +282,70 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
             val name = cfg?.name ?: sourceId
-            if (episodeUrl.isNullOrBlank()) {
-                _playing.value = Playing(
-                    mediaTitle, episodeName, episodeIndex, name, sourceId, null,
-                    note = "该源的播放地址无效",
-                )
-                return@launch
-            }
-            val res = mediaRepo.resolveStream(cfg!!, episodeUrl)
-            val url = (res as? StreamResolution.Ready)?.url
+
+            // 立刻进入播放器，先把「我收到了」这一步给出去
             _playing.value = Playing(
-                mediaTitle, episodeName, episodeIndex, name, sourceId, url,
-                note = when (res) {
-                    is StreamResolution.Ready -> null
-                    is StreamResolution.ThirdPartyPage ->
-                        "这个源只提供了第三方平台的播放页链接，影枢不解析也不转码别人的页面。" +
-                            "右侧可以切换到能给出直链的源。"
-                    is StreamResolution.NeedsSession ->
-                        "该源的直链需要站内登录态，影枢不代为登录。可在「播放源管理」里填入你自己的站点凭证，或切换到其它源。"
-                },
+                mediaTitle, episodeName, episodeIndex, name, sourceId, null, episodeUrl,
             )
             _resumePosition.value = resumeFrom
+
+            if (cfg == null) {
+                _playing.value = _playing.value?.copy(note = "播放源已不存在，可能在「播放源管理」里被删掉了")
+                return@launch
+            }
+            if (episodeUrl.isNullOrBlank()) {
+                _playing.value = _playing.value?.copy(note = "该源的播放地址无效")
+                return@launch
+            }
+
+            _resolving.value = true
+            val res = mediaRepo.resolveStream(cfg, episodeUrl)
+            _resolving.value = false
+
+            _playing.value = _playing.value?.copy(
+                streamUrl = (res as? StreamResolution.Ready)?.url,
+                note = noteOf(res),
+            )
         }
+    }
+
+    /** 重试解析：用户在播放器里点「重试」时走这里，不换集也不换源。 */
+    fun retryPlay() {
+        val p = _playing.value ?: return
+        play(
+            sourceId = p.sourceId,
+            mediaTitle = p.mediaTitle,
+            episodeName = p.episodeName,
+            episodeIndex = p.episodeIndex,
+            episodeUrl = p.episodeUrl,
+            resumeFrom = _resumePosition.value,
+        )
+    }
+
+    /**
+     * 把解析结果翻译成给用户看的一句话。
+     *
+     * 几种「拿不到」的成因要分得开 —— 尤其要让用户知道哪些是换个源就能解决的、
+     * 哪些是填自己的凭证可能走通的、哪些是本站根本不打算给匿名用户的。
+     */
+    private fun noteOf(res: StreamResolution): String? = when (res) {
+        is StreamResolution.Ready -> null
+
+        is StreamResolution.ThirdPartyPage ->
+            "这个源给的是${res.platform}的播放页，不是视频文件本身。" +
+                "影枢只在本机解码直链，不会去解析、转码别人的页面。"
+
+        is StreamResolution.NeedsSession ->
+            "直链只对登录用户开放，影枢不代为登录。" +
+                "可以在「播放源管理」里填入你自己的站点凭证，让影枢只做转发。"
+
+        is StreamResolution.NeedsClientScript ->
+            "直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。" +
+                "影枢不执行站点脚本、也不逆它的签名，所以这里只能如实说拿不到 —— " +
+                "填凭证也解决不了这一步。"
+
+        is StreamResolution.Failed ->
+            "解析直链失败：${res.reason}"
     }
 
     /** 播放器里切源：保持进度。 */
@@ -320,7 +369,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updatePosition(sec: Long) { _resumePosition.value = sec }
 
-    fun stopPlaying() { _playing.value = null }
+    fun stopPlaying() {
+        _playing.value = null
+        _resolving.value = false
+    }
 
     private fun qualityOf(m: Media): String? {
         val t = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")

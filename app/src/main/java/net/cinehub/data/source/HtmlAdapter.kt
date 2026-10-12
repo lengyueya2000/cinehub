@@ -9,6 +9,8 @@ import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
 import net.cinehub.data.model.SourceConfig
+import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.net.Http
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -94,13 +96,39 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
     /**
      * 解析真实播放地址。
      *
-     * [HtmlRules.resolveMode] 为 none 时直接返回 null —— 上层会明确告诉用户
-     * 「此源需要站内会话」，而不是给一个假地址让播放器报错。
+     * 四条分支各对应一种真实成因，按「先看是不是别人的页面，再看本站怎么取」的顺序判断：
+     * 第三方平台的播放页是确定性事实，任何模式下都该如实说明，而不是硬塞给播放器。
      */
-    override suspend fun resolveStream(episodeUrl: String): String? {
-        if (rules.resolveMode != HtmlRules.MODE_MACCMS_PLAYER) return null
-        val html = Http.get(episodeUrl, referer = config.baseUrl, headers = Http.authHeaders(config))
-        return macPlayerUrl(html)
+    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+        // 1. 爱奇艺 / 腾讯 / B 站那类播放页 —— 本机解不了别人的页面
+        VideoPlatforms.platformOf(episodeUrl)?.let {
+            return StreamResolution.ThirdPartyPage(episodeUrl, it)
+        }
+
+        // 2. 苹果 CMS 模板：地址写在播放页的 player_aaaa 里
+        if (rules.resolveMode == HtmlRules.MODE_MACCMS_PLAYER) {
+            val html = Http.get(episodeUrl, referer = config.baseUrl, headers = Http.authHeaders(config))
+            return macPlayerUrl(html)
+                ?.let { StreamResolution.Ready(it) }
+                ?: StreamResolution.Failed(
+                    "播放页里没有 player_aaaa 数据，这个模板可能改版了",
+                )
+        }
+
+        // 3. 地址由站点脚本现算（如 4kvm.net 的 WASM 签名）
+        if (rules.resolveMode == HtmlRules.MODE_CLIENT_SCRIPT) {
+            return StreamResolution.NeedsClientScript
+        }
+
+        // 4. 直链只对登录用户开放 —— 填用户自己的凭证可能走通
+        if (rules.resolveMode == HtmlRules.MODE_SESSION) {
+            return StreamResolution.NeedsSession
+        }
+
+        // 5. 没配规则 —— 如实说规则不足，而不是猜一个原因
+        return StreamResolution.Failed(
+            "这个源还没有配置直链解析规则，影枢只能拿到它的播放页地址",
+        )
     }
 
     /**
@@ -197,12 +225,18 @@ object DefaultRules {
         episodeSelector = "a.episode-link, a[data-episode]",
     )
 
-    /** 4kvm.net 这类站点：详情页即播放页，直链需要站内会话，所以不解析。 */
+    /**
+     * 4kvm.net 这类站点：详情页即播放页，直链由页面里的 WASM 现算签名。
+     *
+     * 静态 HTML 里没有 player_aaaa，也没有任何 m3u8 / mp4 —— 实测过。
+     * 所以标成 [HtmlRules.MODE_CLIENT_SCRIPT]，让提示语说清「签名在站点脚本里」，
+     * 而不是含糊地说「需要登录」（填凭证也没用）或「第三方播放页」（那是另一回事）。
+     */
     val k4 = generic.copy(
         itemSelector = "a[href*=/play/]",
         detailPath = "/play/{id}",
         episodeSelector = "a.episode-link",
-        resolveMode = HtmlRules.MODE_NONE,
+        resolveMode = HtmlRules.MODE_CLIENT_SCRIPT,
     )
 
     /**

@@ -82,7 +82,9 @@ data class HtmlRules(
      *
      * 苹果 CMS 模板站会把真实地址写进播放页的 `player_aaaa` 配置里，
      * 这是公开的页面数据（不是绕过登录），所以可以照读；
-     * 其它站点留 none，[net.cinehub.data.source.HtmlAdapter.resolveStream] 返回 null。
+     * 地址要靠站点脚本现算的标 [MODE_CLIENT_SCRIPT]，
+     * 直链只对登录用户开放的标 [MODE_SESSION]，
+     * 其余留 [MODE_NONE]，由 [net.cinehub.data.source.HtmlAdapter.resolveStream] 如实说明。
      */
     val resolveMode: String = MODE_NONE,
 ) {
@@ -91,6 +93,22 @@ data class HtmlRules(
 
         /** 从播放页的 player_aaaa 里取 url 字段。 */
         const val MODE_MACCMS_PLAYER = "maccmsPlayer"
+
+        /**
+         * 直链由站点自己的页面脚本现算（WASM 签名 / JS 拼地址）。
+         *
+         * 不执行对方的脚本就构造不出请求，所以影枢不解析、也不去逆它的签名 ——
+         * 标这个模式只是为了让提示语说实话。
+         */
+        const val MODE_CLIENT_SCRIPT = "clientScript"
+
+        /**
+         * 直链只对登录用户开放。
+         *
+         * 影枢不代为登录，但会提示用户可以在源配置里填**自己的**站点凭证
+         * （`authToken` + `authMode`），凭证只做转发。
+         */
+        const val MODE_SESSION = "session"
     }
 }
 
