@@ -371,6 +371,7 @@ private fun SourceRow(
                         SourceKind.Html -> "网页解析"
                         SourceKind.JsonApi -> "JSON 接口"
                         SourceKind.M3u -> "M3U 列表"
+                        SourceKind.AiMovie -> "签名接口"
                     },
                     ghost = true,
                 )
@@ -523,10 +524,15 @@ private fun AddSourceSheet(
             }
 
             Field("接入方式", "不确定就选网页解析") {
-                Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                    KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                    KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                    KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                Column(verticalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                    }
                 }
             }
 

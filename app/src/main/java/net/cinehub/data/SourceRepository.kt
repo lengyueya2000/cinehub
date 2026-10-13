@@ -112,12 +112,9 @@ object Seed {
             id = "dongpiandi",
             name = "懂片帝AI",
             baseUrl = "https://dongpiandi.ai",
-            kind = net.cinehub.data.model.SourceKind.Html,
+            kind = net.cinehub.data.model.SourceKind.AiMovie,
             priority = 4,
             tags = listOf("1080P", "AI 找片"),
-            html = net.cinehub.data.source.DefaultRules.generic.copy(
-                listPath = "/search?q={q}",
-            ),
         ),
         SourceConfig(
             id = "demo_m3u",

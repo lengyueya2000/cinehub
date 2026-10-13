@@ -40,5 +40,6 @@ object SourceAdapters {
         net.cinehub.data.model.SourceKind.M3u -> M3uAdapter(cfg)
         net.cinehub.data.model.SourceKind.JsonApi -> MaccmsAdapter(cfg)
         net.cinehub.data.model.SourceKind.Html -> HtmlAdapter(cfg)
+        net.cinehub.data.model.SourceKind.AiMovie -> AiMovieAdapter(cfg)
     }
 }

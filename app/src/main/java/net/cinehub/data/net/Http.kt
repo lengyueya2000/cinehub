@@ -2,8 +2,10 @@ package net.cinehub.data.net
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.util.concurrent.TimeUnit
 
@@ -60,6 +62,63 @@ object Http {
                 r.body?.string() ?: error("空响应")
             }
     }
+
+    /**
+     * 带自定义头地取一次，并把响应里服务端下发的 Cookie 带回给调用方。
+     *
+     * 有些站（如带签名鉴权的前端应用）要先建匿名会话、之后的请求都得带上
+     * 它 Set-Cookie 回来的东西 —— 只拿到正文就拿不到后续数据。
+     */
+    suspend fun getWithHeaders(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        referer: String? = null,
+        timeoutSec: Long = 20,
+    ): ResponseBody = withContext(Dispatchers.IO) {
+        val b = Request.Builder().url(url)
+        b.header("User-Agent", UA)
+        referer?.let { b.header("Referer", it) }
+        headers.forEach { (k, v) -> b.header(k, v) }
+        client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
+            .newCall(b.build()).execute().use { r ->
+                if (!r.isSuccessful) error(failureReason(r.code))
+                ResponseBody(
+                    body = r.body?.string() ?: error("空响应"),
+                    setCookie = r.headers("Set-Cookie").joinToString("; ") {
+                        it.substringBefore(';')
+                    }.takeIf { it.isNotBlank() },
+                )
+            }
+    }
+
+    /** POST 一段 JSON，同样把 Set-Cookie 带回来。 */
+    suspend fun post(
+        url: String,
+        json: String,
+        headers: Map<String, String> = emptyMap(),
+        timeoutSec: Long = 20,
+    ): ResponseBody = withContext(Dispatchers.IO) {
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val b = Request.Builder().url(url).header("User-Agent", UA).post(json.toRequestBody(mediaType))
+        headers.forEach { (k, v) -> b.header(k, v) }
+        client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
+            .newCall(b.build()).execute().use { r ->
+                ResponseBody(
+                    body = r.body?.string().orEmpty(),
+                    status = r.code,
+                    setCookie = r.headers("Set-Cookie").joinToString("; ") {
+                        it.substringBefore(';')
+                    }.takeIf { it.isNotBlank() },
+                )
+            }
+    }
+
+    /** 响应正文 + 服务端下发的会话 Cookie（没有则为 null）。 */
+    data class ResponseBody(
+        val body: String,
+        val status: Int = 200,
+        val setCookie: String? = null,
+    )
 
     /** 探测连通性并返回延迟；失败抛出异常。 */
     suspend fun probe(url: String, referer: String? = null): Long = withContext(Dispatchers.IO) {
