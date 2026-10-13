@@ -32,9 +32,33 @@ sealed interface StreamResolution {
     data class Failed(val reason: String) : StreamResolution
 }
 
+/**
+ * 把解析结果翻译成给用户看的一句话；能正常播放时返回 null。
+ *
+ * 播放和缓存走的是同一条解析路径，所以要说的话也得是同一句 ——
+ * 之前它在 ViewModel 里写了一份，下载那边再抄一遍就会慢慢长成两套说法。
+ */
+fun StreamResolution.userNote(): String? = when (this) {
+    is StreamResolution.Ready -> null
+
+    is StreamResolution.ThirdPartyPage ->
+        "这个源给的是${platform}的播放页，不是视频文件本身。" +
+            "影枢只在本机解码直链，不会去解析、转码别人的页面。"
+
+    is StreamResolution.NeedsSession ->
+        "直链只对登录用户开放，影枢不代为登录。" +
+            "可以在「播放源管理」里填入你自己的站点凭证，让影枢只做转发。"
+
+    is StreamResolution.NeedsClientScript ->
+        "直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。" +
+            "影枢不执行站点脚本、也不逆它的签名，所以这里只能如实说拿不到 —— " +
+            "填凭证也解决不了这一步。"
+
+    is StreamResolution.Failed -> "解析直链失败：$reason"
+}
+
 /** 已知的第三方视频平台。 */
-object VideoPlatforms {
-    private val HOSTS = listOf(
+object VideoPlatforms {    private val HOSTS = listOf(
         "v.qq.com" to "腾讯视频",
         "film.qq.com" to "腾讯视频",
         "youku.com" to "优酷",

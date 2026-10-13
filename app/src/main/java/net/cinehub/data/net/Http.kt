@@ -144,7 +144,7 @@ object Http {
      * 567 是腾讯 EdgeOne 的安全拦截码，直接显示「HTTP 567」对用户毫无意义 ——
      * 它真正传达的是「这个站在你所在的网络环境下拒绝访问」。
      */
-    private fun failureReason(code: Int): String = when (code) {
+    fun failureReason(code: Int): String = when (code) {
         567 -> "安全策略拦截"
         403 -> "拒绝访问"
         404 -> "地址不存在"

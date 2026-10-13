@@ -27,11 +27,22 @@ import java.util.concurrent.ConcurrentHashMap
 class MediaRepository(private val sources: SourceRepository) {
 
     private val healthCache = ConcurrentHashMap<String, HealthReport>()
+    private val healthAt = ConcurrentHashMap<String, Long>()
 
+    /**
+     * Down 只算「这一刻没探通」，过一分钟就自动重试。
+     *
+     * 探的是站点根路径，跟真正取内容的接口不是一回事：根路径抖一下就把源判死，
+     * 用户看到的就成了「搜索没结果」「某几个源凭空消失」。
+     */
     suspend fun healthOf(cfg: SourceConfig, force: Boolean = false): HealthReport {
-        if (!force) healthCache[cfg.id]?.let { return it }
+        val cached = healthCache[cfg.id]
+        val expired = cached != null && cached.health == Health.Down &&
+            System.currentTimeMillis() - (healthAt[cfg.id] ?: 0L) > DOWN_RETRY_MS
+        if (!force && cached != null && !expired) return cached
         val report = check(cfg)
         healthCache[cfg.id] = report
+        healthAt[cfg.id] = System.currentTimeMillis()
         return report
     }
 
@@ -58,15 +69,21 @@ class MediaRepository(private val sources: SourceRepository) {
     suspend fun search(keyword: String): List<AggregatedMedia> = coroutineScope {
         val active = sources.active()
         val per = active.map { cfg ->
+            // 这里不按健康度设闸门：探根路径失败不代表这个源取不到内容，
+            // 拿 Down 当闸门会让一次抖动把源整个会话判死 —— 表现就是「搜索失效、少了几个源」。
             async {
-                val health = healthOf(cfg)
-                if (health.health == Health.Down) {
-                    cfg to emptyList<Media>()
-                } else {
-                    cfg to runCatching {
-                        SourceAdapters.create(cfg).search(keyword, 1)
-                    }.getOrElse { emptyList() }
+                val t0 = System.currentTimeMillis()
+                val list = runCatching {
+                    SourceAdapters.create(cfg).search(keyword, 1)
+                }.getOrElse { emptyList() }
+                // 真取回了内容，就是比探根路径更硬的证据 —— 用它把「不可用」洗掉，
+                // 否则界面上会出现「这个源给了结果、却标着不可用」的自相矛盾。
+                if (list.isNotEmpty()) {
+                    val cost = System.currentTimeMillis() - t0
+                    healthCache[cfg.id] = HealthReport(if (cost < 800) Health.Ok else Health.Slow, cost)
+                    healthAt[cfg.id] = System.currentTimeMillis()
                 }
+                cfg to list
             }
         }.map { it.await() }
 
@@ -118,8 +135,7 @@ class MediaRepository(private val sources: SourceRepository) {
     suspend fun home(): List<Media> = coroutineScope {
         val active = sources.active()
         for (cfg in active) {
-            val health = healthOf(cfg)
-            if (health.health == Health.Down) continue
+            // 同样不按健康度跳过：探根路径失败的源照样可能给出内容，取不到自然会落到下一个
             val list = runCatching { SourceAdapters.create(cfg).browse(1) }.getOrElse { emptyList() }
             if (list.isNotEmpty()) return@coroutineScope list
         }
@@ -154,8 +170,8 @@ class MediaRepository(private val sources: SourceRepository) {
         val active = sources.active()
         active.map { cfg ->
             async {
-                val health = healthOf(cfg)
-                if (health.health == Health.Down) return@async emptyList()
+                // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
+                val health = healthCache[cfg.id]?.health ?: Health.Unknown
                 runCatching {
                     SourceAdapters.create(cfg).search(title, 1)
                 }.getOrElse { emptyList() }
@@ -165,7 +181,7 @@ class MediaRepository(private val sources: SourceRepository) {
                             sourceId = cfg.id,
                             sourceName = cfg.name,
                             item = it,
-                            health = health.health,
+                            health = health,
                             quality = qualityTag(it),
                             latencyMs = healthCache[cfg.id]?.latencyMs,
                         )
@@ -183,5 +199,9 @@ class MediaRepository(private val sources: SourceRepository) {
             Regex("720").containsMatchIn(text) -> "720P"
             else -> null
         }
+    }
+
+    private companion object {
+        const val DOWN_RETRY_MS = 60_000L
     }
 }

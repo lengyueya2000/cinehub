@@ -128,8 +128,8 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                     is Route.Detail -> DetailScreen(
                         vm = vm,
                         onBack = { route = Route.Home },
-                        onPlay = { sourceId, title, ep ->
-                            vm.play(sourceId, title, ep.name, ep.index, ep.playUrl, resumeFrom = 0)
+                        onPlay = { sourceId, mediaId, title, ep ->
+                            vm.play(sourceId, title, ep.name, ep.index, ep.playUrl, resumeFrom = 0, mediaId = mediaId)
                         },
                     )
 
@@ -138,7 +138,7 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
-                    is Route.Downloads -> DownloadsScreen()
+                    is Route.Downloads -> DownloadsScreen(vm)
 
                     is Route.Player -> PlayerScreen(
                         vm = vm,
@@ -156,9 +156,16 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                 }
             }
 
-            // 底部 TabBar 只在首页/搜索态显示，其它页面由各自顶栏返回
-            if (route is Route.Home || route is Route.Search) {
-                TabBar(active = 0) { idx ->
+            // 底部 TabBar 在这四个平级页面显示；详情/播放器/源管理有自己的顶栏返回
+            val tab = when (route) {
+                is Route.Home, is Route.Search -> 0
+                is Route.Library -> 1
+                is Route.Downloads -> 2
+                is Route.Sources -> 3
+                else -> null
+            }
+            tab?.let { active ->
+                TabBar(active = active) { idx ->
                     when (idx) {
                         0 -> route = Route.Home
                         1 -> route = Route.Library

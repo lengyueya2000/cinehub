@@ -11,12 +11,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -465,6 +468,9 @@ private fun AddSourceSheet(
         )
         Column(
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                // 表单比屏幕高时（小屏 / 横屏）按钮会被裁掉，所以整块可滚，最多占四分之三屏
+                .heightIn(max = 640.dp)
+                .verticalScroll(rememberScrollState())
                 .clip(R.sheet)
                 .background(T.Surface)
                 .border(1.dp, T.BorderStrong, R.sheet)

@@ -9,9 +9,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.model.AggregatedMedia
+import net.cinehub.data.model.DownloadTask
+import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.Media
@@ -20,12 +23,16 @@ import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.userNote
 import net.cinehub.data.source.SourceAdapters
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val sourceRepo = SourceRepository(app)
     private val mediaRepo = MediaRepository(sourceRepo)
+    private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
+
+    val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
 
     // ---------- 播放源 ----------
     private val _sources = MutableStateFlow<List<SourceConfig>>(emptyList())
@@ -97,6 +104,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val note: String? = null,
         /** 源站根地址 —— 播放器要带着它做 Referer，CDN 才认。 */
         val sourceBaseUrl: String? = null,
+        /** 缓存这一集时要写进任务的键；本地回放也带着它，切回在线源才对得上。 */
+        val mediaId: String? = null,
     )
 
     /** 正在解析直链 —— 播放器靠它显示「已收到你的点击」，而不是一个不动的黑屏。 */
@@ -292,6 +301,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         episodeIndex: Int,
         episodeUrl: String?,
         resumeFrom: Long = _resumePosition.value,
+        mediaId: String? = null,
     ) {
         viewModelScope.launch {
             val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
@@ -301,6 +311,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _playing.value = Playing(
                 mediaTitle, episodeName, episodeIndex, name, sourceId, null, episodeUrl,
                 sourceBaseUrl = cfg?.baseUrl?.trimEnd('/'),
+                mediaId = mediaId,
             )
             _resumePosition.value = resumeFrom
 
@@ -334,6 +345,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             episodeIndex = p.episodeIndex,
             episodeUrl = p.episodeUrl,
             resumeFrom = _resumePosition.value,
+            mediaId = p.mediaId,
         )
     }
 
@@ -343,25 +355,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 几种「拿不到」的成因要分得开 —— 尤其要让用户知道哪些是换个源就能解决的、
      * 哪些是填自己的凭证可能走通的、哪些是本站根本不打算给匿名用户的。
      */
-    private fun noteOf(res: StreamResolution): String? = when (res) {
-        is StreamResolution.Ready -> null
-
-        is StreamResolution.ThirdPartyPage ->
-            "这个源给的是${res.platform}的播放页，不是视频文件本身。" +
-                "影枢只在本机解码直链，不会去解析、转码别人的页面。"
-
-        is StreamResolution.NeedsSession ->
-            "直链只对登录用户开放，影枢不代为登录。" +
-                "可以在「播放源管理」里填入你自己的站点凭证，让影枢只做转发。"
-
-        is StreamResolution.NeedsClientScript ->
-            "直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。" +
-                "影枢不执行站点脚本、也不逆它的签名，所以这里只能如实说拿不到 —— " +
-                "填凭证也解决不了这一步。"
-
-        is StreamResolution.Failed ->
-            "解析直链失败：${res.reason}"
-    }
+    private fun noteOf(res: StreamResolution): String? = res.userNote()
 
     /** 播放器里切源：保持进度。 */
     fun switchPlayingSource(av: SourceAvailability, episodeIndex: Int) {
@@ -378,8 +372,63 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 episodeIndex = ep?.index ?: episodeIndex,
                 episodeUrl = ep?.playUrl,
                 resumeFrom = pos,
+                mediaId = av.item.id,
             )
         }
+    }
+
+    // ---------- 离线缓存 ----------
+
+    fun downloadTask(sourceId: String, mediaId: String, episodeIndex: Int): DownloadTask? =
+        downloadRepo.taskOf(sourceId, mediaId, episodeIndex)
+
+    fun cache(sourceId: String, media: Media, episode: Episode) {
+        viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId } ?: return@launch
+            downloadRepo.enqueue(cfg, media, episode)
+        }
+    }
+
+    fun cacheLine(sourceId: String, media: Media, episodes: List<Episode>) {
+        viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId } ?: return@launch
+            downloadRepo.enqueueAll(cfg, media, episodes)
+        }
+    }
+
+    /** 播放器里的「缓存」：把当前这一集存下来，用的就是它刚解析过的那条直链。 */
+    fun cachePlaying() {
+        val p = _playing.value ?: return
+        val mediaId = p.mediaId ?: return
+        val d = _detail.value?.takeIf { it.media.id == mediaId } ?: return
+        cache(
+            p.sourceId,
+            d.media,
+            Episode(p.episodeName, p.episodeIndex, p.episodeUrl),
+        )
+    }
+
+    fun pauseDownload(id: String) = downloadRepo.pause(id)
+
+    fun resumeDownload(id: String) = downloadRepo.resume(id)
+
+    fun deleteDownload(id: String) = downloadRepo.delete(id)
+
+    fun downloadSpace(): Long = downloadRepo.spaceUsed()
+
+    /** 直接播已缓存好的文件，不再碰网络。 */
+    fun playCached(task: DownloadTask) {
+        val uri = downloadRepo.localUri(task.id) ?: return
+        _resumePosition.value = 0
+        _playing.value = Playing(
+            mediaTitle = task.mediaTitle,
+            episodeName = task.episodeName,
+            episodeIndex = task.episodeIndex,
+            sourceName = "本机缓存",
+            sourceId = "local",
+            streamUrl = uri,
+            mediaId = task.mediaId,
+        )
     }
 
     fun updatePosition(sec: Long) { _resumePosition.value = sec }

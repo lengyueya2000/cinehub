@@ -3,6 +3,8 @@ package net.cinehub.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,11 +49,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import net.cinehub.data.model.DownloadStatus
+import net.cinehub.data.model.DownloadTask
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.MediaDetail
@@ -69,11 +74,12 @@ import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DetailScreen(
     vm: AppViewModel,
     onBack: () -> Unit,
-    onPlay: (sourceId: String, title: String, ep: Episode) -> Unit,
+    onPlay: (sourceId: String, mediaId: String, title: String, ep: Episode) -> Unit,
 ) {
     val detail by vm.detail.collectAsState()
     val loading by vm.detailLoading.collectAsState()
@@ -81,6 +87,7 @@ fun DetailScreen(
     val siblings by vm.siblings.collectAsState()
     val activeSourceId by vm.activeSourceId.collectAsState()
     val health by vm.health.collectAsState()
+    val downloads by vm.downloads.collectAsState()
 
     var lineIdx by remember { mutableIntStateOf(0) }
     var epIdx by remember { mutableIntStateOf(0) }
@@ -111,6 +118,13 @@ fun DetailScreen(
     val line = lines.getOrNull(lineIdx.coerceIn(0, (lines.size - 1).coerceAtLeast(0)))
     val eps = line?.episodes.orEmpty()
     val curEp = eps.getOrNull(epIdx.coerceIn(0, (eps.size - 1).coerceAtLeast(0)))
+    val sid = activeSourceId ?: d.media.sourceId
+
+    fun taskFor(ep: Episode) = downloads.firstOrNull {
+        it.sourceId == sid && it.mediaId == d.media.id && it.episodeIndex == ep.index
+    }
+
+    fun cache(ep: Episode) = vm.cache(sid, d.media, ep)
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -124,10 +138,23 @@ fun DetailScreen(
                     Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s4),
                     horizontalArrangement = Arrangement.spacedBy(Sp.s2),
                 ) {
-                    ActionTile("已收藏", fav, Modifier.weight(1f)) { fav = !fav }
-                    ActionTile("缓存", false, Modifier.weight(1f)) {}
-                    ActionTile("分享", false, Modifier.weight(1f)) {}
-                    ActionTile("更多", false, Modifier.weight(1f)) {}
+                    ActionTile("已收藏", Icons.Filled.Favorite, fav, Modifier.weight(1f)) { fav = !fav }
+                    curEp?.let { ep ->
+                        val t = taskFor(ep)
+                        ActionTile(
+                            cacheLabel(t),
+                            Icons.Outlined.Download,
+                            t?.status == DownloadStatus.Done,
+                            Modifier.weight(1f),
+                        ) {
+                            when (t?.status) {
+                                DownloadStatus.Paused, DownloadStatus.Failed -> vm.resumeDownload(t.id)
+                                else -> cache(ep)
+                            }
+                        }
+                    } ?: ActionTile("缓存", Icons.Outlined.Download, false, Modifier.weight(1f)) {}
+                    ActionTile("分享", Icons.Outlined.Share, false, Modifier.weight(1f)) {}
+                    ActionTile("更多", Icons.Filled.MoreVert, false, Modifier.weight(1f)) {}
                 }
             }
 
@@ -161,6 +188,17 @@ fun DetailScreen(
                         fontSize = Fs.xs,
                     )
                     Box(Modifier.weight(1f))
+                    if (eps.size > 1) {
+                        Text(
+                            "缓存全部",
+                            color = T.Src500,
+                            fontSize = Fs.xs,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clip(R.sm).clickable { vm.cacheLine(sid, d.media, eps) }
+                                .padding(horizontal = 6.dp, vertical = 3.dp),
+                        )
+                        Spacer8()
+                    }
                     if (lines.size > 1) {
                         Text(
                             "线路 ${lineIdx + 1}/${lines.size}",
@@ -189,6 +227,7 @@ fun DetailScreen(
                         items(eps.size) { i ->
                             val e = eps[i]
                             val on = i == epIdx
+                            val t = taskFor(e)
                             Box(
                                 Modifier.height(38.dp).clip(R.sm)
                                     .background(
@@ -196,7 +235,10 @@ fun DetailScreen(
                                         else Brush.verticalGradient(listOf(T.Surface2, T.Surface2))
                                     )
                                     .border(1.dp, if (on) Color.Transparent else T.Border, R.sm)
-                                    .clickable { epIdx = i },
+                                    .combinedClickable(
+                                        onClick = { epIdx = i },
+                                        onLongClick = { cache(e) },
+                                    ),
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Text(
@@ -205,9 +247,30 @@ fun DetailScreen(
                                     fontSize = Fs.xs,
                                     fontWeight = FontWeight.SemiBold,
                                 )
+                                t?.let {
+                                    Text(
+                                        when (it.status) {
+                                            DownloadStatus.Done -> "✓"
+                                            DownloadStatus.Failed -> "!"
+                                            DownloadStatus.Paused -> "‖"
+                                            else -> "${(it.progress * 100).toInt()}%"
+                                        },
+                                        color = if (on) Color.White else T.Src500,
+                                        fontSize = Fs.tiny,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
+                                    )
+                                }
                             }
                         }
                     }
+                    Spacer4()
+                    Text(
+                        "长按某一集 = 只缓存它",
+                        color = T.TextFaint,
+                        fontSize = Fs.tiny,
+                        modifier = Modifier.padding(horizontal = Sp.s4),
+                    )
                 }
             }
 
@@ -238,21 +301,33 @@ fun DetailScreen(
                 .padding(horizontal = Sp.s4, vertical = Sp.s3),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val curTask = curEp?.let { taskFor(it) }
             Box(
                 Modifier.size(46.dp).clip(R.md).background(T.Surface2)
-                    .border(1.dp, T.Border, R.md),
+                    .border(1.dp, T.Border, R.md)
+                    .combinedClickable(
+                        onClick = {
+                            when (curTask?.status) {
+                                DownloadStatus.Paused, DownloadStatus.Failed -> vm.resumeDownload(curTask.id)
+                                else -> curEp?.let { cache(it) }
+                            }
+                        },
+                        onLongClick = { curTask?.let { vm.deleteDownload(it.id) } },
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(Icons.Outlined.Download, null, tint = T.TextDim, modifier = Modifier.size(20.dp))
+                Icon(
+                    Icons.Outlined.Download,
+                    null,
+                    tint = if (curTask?.status == DownloadStatus.Done) T.Play400 else T.TextDim,
+                    modifier = Modifier.size(20.dp),
+                )
             }
             Spacer12()
             Row(
                 Modifier.weight(1f).height(46.dp).clip(R.md)
                     .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
-                    .clickable {
-                        val sid = activeSourceId ?: d.media.sourceId
-                        curEp?.let { onPlay(sid, d.media.title, it) }
-                    },
+                    .clickable { curEp?.let { onPlay(sid, d.media.id, d.media.title, it) } },
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -363,7 +438,13 @@ private fun CircleIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, on
 }
 
 @Composable
-private fun ActionTile(label: String, active: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun ActionTile(
+    label: String,
+    icon: ImageVector,
+    active: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Column(
         modifier.height(60.dp).clip(R.md)
             .background(if (active) T.Play500.copy(alpha = .09f) else T.Surface2)
@@ -373,12 +454,7 @@ private fun ActionTile(label: String, active: Boolean, modifier: Modifier = Modi
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            when (label) {
-                "已收藏" -> Icons.Filled.Favorite
-                "缓存" -> Icons.Outlined.Download
-                "分享" -> Icons.Outlined.Share
-                else -> Icons.Filled.MoreVert
-            },
+            icon,
             null,
             tint = if (active) T.Play400 else T.TextDim,
             modifier = Modifier.size(19.dp),
@@ -389,8 +465,19 @@ private fun ActionTile(label: String, active: Boolean, modifier: Modifier = Modi
             color = if (active) T.Play400 else T.TextDim,
             fontSize = Fs.xxs,
             fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
         )
     }
+}
+
+/** 缓存按钮上的字 —— 每一句都要对得上任务真实处在的那一步。 */
+private fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
+    DownloadStatus.Done -> "已缓存"
+    DownloadStatus.Running -> "缓存中 ${(t.progress * 100).toInt()}%"
+    DownloadStatus.Queued -> "排队中"
+    DownloadStatus.Paused -> "继续缓存"
+    DownloadStatus.Failed -> "重试缓存"
+    null -> "缓存"
 }
 
 /** 播放源面板：横排源卡片，带健康状态与延迟。 */
