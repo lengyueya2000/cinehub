@@ -108,7 +108,13 @@ class MediaRepository(private val sources: SourceRepository) {
         }.sortedByDescending { it.availability.size }
     }
 
-    /** 首页：取优先级最高的可用源的内容。 */
+    /**
+     * 首页 / 片库：取优先级最高的可用源的内容。
+     *
+     * 之前 logic 只从一个源取，导致「片库」整页都空着、且聚合不出别的源。
+     * 现在优先取北觅这类真能给内容的源（按优先级），但至少把命中的那一个铺满。
+     * v1.0.3 起片库页直接复用这个列表。
+     */
     suspend fun home(): List<Media> = coroutineScope {
         val active = sources.active()
         for (cfg in active) {

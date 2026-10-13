@@ -1,6 +1,11 @@
 package net.cinehub.ui.screens
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import android.view.ViewGroup
+import android.view.WindowManager
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -21,6 +26,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -44,7 +51,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.BackHandler
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -95,6 +106,7 @@ fun PlayerScreen(
     var isPlaying by remember { mutableStateOf(false) }
     var buffering by remember { mutableStateOf(true) }
     var errText by remember { mutableStateOf<String?>(null) }
+    var fullscreen by remember { mutableStateOf(false) }
 
     val player = remember {
         ExoPlayer.Builder(ctx).build().apply {
@@ -168,8 +180,45 @@ fun PlayerScreen(
         onDispose { player.release() }
     }
 
+    val activity = ctx.activity()
+    val insetsController = remember(activity) {
+        activity?.window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+    }
+
+    // 全屏：横屏 + 隐藏系统栏 + 屏幕常亮。退出时逐项还原，不能只还原一半 ——
+    // 否则从播放器返回后状态栏一直不回来，看起来像应用卡死了。
+    LaunchedEffect(fullscreen) {
+        val a = activity ?: return@LaunchedEffect
+        if (fullscreen) {
+            a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            insetsController?.apply {
+                systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsetsCompat.Type.systemBars())
+            }
+            a.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            // 回到竖屏用 PORTRAIT 而不是 UNSPECIFIED：模拟器上自动旋转关着时，
+            // UNSPECIFIED 会留在当前横屏不动，退出全屏看起来像没生效。
+            a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            a.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+    // 离开播放器时必须还原，否则返回后停留在横屏 + 无状态栏
+    DisposableEffect(Unit) {
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     val lines = detail?.lines.orEmpty()
     val episodes = lines.firstOrNull()?.episodes.orEmpty()
+
+    // 全屏态下系统返回键先退出全屏，而不是直接离开播放器
+    BackHandler(enabled = fullscreen) { fullscreen = false }
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -470,6 +519,29 @@ fun PlayerScreen(
                         },
                     )
                     Box(Modifier.weight(1f))
+                    // 全屏：横屏 + 隐藏系统栏 + 常亮
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clip(R.full)
+                            .background(Color.White.copy(alpha = .14f))
+                            .clickable { fullscreen = !fullscreen }
+                            .padding(horizontal = 9.dp, vertical = 4.dp),
+                    ) {
+                        Icon(
+                            if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                            null,
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer4()
+                        Text(
+                            if (fullscreen) "退出全屏" else "全屏",
+                            color = Color.White,
+                            fontSize = Fs.xxs,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Spacer8()
                     Text(
                         "1.0x",
                         color = Color.White,
@@ -493,11 +565,12 @@ fun PlayerScreen(
             }
         }
 
-        // 选集抽屉
-        Column(
-            Modifier.fillMaxWidth().height(180.dp).background(T.Surface)
-                .padding(horizontal = Sp.s4, vertical = Sp.s3),
-        ) {
+        // 选集抽屉 —— 全屏时画面要吃满整个屏幕，抽屉让位
+        if (!fullscreen) {
+            Column(
+                Modifier.fillMaxWidth().height(180.dp).background(T.Surface)
+                    .padding(horizontal = Sp.s4, vertical = Sp.s3),
+            ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     "选集 · ${playing?.mediaTitle ?: ""}",
@@ -561,20 +634,26 @@ fun PlayerScreen(
                     }
                 }
             }
-            Spacer8()
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("播放进度已跨源同步", color = T.TextFaint, fontSize = Fs.xxs)
-                Box(Modifier.weight(1f))
-                Text(
-                    "切换源不丢进度",
-                    color = T.Src500,
-                    fontSize = Fs.xxs,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Spacer8()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("播放进度已跨源同步", color = T.TextFaint, fontSize = Fs.xxs)
+                    Box(Modifier.weight(1f))
+                    Text(
+                        "切换源不丢进度",
+                        color = T.Src500,
+                        fontSize = Fs.xxs,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
             }
         }
     }
 }
+
+/** 从任意 Context 往上找到宿主 Activity —— 横屏与系统栏都必须由它来改。 */
+private fun Context.activity(): Activity? = generateSequence(this) {
+    (it as? ContextWrapper)?.baseContext
+}.firstOrNull { it is Activity } as? Activity
 
 private fun fmt(sec: Long): String {
     if (sec <= 0) return "00:00"

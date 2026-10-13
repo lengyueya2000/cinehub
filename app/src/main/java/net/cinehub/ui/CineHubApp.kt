@@ -43,7 +43,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import net.cinehub.ui.screens.DetailScreen
+import net.cinehub.ui.screens.DownloadsScreen
 import net.cinehub.ui.screens.HomeScreen
+import net.cinehub.ui.screens.LibraryScreen
 import net.cinehub.ui.screens.PlayerScreen
 import net.cinehub.ui.screens.SearchScreen
 import net.cinehub.ui.screens.SourceScreen
@@ -56,7 +58,9 @@ private sealed interface Route {
     data object Search : Route
     data class Detail(val sourceId: String, val mediaId: String) : Route
     data object Player : Route
+    data object Library : Route
     data object Sources : Route
+    data object Downloads : Route
 }
 
 private val TABS = listOf(
@@ -82,6 +86,8 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
             is Route.Home -> Route.Home
             is Route.Search -> Route.Home
             is Route.Sources -> Route.Home
+            is Route.Library -> Route.Home
+            is Route.Downloads -> Route.Home
             is Route.Detail -> Route.Home
             is Route.Player -> {
                 vm.stopPlaying()
@@ -127,6 +133,13 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         },
                     )
 
+                    is Route.Library -> LibraryScreen(
+                        vm = vm,
+                        onOpenDetail = { s, m -> openDetail(s, m) },
+                    )
+
+                    is Route.Downloads -> DownloadsScreen()
+
                     is Route.Player -> PlayerScreen(
                         vm = vm,
                         onBack = {
@@ -143,12 +156,14 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                 }
             }
 
+            // 底部 TabBar 只在首页/搜索态显示，其它页面由各自顶栏返回
             if (route is Route.Home || route is Route.Search) {
                 TabBar(active = 0) { idx ->
                     when (idx) {
                         0 -> route = Route.Home
+                        1 -> route = Route.Library
+                        2 -> route = Route.Downloads
                         3 -> route = Route.Sources
-                        else -> route = Route.Home
                     }
                 }
             }
