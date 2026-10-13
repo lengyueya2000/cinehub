@@ -95,6 +95,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         /** 该集的播放页地址，用于「重试」时重新解析。 */
         val episodeUrl: String? = null,
         val note: String? = null,
+        /** 源站根地址 —— 播放器要带着它做 Referer，CDN 才认。 */
+        val sourceBaseUrl: String? = null,
     )
 
     /** 正在解析直链 —— 播放器靠它显示「已收到你的点击」，而不是一个不动的黑屏。 */
@@ -126,6 +128,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteSource(id: String) = viewModelScope.launch {
         sourceRepo.delete(id)
         refreshHealth(false)
+    }
+
+    /**
+     * 补回被删掉的内置源。
+     *
+     * 用户误删后不需要重装 —— 只补缺失的那几个，自己加的源和已有的启停状态都不动。
+     */
+    fun restoreDefaultSources(onDone: (Int) -> Unit) = viewModelScope.launch {
+        val n = sourceRepo.restoreDefaults()
+        refreshHealth(true)
+        loadHome()
+        onDone(n)
     }
 
     fun reorder(ids: List<String>) = viewModelScope.launch { sourceRepo.reorder(ids) }
@@ -286,6 +300,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // 立刻进入播放器，先把「我收到了」这一步给出去
             _playing.value = Playing(
                 mediaTitle, episodeName, episodeIndex, name, sourceId, null, episodeUrl,
+                sourceBaseUrl = cfg?.baseUrl?.trimEnd('/'),
             )
             _resumePosition.value = resumeFrom
 

@@ -46,6 +46,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
@@ -91,9 +93,24 @@ fun PlayerScreen(
     var pos by remember { mutableLongStateOf(resumeFrom) }
     var dur by remember { mutableLongStateOf(0L) }
     var isPlaying by remember { mutableStateOf(false) }
+    var buffering by remember { mutableStateOf(true) }
+    var errText by remember { mutableStateOf<String?>(null) }
 
     val player = remember {
-        ExoPlayer.Builder(ctx).build().apply { playWhenReady = true }
+        ExoPlayer.Builder(ctx).build().apply {
+            playWhenReady = true
+            addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(state: Int) {
+                    // BUFFERING / READY / ENDED —— 首帧渲染前 UI 要说清「在缓冲」，
+                    // 否则用户看到的就是一个不动的黑屏，像是点了没反应。
+                    buffering = state == Player.STATE_BUFFERING
+                }
+
+                override fun onPlayerError(e: PlaybackException) {
+                    errText = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
+                }
+            })
+        }
     }
 
     // 换源 / 换集时重建媒体源；用 resumeFrom 保证进度接续
@@ -101,15 +118,32 @@ fun PlayerScreen(
         val url = playing?.streamUrl
         player.stop()
         player.clearMediaItems()
+        errText = null
+        buffering = true
         if (url.isNullOrBlank()) return@LaunchedEffect
+
+        // 站点的 CDN 会校验 Referer/Origin，段地址常常只在带 Referer 时才给内容
+        val props = buildMap {
+            val origin = playing?.sourceBaseUrl
+            if (!origin.isNullOrBlank()) {
+                put("Referer", "$origin/")
+                put("Origin", origin)
+            }
+        }
 
         val http = DefaultHttpDataSource.Factory()
             .setUserAgent(net.cinehub.data.net.Http.UA)
             .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(props)
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
 
         val item = MediaItem.fromUri(url)
         val source = if (url.contains(".m3u8", true)) {
-            HlsMediaSource.Factory(http).createMediaSource(item)
+            // chunkless：不必先把整份 1 小时的分段列表拉完才起播
+            HlsMediaSource.Factory(http)
+                .setAllowChunklessPreparation(true)
+                .createMediaSource(item)
         } else {
             androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(http)
                 .createMediaSource(item)
@@ -277,19 +311,68 @@ fun PlayerScreen(
                         }
                     }
                 }
-            } else if (!isPlaying) {
-                Box(
-                    Modifier.align(Alignment.Center).size(64.dp).clip(CircleShape)
-                        .background(Color.Black.copy(alpha = .42f))
-                        .border(1.5.dp, Color.White.copy(alpha = .30f), CircleShape)
-                        .clickable { player.play() },
-                    contentAlignment = Alignment.Center,
+            } else if (errText != null) {
+                // 直链是通的、但解码/拉取失败时，把原因说出来而不是留一个黑屏
+                Column(
+                    Modifier.align(Alignment.Center).padding(start = Sp.s7, end = 72.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Icon(
-                        Icons.Filled.PlayArrow, null,
-                        tint = Color.White,
-                        modifier = Modifier.size(27.dp),
+                    Text("播放失败", color = Color.White, fontSize = Fs.sec, fontWeight = FontWeight.Bold)
+                    Spacer8()
+                    Text(
+                        errText ?: "",
+                        color = T.TextDim,
+                        fontSize = Fs.xs,
+                        lineHeight = Fs.xs * 1.7f,
                     )
+                    Spacer12()
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "重试",
+                            color = Color.White,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clip(R.full)
+                                .background(Color.White.copy(alpha = .14f))
+                                .clickable {
+                                    errText = null
+                                    player.prepare()
+                                    player.play()
+                                }
+                                .padding(horizontal = 16.dp, vertical = 7.dp),
+                        )
+                        Spacer8()
+                        Text(
+                            "或用右侧的源切换 →",
+                            color = T.Src500,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            } else if (!isPlaying) {
+                Row(
+                    Modifier.align(Alignment.Center),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(64.dp).clip(CircleShape)
+                            .background(Color.Black.copy(alpha = .42f))
+                            .border(1.5.dp, Color.White.copy(alpha = .30f), CircleShape)
+                            .clickable { player.play() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.PlayArrow, null,
+                            tint = Color.White,
+                            modifier = Modifier.size(27.dp),
+                        )
+                    }
+                    // 只有「点了播放但还没出首帧」才提示缓冲，暂停时不打扰
+                    if (buffering && player.playWhenReady) {
+                        Spacer12()
+                        Text("缓冲中…", color = Color.White, fontSize = Fs.xs)
+                    }
                 }
             }
 

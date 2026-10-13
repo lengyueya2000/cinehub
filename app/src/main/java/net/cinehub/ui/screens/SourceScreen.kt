@@ -188,6 +188,55 @@ fun SourceScreen(
                 }
             }
 
+            // 内置源被删掉后可以从这里补回，不必重装
+            val missing = net.cinehub.data.Seed.sources.count { s ->
+                sources.none { it.id == s.id }
+            }
+            if (missing > 0) {
+                item {
+                    var restored by remember { mutableStateOf<String?>(null) }
+                    Row(
+                        Modifier.fillMaxWidth().clip(R.md)
+                            .background(T.Warn.copy(alpha = .07f))
+                            .border(1.dp, T.Warn.copy(alpha = .28f), R.md)
+                            .padding(Sp.s3),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "有 $missing 个内置源不在列表里",
+                                color = T.Text,
+                                fontSize = Fs.sm,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer4()
+                            Text(
+                                restored ?: "删掉的内置源可以补回来，你自己添加的源不受影响。",
+                                color = T.TextFaint,
+                                fontSize = Fs.xxs,
+                                lineHeight = Fs.xxs * 1.6f,
+                            )
+                        }
+                        Spacer12()
+                        Text(
+                            "补回",
+                            color = T.Warn,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clip(R.full)
+                                .border(1.dp, T.Warn.copy(alpha = .5f), R.full)
+                                .clickable {
+                                    vm.restoreDefaultSources { n ->
+                                        restored = if (n > 0) "已补回 $n 个内置源" else "内置源都在，无需补回"
+                                    }
+                                }
+                                .padding(horizontal = 14.dp, vertical = 7.dp),
+                        )
+                    }
+                    Spacer12()
+                }
+            }
+
             items(sources.size) { i ->
                 val cfg = sources[i]
                 SourceRow(

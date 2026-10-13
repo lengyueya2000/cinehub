@@ -57,6 +57,21 @@ class SourceRepository(private val context: Context) {
         write(ids.mapIndexedNotNull { i, id -> cur[id]?.copy(priority = i + 1) })
     }
 
+    /**
+     * 恢复内置源，但保留用户自己加的源。
+     *
+     * 用户手滑删掉内置源后不该只能重装 —— 这里按 id 补回缺失的内置源，
+     * 已经是同一个 id 的条目保持原样（含用户的启停与排序）。
+     * 返回补回了几个，交给 UI 说清楚发生了什么。
+     */
+    suspend fun restoreDefaults(): Int {
+        val cur = sources.first().toMutableList()
+        val have = cur.map { it.id }.toSet()
+        val missing = Seed.sources.filter { it.id !in have }
+        write(cur + missing)
+        return missing.size
+    }
+
     private suspend fun write(list: List<SourceConfig>) {
         val sorted = list.sortedBy { it.priority }
         context.dataStore.edit { it[KEY] = json.encodeToString(sorted) }
