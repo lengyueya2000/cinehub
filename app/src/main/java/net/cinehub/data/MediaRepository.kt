@@ -163,10 +163,16 @@ class MediaRepository(private val sources: SourceRepository) {
 
     /**
      * 同一部片在其它源里的对应条目 —— 切源不丢进度的基础。
-     * 用标题 + 年份归并，所以换源后进度能续上。
+     *
+     * 匹配条件是「标题相同 + 年份不冲突」，不是整键相等。各源对同一部片的年份写法本来就不一致
+     * （实测搜「功夫女足」：西瓜给 2026、北觅不给），而详情页的键还会再退化一层 ——
+     * [net.cinehub.data.source.HtmlAdapter] 的 detail() 根本不解析年份。
+     * 用整键相等去筛，用户看到的就是「搜索卡片上挂着三个源徽标，点进去只剩另外两个」，
+     * 而且少掉的正好是刚在卡片上见过的那几个。只有两边都写了年份且年份不同，才算另一部片。
      */
     suspend fun siblingsOf(key: String): List<SourceAvailability> = coroutineScope {
         val title = key.substringBefore('|')
+        val year = key.substringAfter('|', "").takeIf { it.isNotBlank() }
         val active = sources.active()
         active.map { cfg ->
             async {
@@ -175,7 +181,7 @@ class MediaRepository(private val sources: SourceRepository) {
                 runCatching {
                     SourceAdapters.create(cfg).search(title, 1)
                 }.getOrElse { emptyList() }
-                    .filter { it.key == key }
+                    .filter { sameWork(it.key, title, year) }
                     .map {
                         SourceAvailability(
                             sourceId = cfg.id,
@@ -188,6 +194,12 @@ class MediaRepository(private val sources: SourceRepository) {
                     }
             }
         }.flatMap { it.await() }
+    }
+
+    private fun sameWork(other: String, title: String, year: String?): Boolean {
+        if (other.substringBefore('|') != title) return false
+        val otherYear = other.substringAfter('|', "").takeIf { it.isNotBlank() }
+        return year == null || otherYear == null || otherYear == year
     }
 
     private fun qualityTag(m: Media): String? {

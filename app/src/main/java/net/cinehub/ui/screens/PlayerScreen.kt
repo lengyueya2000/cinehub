@@ -554,6 +554,25 @@ fun PlayerScreen(
                                     .clickable { vm.retryPlay() }
                                     .padding(horizontal = 16.dp, vertical = 7.dp),
                             )
+                            // 地址在对方脚本手里时，唯一不越界的路是让站点自己的页面把它算出来
+                            if (playing?.sourceId != "local" && !playing?.episodeUrl.isNullOrBlank()) {
+                                Spacer8()
+                                Text(
+                                    "在站点页面里解析",
+                                    color = T.Src400,
+                                    fontSize = Fs.sm,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.clip(R.full)
+                                        .border(1.dp, T.Src500.copy(alpha = .5f), R.full)
+                                        .clickable {
+                                            vm.openSiteBrowser(
+                                                playing?.episodeUrl ?: return@clickable,
+                                                playing?.sourceName ?: "站点页面",
+                                            )
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                                )
+                            }
                             Spacer8()
                             Text(
                                 if (fullscreen) "退出全屏后可切换右侧的源" else "用右侧的源切换 →",

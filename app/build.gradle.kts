@@ -22,8 +22,8 @@ android {
         applicationId = "net.cinehub"
         minSdk = 24
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.0.5"
+        versionCode = 7
+        versionName = "1.0.6"
     }
 
     if (hasReleaseKeystore) {
@@ -33,6 +33,11 @@ android {
                 storePassword = keystoreProps.getProperty("storePassword")
                 keyAlias = keystoreProps.getProperty("keyAlias")
                 keyPassword = keystoreProps.getProperty("keyPassword")
+                // 只签 v2 的包，系统安装器认得，但第三方安装路径（文件管理器、部分 ROM 的
+                // 「应用安装」、旧设备）仍按 JAR(v1) 读签名，读不到就报「解析软件包时出现问题」。
+                // minSdk 24 不强制 v1，AGP 因此默认把它关了 —— 这里显式补回来。
+                enableV1Signing = true
+                enableV2Signing = true
             }
         }
     }

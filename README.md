@@ -62,6 +62,41 @@ Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlin
 
 如果依赖已经在本地 Gradle 缓存里，加 `--offline` 会明显更快。
 
+### 装不上时按这个顺序查
+
+APK「下载完了但装不上」在三件事上，按概率从高到低排：
+
+1. **签名方案**。Android 7 以下的安装器只认 v1（JAR）签名，而 AGP 在 `minSdkVersion >= 24`
+   时会默认关掉 v1 —— 结果就是 v2/v3 校验全过、手机上却一句「解析软件包时出现问题」。
+   所以 `app/build.gradle.kts` 里显式写了 `enableV1Signing = true`。别信 `apksigner verify`
+   的默认输出，它按包的 minSdk 选校验方案，要显式压低才看得到 v1 的结论：
+
+   ```bash
+   apksigner verify -v --min-sdk-version 21 app-release.apk | grep 'V1\|v1'
+   # Verified using v1 scheme (JAR signing): true
+   ```
+
+2. **证书冲突**。同一包名只允许同证书覆盖安装，`INSTALL_FAILED_UPDATE_INCOMPATIBLE`
+   在界面上往往只显示成「未安装应用」。手机里若还留着 debug 签名的那份，必须先卸掉 ——
+   卸载会带走用户已添加的播放源和离线缓存，这是无法回避的，只能提前告知。
+
+   ```bash
+   adb install -r -d app-release.apk        # 看真实报错，比手机弹窗诚实
+   adb shell dumpsys package net.cinehub.app | grep -i 'signatures\|versionCode'
+   ```
+
+3. **传输截断**。国内一些网盘/图床会在下载时改字节。装之前核一次 SHA-256：
+
+   ```bash
+   certutil -hashfile app-release.apk SHA256      # Windows
+   sha256sum app-release.apk                       # Linux / macOS
+   ```
+
+   指纹和发布说明里给的对不上，就是包在传输路上被换了，不是签名的问题。
+
+其余的都是系统策略而不是包的问题：Android 8+ 要在「安装未知应用」里给文件管理器放行，
+部分国产 ROM 还会额外拦一次「风险应用」（走「仍要安装」）。
+
 
 ---
 

@@ -51,8 +51,9 @@ fun StreamResolution.userNote(): String? = when (this) {
 
     is StreamResolution.NeedsClientScript ->
         "直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。" +
-            "影枢不执行站点脚本、也不逆它的签名，所以这里只能如实说拿不到 —— " +
-            "填凭证也解决不了这一步。"
+            "影枢不逆它的签名 —— 但可以打开它自己的页面，让站点把地址算给它自己的播放器，" +
+            "影枢在旁边接住那条地址。点「在站点页面里解析」试试（这类站通常还要你先登录，" +
+            "会员内容影枢也不会替你绕过）。"
 
     is StreamResolution.Failed -> "解析直链失败：$reason"
 }

@@ -112,6 +112,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _resolving = MutableStateFlow(false)
     val resolving: StateFlow<Boolean> = _resolving.asStateFlow()
 
+    // ---------- 站点页面取链 ----------
+
+    /**
+     * 要在站点自己的页面里打开的地址，以及它是给哪个源用的。
+     *
+     * 只有一处能产生它：播放器上的「在站点页面里解析」和源管理里的「在站点里登录」。
+     */
+    data class Browser(val startUrl: String, val label: String)
+
+    private val _browser = MutableStateFlow<Browser?>(null)
+    val browser: StateFlow<Browser?> = _browser.asStateFlow()
+
+    fun openSiteBrowser(startUrl: String, label: String) {
+        _browser.value = Browser(startUrl, label)
+    }
+
+    fun closeSiteBrowser() { _browser.value = null }
+
+    /**
+     * 收下站点自己解析出来的那条地址。
+     *
+     * 只换 streamUrl，源、Referer、这一集都不动 —— 换源会让 Referer 对不上，
+     * 而这条地址恰恰是原来那个源给出来的。
+     */
+    fun useSiteLink(link: String) {
+        val cur = _playing.value ?: return
+        if (!link.startsWith("http")) return
+        _playing.value = cur.copy(streamUrl = link, note = null)
+    }
+
     init {
         viewModelScope.launch {
             sourceRepo.sources.collect { _sources.value = it }

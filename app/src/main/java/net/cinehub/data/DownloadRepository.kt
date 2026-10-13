@@ -180,12 +180,21 @@ class DownloadRepository(
     /**
      * 网络异常的原文是英文（`connection closed`、`failed to connect to …`），
      * 直接显示等于把日志甩到界面上。自己抛的 IllegalStateException 已经带中文，原样放行。
+     *
+     * 别把这类失败都推给「Referer 没带对」。实测 dytt 系直链的 CDN 是按访问地区放行的：
+     * 境外出口 IP 取 `vip.dytt-*.com` / `play.phimgood.com` 会拿到 403
+     * 「The region has been denied.」，或在 TLS 握手阶段直接被断开 —— 换请求头、重试都没用，
+     * 影枢也不去绕它。该做的是把「换条线路 / 换个源」说成用户真能执行的下一步：
+     * 有些源（如北觅）每条片子只给一条线路，这时候能换的只有源。
      */
     private fun reasonOf(e: Exception): String = when {
         e is IllegalStateException -> e.message ?: "下载失败"
-        e is java.net.SocketTimeoutException -> "连不上这个地址（超时），换一条线路再试"
+        e is java.net.SocketTimeoutException ->
+            "连不上这个地址（超时）—— 换一条线路，或换一个源再缓存"
+        e is javax.net.ssl.SSLException ->
+            "对方 CDN 在建立加密连接时就断了 —— 这类直链常按访问地区放行，你当前的网络容易被拒。换一条线路，或换一个源。"
         e is java.io.IOException ->
-            "连接被对方切断 —— 这类 CDN 通常只认本站页面的访问，或者这条线路已经失效。换一条线路再缓存。"
+            "连接被对方切断 —— 这条线路对你当前的网络不开放，或地址已失效。换一条线路，或换一个源再缓存。"
         else -> e.message ?: "下载失败"
     }
 

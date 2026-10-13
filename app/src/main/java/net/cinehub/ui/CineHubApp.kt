@@ -48,6 +48,7 @@ import net.cinehub.ui.screens.HomeScreen
 import net.cinehub.ui.screens.LibraryScreen
 import net.cinehub.ui.screens.PlayerScreen
 import net.cinehub.ui.screens.SearchScreen
+import net.cinehub.ui.screens.SiteBrowserScreen
 import net.cinehub.ui.screens.SourceScreen
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.Sp
@@ -74,6 +75,7 @@ private val TABS = listOf(
 fun CineHubApp(vm: AppViewModel = viewModel()) {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     val playing by vm.playing.collectAsState()
+    val browser by vm.browser.collectAsState()
 
     fun openDetail(sourceId: String, mediaId: String) {
         vm.openDetail(sourceId, mediaId)
@@ -173,6 +175,18 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         3 -> route = Route.Sources
                     }
                 }
+            }
+        }
+
+        // 站点页面取链：盖在所有页面之上，因为它既不是一个 Tab 也不该被 Tab 切走
+        browser?.let { b ->
+            Box(Modifier.fillMaxSize().background(T.Bg)) {
+                SiteBrowserScreen(
+                    vm = vm,
+                    startUrl = b.startUrl,
+                    label = b.label,
+                    onClose = { vm.closeSiteBrowser() },
+                )
             }
         }
     }

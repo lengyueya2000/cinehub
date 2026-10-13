@@ -247,6 +247,7 @@ fun SourceScreen(
                     report = health[cfg.id],
                     onToggle = { vm.toggleSource(cfg.id, it) },
                     onDelete = { vm.deleteSource(cfg.id) },
+                    onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
                     onUp = {
                         if (i > 0) {
                             val ids = sources.map { it.id }.toMutableList()
@@ -298,6 +299,7 @@ private fun SourceRow(
     report: HealthReport?,
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
+    onOpenSite: () -> Unit,
     onUp: () -> Unit,
 ) {
     val h = report?.health ?: Health.Unknown
@@ -424,6 +426,19 @@ private fun SourceRow(
             }
             Spacer4()
             Row {
+                // 「站点」= 在影枢里打开对方自己的页面。用户在这里登自己的账号，
+                // 凭证只留在本机 WebView 的 cookie 里 —— 影枢不代收账号密码。
+                Text(
+                    "站点",
+                    color = T.Src400,
+                    fontSize = Fs.tiny,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clip(R.sm)
+                        .border(1.dp, T.Src500.copy(alpha = .40f), R.sm)
+                        .clickable(onClick = onOpenSite)
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                )
+                Spacer8()
                 Icon(
                     Icons.Filled.Refresh, null,
                     tint = T.TextFaint,
