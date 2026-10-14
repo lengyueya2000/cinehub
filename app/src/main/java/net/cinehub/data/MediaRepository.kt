@@ -15,7 +15,8 @@ import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.VideoPlatforms
-import net.cinehub.data.model.normalizeTitle
+import net.cinehub.data.model.titleFingerprint
+import net.cinehub.data.model.titleSearchVariants
 import net.cinehub.data.net.Http
 import net.cinehub.data.source.SourceAdapters
 import java.util.concurrent.ConcurrentHashMap
@@ -193,35 +194,36 @@ class MediaRepository(private val sources: SourceRepository) {
      * 搜索词用的是**原标题**，不是归并键里那串去了标点的：站点多是 LIKE 匹配，
      * 「暗影蜘蛛侠：黑白版」被削成「暗影蜘蛛侠黑白版」之后一条都搜不到 ——
      * 表现就是搜索卡片上挂着三个源徽标，点进去只剩两个，少的正是刚见过的那几个。
-     * 比对时才用归一化后的键（见 [sameWork]）。
+     * 比对时才用片名指纹（见 [sameWork]）。
      *
      * 匹配条件是「标题相同 + 年份不冲突」，不是整键相等。各源对同一部片的年份写法本来就不一致
      * （实测搜「功夫女足」：有的给 2026、有的不给）。只有两边都写了年份且年份不同，才算另一部片。
+     *
+     * 原标题一条都对不上时，会换写法再试（见 [findInSource]）—— 片名里的空格和季号写法
+     * 是「明明有却说没有」最常见的两个来源。
      */
     suspend fun siblingsOf(media: Media): Siblings = coroutineScope {
-        val want = normalizeTitle(media.title)
+        val want = titleFingerprint(media.title)
         val year = media.key.substringAfter('|', "").takeIf { it.isNotBlank() }
         val active = sources.active()
         val per = active.map { cfg ->
             async {
                 // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
                 val health = healthCache[cfg.id]?.health ?: Health.Unknown
-                val r = quietly { SourceAdapters.create(cfg).search(media.title, 1) }
+                val (hits, err) = findInSource(cfg, media.title, want, year)
                 Triple(
                     cfg,
-                    r.getOrNull().orEmpty()
-                        .filter { sameWork(it.key, want, year) }
-                        .map {
-                            SourceAvailability(
-                                sourceId = cfg.id,
-                                sourceName = cfg.name,
-                                item = it,
-                                health = health,
-                                quality = qualityTag(it),
-                                latencyMs = healthCache[cfg.id]?.latencyMs,
-                            )
-                        },
-                    r.exceptionOrNull(),
+                    hits.map {
+                        SourceAvailability(
+                            sourceId = cfg.id,
+                            sourceName = cfg.name,
+                            item = it,
+                            health = health,
+                            quality = qualityTag(it),
+                            latencyMs = healthCache[cfg.id]?.latencyMs,
+                        )
+                    },
+                    err,
                 )
             }
         }.map { it.await() }
@@ -234,9 +236,38 @@ class MediaRepository(private val sources: SourceRepository) {
         )
     }
 
-    private fun sameWork(other: String, title: String, year: String?): Boolean {
-        if (other.substringBefore('|') != title) return false
-        val otherYear = other.substringAfter('|', "").takeIf { it.isNotBlank() }
+    /**
+     * 在一个源里找这部片，按「原样 → 去掉空白 → 去掉第几季尾巴」依次试，试到对上为止。
+     *
+     * 两趟都有据：
+     * - 空格 —— 豆瓣写「绝望写手 第五季」、源里存的是连写的那串，LIKE 匹配认不得空格；
+     *   只发原样那次，源会被判成「没这部片」。
+     * - 季号写法 —— 懂片帝写「第5季」、4kku 写「第五季」，从任一种写法出发去 LIKE 另一个
+     *   都落空，而「绝望写手」这一截两边都在。比对口径由 [titleFingerprint] 兜住，
+     *   所以放宽检索词不会把第二季认成第五季。
+     *
+     * 标题既没空格也没季号时只会跑一趟；只有真的没找到才继续试。
+     */
+    private suspend fun findInSource(
+        cfg: SourceConfig,
+        title: String,
+        want: String,
+        year: String?,
+    ): Pair<List<Media>, Throwable?> {
+        val adapter = SourceAdapters.create(cfg)
+        var lastErr: Throwable? = null
+        for (q in titleSearchVariants(title)) {
+            val r = quietly { adapter.search(q, 1) }
+            val hits = r.getOrNull().orEmpty().filter { sameWork(it, want, year) }
+            if (hits.isNotEmpty()) return hits to null
+            lastErr = r.exceptionOrNull()
+        }
+        return emptyList<Media>() to lastErr
+    }
+
+    private fun sameWork(m: Media, want: String, year: String?): Boolean {
+        if (titleFingerprint(m.title) != want) return false
+        val otherYear = m.key.substringAfter('|', "").takeIf { it.isNotBlank() }
         return year == null || otherYear == null || otherYear == year
     }
 

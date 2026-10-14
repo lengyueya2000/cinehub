@@ -34,6 +34,8 @@ import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.titleFingerprint
+import net.cinehub.data.model.titleSearchVariants
 import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.model.normalizeTitle
 import net.cinehub.data.model.userNote
@@ -1069,8 +1071,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 豆瓣的一条 → 影枢接的源里到底有没有这部。
      *
-     * 豆瓣不给播放地址，所以只能拿片名去搜。这里**只认归一化后完全同名**的：
+     * 豆瓣不给播放地址，所以只能拿片名去搜。这里**只认片名指纹完全相同**的（见 [titleFingerprint]）：
      * 差一点就「猜」进去，用户看到的是另一部片，比说搜不到更糟。
+     *
+     * 查询词会换着写法试（[titleSearchVariants]）：豆瓣爱写成「绝望写手 第五季」，源站是把片名
+     * 直接 `LIKE '%词%'` 地匹配，那个空格一进去就一条都不剩 —— 只发原样那一次会把
+     * 「源里明明有」报成「接的源里搜不到同名的片子」。
      *
      * 命中与否都交回调用方处理 —— 导航是界面那边的事（ ViewModel 里那个
      * `openDetail` 只把详情取回来，不改路由）。
@@ -1084,25 +1090,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_doubanResolving.value != null) return
         viewModelScope.launch {
             _doubanResolving.value = item.id
-            val hits = mediaRepo.search(item.title).items
-            _doubanResolving.value = null
-            val want = normalizeTitle(item.title)
-            val cands = hits.filter { normalizeTitle(it.media.title) == want }
-            // 同名不同片是常事（翻拍、续集、同名综艺）。豆瓣给了年份就按年份挑；
-            // 源那边没写年份时，只有「唯一一条候选」才敢认 —— 两条以上就宁可说认不出。
-            val year = item.year?.takeIf { it.isNotBlank() }
-            val match = when {
-                cands.isEmpty() -> null
-                year == null -> cands.firstOrNull()
-                else -> cands.firstOrNull { it.media.year == year }
-                    ?: cands.singleOrNull()?.takeIf { it.media.year.isNullOrBlank() }
+            try {
+                val want = titleFingerprint(item.title)
+                var cands = emptyList<AggregatedMedia>()
+                // 原样那次命中就不要再发第二次：多一趟是全源扇出，不该白付
+                for (form in titleSearchVariants(item.title)) {
+                    cands = mediaRepo.search(form).items.filter { titleFingerprint(it.media.title) == want }
+                    if (cands.isNotEmpty()) break
+                }
+                // 同名不同片是常事（翻拍、续集、同名综艺）。豆瓣给了年份就按年份挑；
+                // 源那边没写年份时，只有「唯一一条候选」才敢认 —— 两条以上就宁可说认不出。
+                val year = item.year?.takeIf { it.isNotBlank() }
+                val match = when {
+                    cands.isEmpty() -> null
+                    year == null -> cands.firstOrNull()
+                    else -> cands.firstOrNull { it.media.year == year }
+                        ?: cands.singleOrNull()?.takeIf { it.media.year.isNullOrBlank() }
+                }
+                val why = when {
+                    match != null -> null
+                    cands.isEmpty() -> "接的源里搜不到同名的片子"
+                    else -> "同名的有 ${cands.size} 部，对不上豆瓣标的 $year 年那部 —— 认不准就不硬指"
+                }
+                if (match == null) onMiss(item, why!!) else onHit(match.media)
+            } finally {
+                // 占位标记必须在任何退出路径上放开，否则整张榜单从此点不动
+                _doubanResolving.value = null
             }
-            val why = when {
-                match != null -> null
-                cands.isEmpty() -> "接的源里搜不到同名的片子"
-                else -> "同名的有 ${cands.size} 部，对不上豆瓣标的 $year 年那部 —— 认不准就不硬指"
-            }
-            if (match == null) onMiss(item, why!!) else onHit(match.media)
         }
     }
 

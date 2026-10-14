@@ -43,6 +43,57 @@ private val TITLE_PUNCT = setOf(
     '-', '_', '—', '～', '~', '、', '，', ',', '!', '！', '?', '？', '"', '\'',
 )
 
+/**
+ * 「第几季/第几部」的中文数字折成阿拉伯数字之后的片名 —— 只用于比对。
+ *
+ * 同一部剧，懂片帝写「绝望写手 第5季」、4kku 写「绝望写手第五季」，[normalizeTitle]
+ * 之后仍然一个 5 一个五，谁也不认谁 —— 搜索页挂着两个源、详情「播放源」只剩一个。
+ *
+ * 刻意**不**并进 [Media.key]：键是收藏 / 观看记录 / 下载任务的落盘凭据，改了写法
+ * 老记录就对不上号。不同季折出来仍是不同数字（第五→5、第六→6），不会把续集认成前作。
+ */
+fun titleFingerprint(s: String): String =
+    SEASON_CN.replace(normalizeTitle(s)) { m ->
+        "第${cnNumber(m.groupValues[1]) ?: m.groupValues[1]}${m.groupValues[2]}"
+    }
+
+/** 去掉「第几季/第几部」尾巴的片名 —— 拿去当兜底搜索词用（见 [titleSearchVariants]）。 */
+fun withoutSeason(s: String): String = SEASON_CN.replace(normalizeTitle(s), "")
+
+/**
+ * 拿一个片名去源里搜时该依次试的几种写法：原样 → 去掉空白 → 去掉季号。
+ *
+ * 站点多是 `LIKE '%词%'`，片名写法一变就空手而归：豆瓣爱在季号前搁一个空格，
+ * 懂片帝写「第5季」而 4kku 写「第五季」。第三档只留公共的那一截，
+ * 认领哪一条交给 [titleFingerprint] —— 放宽检索词不等于放宽判定，不会把第二季认成第五季。
+ *
+ * 每档都是全源扇出，所以调用方应当**试到命中就停**，别三档都发。
+ */
+fun titleSearchVariants(title: String): List<String> {
+    val flat = title.filterNot { it.isWhitespace() }
+    val base = withoutSeason(flat)
+    return listOfNotNull(
+        title,
+        flat.takeIf { it != title },
+        base.takeIf { it.length >= 2 && it != flat },
+    ).distinct()
+}
+
+private val SEASON_CN = Regex("第([零一二三四五六七八九十百两0-9]+)([季部])")
+
+/** 一…九十九的中文数字；认不出来返回 null，交回原文。 */
+private fun cnNumber(s: String): Int? {
+    val d = mapOf('零' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4,
+        '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9)
+    return when {
+        s.length == 1 -> d[s[0]] ?: if (s[0] == '十') 10 else null
+        s.length == 2 && s[0] == '十' -> 10 + (d[s[1]] ?: return null)
+        s.length == 2 && s[1] == '十' -> (d[s[0]] ?: return null) * 10
+        s.length == 3 && s[1] == '十' -> (d[s[0]] ?: return null) * 10 + (d[s[2]] ?: return null)
+        else -> null
+    }
+}
+
 /** 一个可播放的剧集 / 分集。 */
 data class Episode(
     val name: String,
