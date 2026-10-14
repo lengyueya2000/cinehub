@@ -27,6 +27,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -41,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import net.cinehub.data.model.AggregatedMedia
 import net.cinehub.data.model.Health
+import net.cinehub.data.model.SearchOutcome
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
@@ -65,6 +69,7 @@ fun SearchScreen(
 ) {
     val query by vm.query.collectAsState()
     val results by vm.results.collectAsState()
+    val failures by vm.searchFailures.collectAsState()
     val searching by vm.searching.collectAsState()
     val history by vm.history.collectAsState()
     val sources by vm.sources.collectAsState()
@@ -72,6 +77,21 @@ fun SearchScreen(
 
     val enabled = sources.filter { it.enabled }
     val hitSources = results.flatMap { it.availability }.map { it.sourceId }.distinct().size
+
+    // 类型筛选是本页的临时状态：不写进 ViewModel、不落盘，退出搜索就没了。
+    // 键在 query 上 —— 换了关键词就是另一批结果，旧筛选不该继续作用在它上面。
+    var cat by remember(query) { mutableStateOf<String?>(null) }
+    // 芯片只写结果里真出现过的类型。很多源不给 category，一个可信类型都取不到时
+    // 整排直接不渲染 —— 留一排点了没反应的芯片比不排更糟。
+    val chips = remember(results) { resultChips(results) }
+    val shown = if (cat == null) results else results.filter { it.media.category?.trim() == cat }
+    // 没给类型的条目只在「全部」里出现，筛完少了几条得说得出是为什么
+    val uncategorized = results.count { it.media.category?.trim().isNullOrEmpty() }
+
+    // 「都没有〈关键词〉」这句话要有依据才能说：有源没答话就是搜过的硬证据，
+    // 否则比对搜索历史头一条 —— search() 会把这次的词放到最前。
+    // 光在框里打字还没回车时不算搜过，不能声称搜过。
+    val searched = failures.isNotEmpty() || history.firstOrNull() == query
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -114,31 +134,20 @@ fun SearchScreen(
             )
         }
 
-        if (results.isNotEmpty()) {
+        if (results.isNotEmpty() && chips.isNotEmpty()) {
             LazyRow(
                 Modifier.padding(bottom = Sp.s3),
                 contentPadding = PaddingValues(horizontal = Sp.s4),
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
             ) {
                 item {
-                    Text(
-                        "全部 ${results.size}",
-                        color = Color.White,
-                        fontSize = Fs.sm,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clip(R.full).background(T.Play500.copy(alpha = .16f))
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                    )
+                    CatChip("全部 ${results.size}", on = cat == null) { cat = null }
                 }
-                items(listOf("电影", "剧集", "动漫", "综艺")) { c ->
-                    Text(
-                        c,
-                        color = T.TextDim,
-                        fontSize = Fs.sm,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clip(R.full).background(T.Surface2)
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                    )
+                items(chips) { (name, count) ->
+                    // 再点一次已选中的芯片 = 取消筛选，回到不过滤的原样
+                    CatChip("$name $count", on = cat == name) {
+                        cat = if (cat == name) null else name
+                    }
                 }
             }
         }
@@ -173,6 +182,19 @@ fun SearchScreen(
                     }
                     Spacer12()
                 }
+                // 筛过就得说明现在是筛过的状态，以及少掉的那些去哪了 ——
+                // 不然列表变短会被读成「搜索结果变了」，其实是芯片生效了。
+                if (cat != null) {
+                    item {
+                        Text(
+                            "已按类型「$cat」筛出 ${shown.size} 条；这次没回类型信息的 $uncategorized 条只在「全部」里显示。",
+                            color = T.TextFaint,
+                            fontSize = Fs.xxs,
+                            lineHeight = Fs.xxs * 1.5f,
+                            modifier = Modifier.padding(bottom = Sp.s3),
+                        )
+                    }
+                }
             }
 
             if (searching) {
@@ -183,9 +205,21 @@ fun SearchScreen(
                 }
             }
 
+            // 芯片点了却被筛空：说清是这个筛选条件下没有，不是搜索坏了，并留一个能点的退出口。
+            if (!searching && results.isNotEmpty() && shown.isEmpty()) {
+                item {
+                    FilteredOutBlock(cat, uncategorized) { cat = null }
+                }
+            }
+
             if (!searching && results.isEmpty()) {
                 item {
                     Column {
+                        // 搜过了却一条都没有，界面不能继续沉默 —— 也绝不假装成功。
+                        if (query.isNotBlank() && searched) {
+                            NoResultBlock(query, enabled.size, failures) { vm.search() }
+                            Spacer12()
+                        }
                         if (history.isNotEmpty()) {
                             Text("搜索历史", color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
                             Spacer8()
@@ -231,11 +265,158 @@ fun SearchScreen(
                 }
             }
 
-            items(results, key = { it.media.key }) { agg ->
+            items(shown, key = { it.media.key }) { agg ->
                 ResultRow(agg) { av -> onOpenDetail(av.sourceId, av.item.id) }
+            }
+
+            // 有结果时也不能把没答话的源藏起来：少掉几个源，用户有权知道
+            if (shown.isNotEmpty() && failures.isNotEmpty()) {
+                item {
+                    Text(
+                        "另有 ${failures.size} 个源没答上话：" +
+                            failures.joinToString("；") { "${it.sourceName} ${it.reason}" },
+                        color = T.TextFaint,
+                        fontSize = Fs.tiny,
+                        lineHeight = Fs.tiny * 1.6f,
+                        modifier = Modifier.padding(top = Sp.s3),
+                    )
+                }
             }
         }
     }
+}
+
+/**
+ * 搜完了、一条都没有。
+ *
+ * 「几个源压根没答话」和「源都答了、确实没有这部片」是两件事，
+ * 合成一句「无结果」用户只能猜 —— 所以分开说，没答话的要点名到具体哪个源、为什么。
+ * 这里不写「搜索完成」之类的话：结果确实空着，说什么都不能把它说成成功。
+ */
+@Composable
+private fun NoResultBlock(
+    query: String,
+    searchedSources: Int,
+    failures: List<SearchOutcome.Failure>,
+    onRetry: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().clip(R.md)
+            .background(if (failures.isEmpty()) T.Surface2 else T.Warn.copy(alpha = .07f))
+            .border(1.dp, if (failures.isEmpty()) T.Border else T.Warn.copy(alpha = .28f), R.md)
+            .padding(13.dp),
+    ) {
+        if (failures.isEmpty()) {
+            Text(
+                "检索了 $searchedSources 个播放源，都没有「$query」",
+                color = T.Text,
+                fontSize = Fs.body2,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer4()
+            Text(
+                "这些源是各自去站里按片名找词的，写法差一点就对不上。换个更短、更接近片名的关键词再试一次。",
+                color = T.TextDim,
+                fontSize = Fs.xs,
+                lineHeight = Fs.xs * 1.6f,
+            )
+        } else {
+            Text(
+                "${failures.size} 个源没答上话，其余源里也没有「$query」",
+                color = T.Warn,
+                fontSize = Fs.body2,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer8()
+            // reason 已经是仓库给好的短中文，直接列出来，不再自己编一套说法
+            failures.forEach { f ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Text(
+                        f.sourceName,
+                        color = T.Text,
+                        fontSize = Fs.xs,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer8()
+                    Text(f.reason, color = T.TextFaint, fontSize = Fs.xs)
+                }
+            }
+            Spacer8()
+            Text(
+                "这几个源这次没返回任何内容。换个关键词再搜一次，" +
+                    "或到下面「当前接入的播放源」和底部「我的 → 播放源管理」里看它们现在的状态。",
+                color = T.TextDim,
+                fontSize = Fs.xs,
+                lineHeight = Fs.xs * 1.6f,
+            )
+        }
+        Spacer12()
+        Text(
+            "重新搜索「$query」",
+            color = T.Play400,
+            fontSize = Fs.sm,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clickable(onClick = onRetry),
+        )
+    }
+}
+
+/** 筛选筛空了的一屏：说的是「这个条件下没有」，并给一个立刻能点的出口。 */
+@Composable
+private fun FilteredOutBlock(cat: String?, hidden: Int, onClear: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clip(R.md).background(T.Surface2).border(1.dp, T.Border, R.md)
+            .padding(13.dp),
+    ) {
+        Text(
+            "这个筛选条件下没有内容",
+            color = T.Text,
+            fontSize = Fs.body2,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer4()
+        Text(
+            "有些播放源不给条目返回类型信息（这次有 $hidden 条就没给），它们不会出现在任何类型芯片下。",
+            color = T.TextDim,
+            fontSize = Fs.xs,
+            lineHeight = Fs.xs * 1.6f,
+        )
+        Spacer12()
+        Text(
+            if (cat != null) "清除筛选「$cat」" else "清除筛选",
+            color = T.Play400,
+            fontSize = Fs.sm,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clickable(onClick = onClear),
+        )
+    }
+}
+
+/** 只列这次结果里真出现过的类型（类型名 + 命中条数），芯片上写的数字就是点了能剩下多少。 */
+private fun resultChips(items: List<AggregatedMedia>): List<Pair<String, Int>> =
+    items.mapNotNull { it.media.category?.trim()?.takeIf { c -> c.isNotEmpty() } }
+        .groupingBy { it }.eachCount()
+        .entries.sortedByDescending { it.value }
+        .map { it.key to it.value }
+
+/** 可点筛选芯片（选中态用底色 + 文字双重表达，不单靠颜色）。 */
+@Composable
+private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
+    Text(
+        label,
+        color = if (on) Color.White else T.TextDim,
+        fontSize = Fs.sm,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.clip(R.full)
+            .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    )
 }
 
 private fun Modifier.flex(f: Float): Modifier = this

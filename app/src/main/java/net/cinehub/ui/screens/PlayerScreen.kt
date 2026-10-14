@@ -64,6 +64,9 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -102,6 +105,15 @@ private enum class Panel { Episodes, Line, Quality, Speed }
 
 /** 横滑划满一屏对应的跳转量。 */
 private const val SCRUB_SPAN_MS = 120_000L
+
+/**
+ * 播放器报的毫秒 → 秒。
+ *
+ * Media3 用 C.TIME_UNSET（Long.MIN_VALUE+1）表示「还没解出来」，位置在未就绪时也是负的。
+ * 这里先认出来再换算 —— 这两个值一路会写进观看记录，
+ * 而「看完了没」是拿时长算的，靠「除一千再取非负」刚好抹平是在赌上游不改。
+ */
+private fun msToSec(ms: Long): Long = if (ms < 0L || ms == androidx.media3.common.C.TIME_UNSET) 0L else ms / 1000
 
 /**
  * 播放器。
@@ -230,7 +242,10 @@ fun PlayerScreen(
         }
         player.setMediaSource(source)
         player.prepare()
-        if (resumeFrom > 0) player.seekTo(resumeFrom * 1000)
+        // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 上面 player.stop() 之后
+        // 轮询会把那个活值写成 0，这里再读就等于放弃续播。
+        val from = playing?.resumeFrom ?: 0L
+        if (from > 0) player.seekTo(from * 1000)
         player.play()
     }
 
@@ -238,8 +253,8 @@ fun PlayerScreen(
     // 只有 Media3 解出 master playlist 之后才知道有几档，不能凭空列。
     LaunchedEffect(player) {
         while (true) {
-            pos = (player.currentPosition / 1000).coerceAtLeast(0)
-            dur = (player.duration / 1000).coerceAtLeast(0)
+            pos = msToSec(player.currentPosition)
+            dur = msToSec(player.duration)
             wantsPlay = player.playWhenReady
             vm.updatePosition(pos, dur)
             val hs: List<Int> = runCatching {
@@ -280,6 +295,22 @@ fun PlayerScreen(
             delay(3500)
             controls = false
         }
+    }
+
+    /**
+     * 退到后台就把播放和轮询一起停下。
+     *
+     * 影枢没有前台服务，也不发播放通知 —— 放任它在后台放着，用户既找不到入口也关不掉，
+     * 只剩一个还在响的手机；而那条 500ms 的位置轮询会一路把同一个位置反复写进观看记录。
+     * 回来时不自动续：没有通知、没有锁屏控件的情况下「自己又放起来了」比「要再点一下」更让人慌。
+     */
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && player.playWhenReady) player.pause()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     DisposableEffect(Unit) {

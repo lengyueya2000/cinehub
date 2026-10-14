@@ -25,6 +25,7 @@ import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.HistoryEntry
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
+import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
@@ -43,6 +44,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
     val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
+
+    /** 缓存占掉的字节数。仓库在协程里数好，界面只读这个值。 */
+    val downloadSpace: StateFlow<Long> = downloadRepo.space
 
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
@@ -71,6 +75,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _doubanResolving = MutableStateFlow<String?>(null)
     val doubanResolving: StateFlow<String?> = _doubanResolving.asStateFlow()
 
+    /** 落盘那份源列表这一版读不通了（[net.cinehub.data.SourceRepository.unreadable]）。 */
+    val sourcesUnreadable: StateFlow<Boolean> = sourceRepo.unreadable
+
     // ---------- 播放源 ----------
     private val _sources = MutableStateFlow<List<SourceConfig>>(emptyList())
     val sources: StateFlow<List<SourceConfig>> = _sources.asStateFlow()
@@ -98,6 +105,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _results = MutableStateFlow<List<AggregatedMedia>>(emptyList())
     val results: StateFlow<List<AggregatedMedia>> = _results.asStateFlow()
 
+    /** 这次搜索里根本没查动的源（连同短原因）。空列表 = 每个源都答了「没有」。 */
+    private val _searchFailures = MutableStateFlow<List<SearchOutcome.Failure>>(emptyList())
+    val searchFailures: StateFlow<List<SearchOutcome.Failure>> = _searchFailures.asStateFlow()
+
     private val _searching = MutableStateFlow(false)
     val searching: StateFlow<Boolean> = _searching.asStateFlow()
 
@@ -116,6 +127,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _siblings = MutableStateFlow<List<SourceAvailability>>(emptyList())
     val siblings: StateFlow<List<SourceAvailability>> = _siblings.asStateFlow()
+
+    /** 查这一部片的其它源时，根本没答上话的那几个（界面要单独说一句）。 */
+    private val _siblingFailures = MutableStateFlow<List<SearchOutcome.Failure>>(emptyList())
+    val siblingFailures: StateFlow<List<SearchOutcome.Failure>> = _siblingFailures.asStateFlow()
 
     /** 当前详情页选中的源。 */
     private val _activeSourceId = MutableStateFlow<String?>(null)
@@ -164,6 +179,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val mediaCover: String? = null,
         /** 播的是本机缓存时，这部片原本属于哪个源 —— [sourceId] 那时是 "local"。 */
         val originSourceId: String? = null,
+        /**
+         * 这一次播放请求要从第几秒开始。
+         *
+         * 它必须跟着请求冻结在这里，不能读 [_resumePosition]：那个值是播放器每 500ms
+         * 报上来的活值，而换源时媒体源重建会先 `player.stop()` —— 那一刻位置是 0，
+         * 轮询会把 0 写回去。等新地址解析完（HTML 抓取 + 线路探测，通常不止 500ms）
+         * 再去读，读到的就是 0，「切源不丢进度」当场失效，还会把这个假位置落进记录。
+         */
+        val resumeFrom: Long = 0L,
     )
 
     /** 正在解析直链 —— 播放器靠它显示「已收到你的点击」，而不是一个不动的黑屏。 */
@@ -273,7 +297,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching {
                 val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
                 val n = SourceAdapters.create(cfg).browse(1).size
-                "识别到 $n 个资源 · 平均延迟 ${ms}ms"
+                // 「识别到 0 个资源」不是成功。根路径能连通是事实，但一个资源都没给，
+                // 存进来就是个占位的死源 —— 两句话都得说，别合成一句「连接成功」。
+                if (n == 0) "连上了（${ms}ms），但列表里一个资源都没给 —— 先搜一次再决定存不存"
+                else "识别到 $n 个资源 · 平均延迟 ${ms}ms"
             }
         }
         result.onSuccess { msg -> onResult(true, msg, cfg) }
@@ -298,6 +325,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         name = name.ifBlank { baseUrl },
         baseUrl = baseUrl.trim().trimEnd('/'),
         kind = kind,
+        // 排到最后：默认值 0/1 会和内置源撞上，界面上就同时出现两个「默认」位次
+        priority = (_sources.value.maxOfOrNull { it.priority } ?: 0) + 1,
         authToken = authToken?.takeIf { it.isNotBlank() },
         authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None
         else net.cinehub.data.model.AuthMode.Cookie,
@@ -330,13 +359,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _query.value = q
         viewModelScope.launch {
             _searching.value = true
-            _results.value = mediaRepo.search(q)
+            val out = mediaRepo.search(q)
+            _results.value = out.items
+            _searchFailures.value = out.failures
             _searching.value = false
             _history.value = (listOf(q) + _history.value).distinct().take(8)
         }
     }
 
-    fun clearQuery() { _query.value = ""; _results.value = emptyList() }
+    fun clearQuery() {
+        _query.value = ""
+        _results.value = emptyList()
+        _searchFailures.value = emptyList()
+    }
 
     // ---------- 详情 ----------
 
@@ -345,6 +380,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _detailLoading.value = true
             _detailError.value = null
             _detail.value = null
+            _siblings.value = emptyList()
+            _siblingFailures.value = emptyList()
             _activeSourceId.value = sourceId
             val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
             if (cfg == null) {
@@ -353,7 +390,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             runCatching { mediaRepo.detail(cfg, mediaId) }
-                .onSuccess { d ->
+                .onSuccess { raw ->
+                    // 详情页常常不写年份，卡片写了。留着空的走下去，同一部片会因为
+                    // 「卡片那条带 |2026、详情那条不带」变成两条收藏 / 两条观看记录。
+                    val d = raw.withYear(yearKnownFor(cfg.id, mediaId, raw.media.title))
                     _detail.value = d
                     // 先把当前源放进去，避免面板空着；随后异步补齐其它源
                     _siblings.value = listOf(
@@ -366,25 +406,60 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             latencyMs = _health.value[cfg.id]?.latencyMs,
                         )
                     )
-                    mediaRepo.siblingsOf(d.media.key)
-                        .filter { it.sourceId != cfg.id }
-                        .let { others -> _siblings.value = _siblings.value + others }
+                    val s = mediaRepo.siblingsOf(d.media)
+                    _siblingFailures.value = s.failures
+                    _siblings.value = _siblings.value + s.items.filter { it.sourceId != cfg.id }
                 }
                 .onFailure { _detailError.value = it.message ?: "详情加载失败" }
             _detailLoading.value = false
         }
     }
 
+    /** 把详情补齐成年份一致的那条（detail() 常常解析不出年份）。 */
+    private fun MediaDetail.withYear(y: String?): MediaDetail =
+        if (media.year == null && !y.isNullOrBlank()) copy(media = media.copy(year = y)) else this
+
+    /**
+     * 这一部（源 id + 条目 id）在哪儿见到过年份。
+     *
+     * 按 id 对上最准；id 变了（换源、详情页另开一次）才退到同名，
+     * 因为 [Media.key] 是收藏和观看记录的主键，缺了年份就会分裂成两条。
+     */
+    private fun yearKnownFor(sourceId: String, mediaId: String, title: String): String? {
+        _home.value.firstOrNull { it.sourceId == sourceId && it.id == mediaId }?.year?.let { return it }
+        _results.value.forEach { agg ->
+            agg.availability.firstOrNull { it.sourceId == sourceId && it.item.id == mediaId }
+                ?.item?.year?.let { return it }
+        }
+        val want = normalizeTitle(title)
+        return favorites.value.firstOrNull { normalizeTitle(it.title) == want }?.year
+            ?: watchHistory.value.firstOrNull { normalizeTitle(it.title) == want }?.year
+    }
+
     /** 在详情页切源：拿新源里同一部片的详情。 */
     fun switchDetailSource(av: SourceAvailability) {
         viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
+            val prev = _detail.value
+            // 先把手上这份详情撤掉再取新的：不清的话，从「发请求」到「取回来」这一段时间里
+            // 点播放/缓存，会把**旧源**那条地址配着**新源**的凭证发出去（activeSourceId 已经换了）
+            _detail.value = null
             _detailLoading.value = true
             _detailError.value = null
-            val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
-            _activeSourceId.value = av.sourceId
+            val keepYear = _siblings.value.firstNotNullOfOrNull { it.item.year }
+                ?: yearKnownFor(av.sourceId, av.item.id, av.item.title)
             runCatching { mediaRepo.detail(cfg, av.item.id) }
-                .onSuccess { _detail.value = it }
-                .onFailure { _detailError.value = it.message ?: "该源没有这部片" }
+                .onSuccess {
+                    _detail.value = it.withYear(it.media.year ?: keepYear)
+                    // 取回来了才认这个源：失败了还标着新源，界面就是在说一件没发生的事
+                    _activeSourceId.value = av.sourceId
+                }
+                .onFailure {
+                    // 换不过去就退回原来那一页：把人手上正在看的详情整个撤掉，
+                    // 等于让他为了换一个源而丢掉刚才那半屏
+                    _detail.value = prev
+                    _detailError.value = it.message ?: "该源没有这部片"
+                }
             _detailLoading.value = false
         }
     }
@@ -414,6 +489,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
             val name = cfg?.name ?: sourceId
+            val start =
+                if (resumeFrom >= 0L) resumeFrom
+                else mediaKey?.let { watchRepo.resumeAt(it, episodeIndex) } ?: 0L
 
             // 立刻进入播放器，先把「我收到了」这一步给出去
             _playing.value = Playing(
@@ -423,10 +501,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 mediaKey = mediaKey,
                 mediaYear = mediaYear,
                 mediaCover = mediaCover,
+                resumeFrom = start,
             )
-            _resumePosition.value =
-                if (resumeFrom >= 0L) resumeFrom
-                else mediaKey?.let { watchRepo.resumeAt(it, episodeIndex) } ?: 0L
+            _resumePosition.value = start
             // 上一部的时长不能跟到这一部上：「看不看完」是拿它算的
             lastDurationSec = 0L
 
@@ -570,12 +647,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteDownload(id: String) = downloadRepo.delete(id)
 
-    fun downloadSpace(): Long = downloadRepo.spaceUsed()
-
     /** 直接播已缓存好的文件，不再碰网络。 */
     fun playCached(task: DownloadTask) {
         val uri = downloadRepo.localUri(task.id) ?: return
-        _resumePosition.value = watchRepo.resumeAt(task.mediaKey, task.episodeIndex)
+        val start = watchRepo.resumeAt(task.mediaKey, task.episodeIndex)
+        _resumePosition.value = start
         lastDurationSec = 0L
         _playing.value = Playing(
             mediaTitle = task.mediaTitle,
@@ -591,6 +667,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // 记录里要写「哪个源的这部片」—— 写 local 的话，
             // 下次从「继续观看」点进去会找不到源。
             originSourceId = task.sourceId,
+            resumeFrom = start,
         )
     }
 
@@ -601,17 +678,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 退出播放（[stopPlaying]）时再补一次，所以最多丢 10 秒。
      */
     fun updatePosition(sec: Long, durationSec: Long = 0L) {
-        _resumePosition.value = sec
-        if (durationSec > 0L) lastDurationSec = durationSec
+        _resumePosition.value = sec.coerceAtLeast(0L)
+        // Media3 在没解出时长时给的是 C.TIME_UNSET（Long.MIN_VALUE+1）。轮询那里现在会先归 0，
+        // 但这条是通向落盘的唯一入口，判一下比依赖上游的算术更稳 ——
+        // 那个哨兵值一旦写进记录，「看完了没」就是拿一个负的天文数字在算。
+        val dur = durationSec.takeIf { it > 0L && it <= MAX_DURATION_SEC } ?: 0L
+        if (dur > 0L) lastDurationSec = dur
         if (sec <= 0L) return
         val now = System.currentTimeMillis()
         if (now - lastRecordAt >= 10_000L) {
             lastRecordAt = now
-            recordWatch(sec, durationSec)
+            recordWatch(sec, dur)
         }
     }
 
     private var lastRecordAt = 0L
+
+    private companion object {
+        /** 一集再长也不会超过一天。长过这个的就是哨兵值而不是时长。 */
+        const val MAX_DURATION_SEC = 24 * 3600L
+    }
 
     /**
      * 最后一次听到的真实时长。
@@ -717,15 +803,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openFromDouban(
         item: DoubanItem,
         onHit: (Media) -> Unit,
-        onMiss: (DoubanItem) -> Unit,
+        onMiss: (DoubanItem, String) -> Unit,
     ) {
+        // 连点两次会并发跑两份搜索、回来两笔导航 —— 先占住，正在找的时候点不动
+        if (_doubanResolving.value != null) return
         viewModelScope.launch {
             _doubanResolving.value = item.id
-            val hits = runCatching { mediaRepo.search(item.title) }.getOrDefault(emptyList())
+            val hits = mediaRepo.search(item.title).items
             _doubanResolving.value = null
             val want = normalizeTitle(item.title)
-            val match = hits.firstOrNull { normalizeTitle(it.media.title) == want }
-            if (match == null) onMiss(item) else onHit(match.media)
+            val cands = hits.filter { normalizeTitle(it.media.title) == want }
+            // 同名不同片是常事（翻拍、续集、同名综艺）。豆瓣给了年份就按年份挑；
+            // 源那边没写年份时，只有「唯一一条候选」才敢认 —— 两条以上就宁可说认不出。
+            val year = item.year?.takeIf { it.isNotBlank() }
+            val match = when {
+                cands.isEmpty() -> null
+                year == null -> cands.firstOrNull()
+                else -> cands.firstOrNull { it.media.year == year }
+                    ?: cands.singleOrNull()?.takeIf { it.media.year.isNullOrBlank() }
+            }
+            val why = when {
+                match != null -> null
+                cands.isEmpty() -> "接的源里搜不到同名的片子"
+                else -> "同名的有 ${cands.size} 部，对不上豆瓣标的 $year 年那部 —— 认不准就不硬指"
+            }
+            if (match == null) onMiss(item, why!!) else onHit(match.media)
         }
     }
 

@@ -17,6 +17,8 @@ data class DoubanItem(
     val rate: String? = null,
     val kinds: List<String> = emptyList(),
     val regions: List<String> = emptyList(),
+    /** 豆瓣标的年份。同名不同片（翻拍、续集、同名综艺）就靠它分辨。 */
+    val year: String? = null,
     /** Top250 才有名次；标签榜是 0。 */
     val rank: Int = 0,
 ) {

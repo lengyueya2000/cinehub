@@ -67,6 +67,7 @@ import net.cinehub.data.model.Health
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
+import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.clock
 import net.cinehub.ui.AppViewModel
@@ -92,6 +93,7 @@ fun DetailScreen(
     val loading by vm.detailLoading.collectAsState()
     val error by vm.detailError.collectAsState()
     val siblings by vm.siblings.collectAsState()
+    val siblingFailures by vm.siblingFailures.collectAsState()
     val activeSourceId by vm.activeSourceId.collectAsState()
     val health by vm.health.collectAsState()
     val downloads by vm.downloads.collectAsState()
@@ -226,6 +228,10 @@ fun DetailScreen(
                     SourcePanel(
                         activeSourceId = activeSourceId,
                         siblings = siblings,
+                        failures = siblingFailures,
+                        // 换源没成时页面会退回原来那份详情（不撤，用户就不白丢一屏），
+                        // 所以「没换成」这件事只能在这一行里说 —— 否则点下去毫无动静。
+                        switchError = error,
                         health = health,
                         onRescan = { vm.refreshHealth(true) },
                         onPick = { av ->
@@ -488,7 +494,9 @@ private fun Backdrop(
                         fontSize = Fs.xs,
                     )
                     Spacer8()
-                    Pill("4K HDR", cyan = true)
+                    // 画质徽标只写元数据里真的有的那一项。以前硬写「4K HDR」，
+                    // 站点明明给的是「高清」，界面上却替它吹成 4K —— 用户点进去才发现不是。
+                    qualityBadge(d.media)?.let { Pill(it, cyan = true) }
                 }
                 if (!d.media.score.isNullOrBlank()) {
                     Spacer8()
@@ -563,6 +571,8 @@ private fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
 private fun SourcePanel(
     activeSourceId: String?,
     siblings: List<SourceAvailability>,
+    failures: List<SearchOutcome.Failure>,
+    switchError: String?,
     health: Map<String, net.cinehub.data.model.HealthReport>,
     onRescan: () -> Unit,
     onPick: (SourceAvailability) -> Unit,
@@ -635,6 +645,43 @@ private fun SourcePanel(
                 }
             }
         }
+        // 没答上话的源单独说一句。悄悄少一项的话，用户看到的就是「这片只有一个源」，
+        // 而真相是「另外两个源这次没连上」—— 那该做的是重新检测，不是换一个源试试。
+        if (failures.isNotEmpty()) {
+            Spacer8()
+            Text(
+                "另有 ${failures.size} 个源没答上话：" +
+                    failures.joinToString("、") { "${it.sourceName}（${it.reason}）" },
+                color = T.Warn,
+                fontSize = Fs.xxs,
+            )
+        }
+        if (!switchError.isNullOrBlank()) {
+            Spacer8()
+            Text("还在原来这个源上：$switchError", color = T.Err, fontSize = Fs.xxs)
+        }
+    }
+}
+
+/**
+ * 详情页的画质徽标：只写这份元数据里真的存在的说法。
+ *
+ * 影枢在详情页还不知道实际分辨率（要等播放器解出 master playlist 才有几档高度），
+ * 所以这里不能替站点吹 —— 站点写「高清」就显示「高清」本来该显示的样子，没写就不显示。
+ */
+private fun qualityBadge(m: Media): String? {
+    val t = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")
+    val fourK = t.contains("4k", true) || t.contains("2160")
+    val hdr = t.contains("hdr", true)
+    val blue = t.contains("蓝光")
+    return when {
+        fourK && hdr -> "4K HDR"
+        fourK -> "4K"
+        hdr -> "HDR"
+        blue -> "蓝光"
+        t.contains("1080") -> "1080P"
+        t.contains("720") -> "720P"
+        else -> null
     }
 }
 

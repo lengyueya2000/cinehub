@@ -9,6 +9,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,6 +38,7 @@ import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.coroutines.coroutineContext
 
 private val Context.downloadStore by preferencesDataStore(name = "cinehub_downloads")
 
@@ -55,8 +58,24 @@ class DownloadRepository(
 ) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val jobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * 在跑的那一笔。
+     *
+     * 用一层壳而不是直接存 Job：Job 要 launch 之后才拿得到，而协程可能在存进 map 之前
+     * 就跑完了 —— 那一刻按 id 盲删会把**新**那一笔摘没。壳在 launch 之前就占好位，
+     * 谁在跑认壳的身份，不认协程对象。
+     */
+    private class Run {
+        @Volatile
+        var job: Job? = null
+    }
+
+    private val jobs = ConcurrentHashMap<String, Run>()
     private val calls = ConcurrentHashMap<String, okhttp3.Call>()
+
+    /** pump() 会从主线程和 IO 线程两侧进来，占位与发射得看着同一把锁。 */
+    private val queueLock = Any()
 
     /** 用户主动暂停过的任务：OkHttp 被打断时会抛 IOException，那不该记成失败。 */
     private val pausedByUser = ConcurrentHashMap.newKeySet<String>()
@@ -64,15 +83,29 @@ class DownloadRepository(
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY = stringPreferencesKey("downloads_v1")
     private var lastSaveAt = 0L
+    private var pendingSave: Job? = null
 
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
+
+    private val _space = MutableStateFlow(0L)
+
+    /**
+     * 已占用的字节数，给下载页顶部那句「共 x MB」用。
+     *
+     * 算一次放在这儿，让界面去读这个值 —— File.walk 是把整棵目录树点一遍的同步遍历，
+     * 直接在组合里调就是拿主线程去数文件，而下载页每 500ms 就在刷新。
+     */
+    val space: StateFlow<Long> = _space.asStateFlow()
 
     private val root: File
         get() = File(context.getExternalFilesDir(null) ?: context.filesDir, "downloads")
 
     init {
-        scope.launch { load() }
+        scope.launch {
+            load()
+            refreshSpace()
+        }
     }
 
     // ---------- 对外 ----------
@@ -82,8 +115,12 @@ class DownloadRepository(
     fun taskOf(sourceId: String, mediaId: String, episodeIndex: Int): DownloadTask? =
         _tasks.value.firstOrNull { it.id == keyOf(sourceId, mediaId, episodeIndex) }
 
-    /** 已占用的字节数，给下载页顶部那句「共 x MB」用。 */
-    fun spaceUsed(): Long = root.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+    /** 已占用的字节数。只在 [refreshSpace] 的协程里数，别拿到组合里直接调。 */
+    private fun spaceUsed(): Long = root.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+
+    private fun refreshSpace() {
+        scope.launch { _space.value = runCatching { spaceUsed() }.getOrDefault(0L) }
+    }
 
     suspend fun enqueue(cfg: SourceConfig, m: Media, ep: Episode) {
         val id = keyOf(cfg.id, m.id, ep.index)
@@ -105,11 +142,20 @@ class DownloadRepository(
             episodeIndex = ep.index,
             episodeUrl = ep.playUrl,
         )
+        // 重下同一集（上一次是 Failed/Paused）时要把「用户按过暂停」这个名字摘掉，
+        // 否则这一笔真失败了会被当成用户暂停，界面上一个原因都不写。
+        pausedByUser -= id
         _tasks.update { list -> list.filterNot { it.id == id } + task }
         saveNow()
-        start(task)
+        pump()
     }
 
+    /**
+     * 整条线路一起排队，不是同时开跑。
+     *
+     * 「缓存全部」点下去可能有几十集，全发出去就是拿手机当下载机：连接互相抢带宽，
+     * 站点那边也会被当成刷接口。排在后面的显示「排队中」，跑完一格补一格。
+     */
     suspend fun enqueueAll(cfg: SourceConfig, m: Media, eps: List<Episode>) {
         eps.forEach { enqueue(cfg, m, it) }
     }
@@ -117,27 +163,41 @@ class DownloadRepository(
     fun pause(id: String) {
         pausedByUser += id
         patch(id, persist = true) { it.copy(status = DownloadStatus.Paused) }
-        calls.remove(id)?.cancel()
-        jobs.remove(id)?.cancel()
+        synchronized(queueLock) {
+            calls.remove(id)?.cancel()
+            jobs.remove(id)?.job?.cancel()
+        }
+        pump()
     }
 
     fun resume(id: String) {
         val t = taskOf(id) ?: return
         pausedByUser -= id
-        start(t)
+        _tasks.update { list ->
+            list.map { if (it.id == id) it.copy(status = DownloadStatus.Queued, error = null) else it }
+        }
+        saveNow()
+        pump()
     }
 
     fun delete(id: String) {
         pausedByUser += id
-        calls.remove(id)?.cancel()
-        val job = jobs.remove(id)
-        job?.cancel()
+        val run = synchronized(queueLock) {
+            calls.remove(id)?.cancel()
+            jobs.remove(id)
+        }
+        run?.job?.cancel()
         _tasks.update { list -> list.filterNot { it.id == id } }
         saveNow()
         scope.launch {
             // 先等这一条真正停下来再清目录，否则它手上那半截写入会把删空的目录又填回去
-            job?.join()
+            run?.job?.join()
             runCatching { dirOf(id).deleteRecursively() }
+            // 任务没了，名字也得跟着从「用户自己按的暂停」里摘掉：id 是按（源、片、集）算的，
+            // 留着它，以后重下同一集时真失败会被当成用户暂停而一句原因都不写。
+            pausedByUser -= id
+            refreshSpace()
+            pump()
         }
     }
 
@@ -150,12 +210,26 @@ class DownloadRepository(
 
     // ---------- 执行 ----------
 
-    private fun start(task: DownloadTask) {
-        jobs[task.id]?.cancel()
-        jobs[task.id] = scope.launch { runTask(task.id) }
+    /**
+     * 有空位就把排队的发出去。
+     *
+     * 占位（写进 [jobs]）和发射必须在同一把锁里：pump 会从主线程和 IO 线程两侧进来，
+     * 慢一步就会把同一集发出去两遍，两笔写同一个文件。
+     */
+    private fun pump() = synchronized(queueLock) {
+        val free = MAX_PARALLEL - jobs.size
+        if (free <= 0) return
+        _tasks.value.filter { it.status == DownloadStatus.Queued }.take(free).forEach { t ->
+            val run = Run()
+            if (jobs.putIfAbsent(t.id, run) == null) {
+                run.job = scope.launch { runTask(t.id, run) }
+                // 占位期间被 pause/delete 摘走了就掐掉自己这一笔：map 里已经换了人
+                if (jobs[t.id] !== run) run.job?.cancel()
+            }
+        }
     }
 
-    private suspend fun runTask(id: String) {
+    private suspend fun runTask(id: String, self: Run) {
         patch(id, persist = true) { it.copy(status = DownloadStatus.Running, error = null) }
         try {
             download(id)
@@ -174,12 +248,21 @@ class DownloadRepository(
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            if (id in pausedByUser) return
-            val why = reasonOf(e)
-            patch(id, persist = true) { it.copy(status = DownloadStatus.Failed, error = why) }
+            // 这一笔已经被摘走（暂停、删除、重下时被新的接管）就别写状态：
+            // 被 cancel 的 OkHttp 抛的是 IOException，照原样记会写成一条假的「连接被切断」
+            if (id in pausedByUser || jobs[id] !== self) return
+            patch(id, persist = true) { it.copy(status = DownloadStatus.Failed, error = reasonOf(e)) }
         } finally {
-            jobs.remove(id)
-            calls.remove(id)
+            synchronized(queueLock) {
+                // 只摘自己那一笔：重开同一集时 map 里已经换成新的壳了，按 id 盲删会把
+                // 新那笔摘没，之后暂停和删除就管不住真正在跑的那个。
+                if (jobs[id] === self) {
+                    jobs.remove(id)
+                    calls.remove(id)
+                }
+            }
+            refreshSpace()
+            pump()
         }
     }
 
@@ -239,7 +322,10 @@ class DownloadRepository(
 
     private suspend fun downloadSingle(id: String, dir: File, url: String, cfg: SourceConfig) {
         withContext(Dispatchers.IO) {
-            val out = File(dir, "video" + pathExt(url, ".mp4"))
+            // 写入落在 .part 上，只有整条走完了才换成正式文件名：
+            // 「文件在而且非空」从此等于「这一条是完整的」，本地播放不会去点一个半截的视频。
+            val target = File(dir, "video" + pathExt(url, ".mp4"))
+            val out = File(dir, target.name + ".part")
             val have = if (out.isFile) out.length() else 0L
             val call = newCall(url, cfg, rangeFrom = have.takeIf { it > 0 })
             calls[id] = call
@@ -257,6 +343,9 @@ class DownloadRepository(
                     val buf = ByteArray(64 * 1024)
                     var tick = done
                     while (true) {
+                        // 协程被摘走时 ensureActive 会抛 CancellationException：
+                        // 不检查的话这里会一直写到下完，和新起的那一笔一起磨同一个文件
+                        ensureActive()
                         val n = src.read(buf)
                         if (n < 0) break
                         os.write(buf, 0, n)
@@ -270,12 +359,27 @@ class DownloadRepository(
                 }
                 if (total > 0 && done < total) error("下到 ${done * 100 / total}% 时断了，再点继续")
                 val d = done
-                patch(id, persist = true) { it.copy(bytesDone = d, bytesTotal = total.coerceAtLeast(d), fileName = out.name) }
+                promote(out, target)
+                patch(id, persist = true) {
+                    it.copy(bytesDone = d, bytesTotal = total.coerceAtLeast(d), fileName = target.name)
+                }
             }
         }
     }
 
+    /** 把写完了的 .part 换成正式文件名。 */
+    private fun promote(part: File, into: File) {
+        if (into.exists() && !into.delete()) error("${into.name} 删不掉，这一条缓存没法收尾")
+        if (!part.renameTo(into)) {
+            // 同目录改名几乎不会失败；真失败了（个别文件系统不允许）就整份搬过去
+            part.copyTo(into, overwrite = true)
+            part.delete()
+        }
+    }
+
     private suspend fun downloadHls(id: String, dir: File, url: String, cfg: SourceConfig) {
+        // 上一次中断留下的 .part 一律作废：半截分片没有续传的意义，重来这一段就是
+        dir.listFiles()?.filter { it.name.endsWith(".part") }?.forEach { it.delete() }
         // 分片地址是相对**它自己那份列表**的。主列表和变体常常不在同一个目录
         // （实测 mux 的测试流：变体在 url_8/，分片又在 url_8/url_590/），
         // 用主列表的地址去拼就会 404 —— 播放器自己能播、这里缓存不了，就是这么来的。
@@ -315,6 +419,7 @@ class DownloadRepository(
             if (!f.isFile || f.length() == 0L) fetchBytes(initUrl, cfg, f, keyOf(initCrypt))
         }
         segs.forEach { seg ->
+            coroutineContext.ensureActive()
             val f = File(dir, seg.name)
             if (!f.isFile || f.length() == 0L) fetchBytes(seg.url, cfg, f, keyOf(seg.crypt))
             n++
@@ -322,8 +427,12 @@ class DownloadRepository(
             patch(id) { it.copy(segmentsDone = d) }
         }
 
-        File(dir, "index.m3u8").writeText(localPlaylist(segs, initName))
-        patch(id, persist = true) { it.copy(fileName = "index.m3u8", segmentsDone = segs.size) }
+        // 本地列表也是「写完才算数」：它一在，localUri 就会说这一集可以离线播了
+        val playlistFile = File(dir, "index.m3u8")
+        val tmp = File(dir, "index.m3u8.part")
+        tmp.writeText(localPlaylist(segs, initName))
+        promote(tmp, playlistFile)
+        patch(id, persist = true) { it.copy(fileName = playlistFile.name, segmentsDone = segs.size) }
     }
 
     private suspend fun fetchBytes(
@@ -333,11 +442,17 @@ class DownloadRepository(
         key: Pair<ByteArray, ByteArray>? = null,
     ) {
         withContext(Dispatchers.IO) {
+            ensureActive()
             val call = newCall(url, cfg, rangeFrom = null)
             call.execute().use { r ->
                 if (!r.isSuccessful) error(Http.failureReason(r.code))
                 val bytes = r.body?.bytes() ?: error("空响应")
-                into.writeBytes(if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second))
+                val plain = if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second)
+                // 先落到 .part 再改名：这一段的完成判据是「正式名字的文件的字节非空」，
+                // 直接写进正式名字，就是让一段半截的分片冒充一片完整的。
+                val part = File(into.parentFile, into.name + ".part")
+                part.writeBytes(plain)
+                promote(part, into)
             }
         }
     }
@@ -550,10 +665,18 @@ class DownloadRepository(
         if (persist) saveNow() else saveSoon()
     }
 
+    /** 同 [WatchRepository]：窗口内的写改成延后补一次，别把最后一笔丢掉。 */
     private fun saveSoon() {
-        val now = System.currentTimeMillis()
-        if (now - lastSaveAt < 1_500L) return
-        saveNow()
+        val wait = 1_500L - (System.currentTimeMillis() - lastSaveAt)
+        if (wait <= 0L) {
+            saveNow()
+            return
+        }
+        pendingSave?.cancel()
+        pendingSave = scope.launch {
+            delay(wait)
+            saveNow()
+        }
     }
 
     private fun saveNow() {
@@ -572,14 +695,20 @@ class DownloadRepository(
             if (it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued)
                 it.copy(status = DownloadStatus.Paused) else it
         }
-        _tasks.value = fixed
-        if (fixed != stored) {
+        // 落盘读回来之前用户可能已经排了一个任务：整份覆盖会把那一笔吞掉，
+        // 之后任何一次保存再把「没有它」的状态写回磁盘。所以合并，内存里的优先。
+        val merged = (_tasks.value + fixed).distinctBy { it.id }
+        _tasks.value = merged
+        if (merged != stored) {
             lastSaveAt = System.currentTimeMillis()
-            context.downloadStore.edit { it[KEY] = json.encodeToString(fixed) }
+            context.downloadStore.edit { it[KEY] = json.encodeToString(merged) }
         }
     }
 
     private companion object {
+        /** 同时在跑几集。多了没意义：带宽就那么宽，站点那边也容易把并发当成刷接口。 */
+        const val MAX_PARALLEL = 3
+
         fun keyOf(sourceId: String, mediaId: String, episodeIndex: Int) =
             "dl_${sourceId}_${mediaId}_$episodeIndex".replace(Regex("[^A-Za-z0-9_.-]"), "_")
     }

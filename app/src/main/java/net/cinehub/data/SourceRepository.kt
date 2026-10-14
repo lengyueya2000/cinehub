@@ -5,6 +5,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
@@ -21,15 +24,33 @@ private val Context.dataStore by preferencesDataStore(name = "cinehub")
 class SourceRepository(private val context: Context) {
 
     private val KEY = stringPreferencesKey("sources_v1")
+    private val BACKUP_KEY = stringPreferencesKey("sources_v1_unreadable")
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
+
+    /** 上一次真读通了的列表。读不通时用它兜，见 [sources]。 */
+    @Volatile
+    private var lastGood: List<SourceConfig>? = null
+
+    /**
+     * 落盘那份读不通了（内容在，但这一版解析不了）。
+     *
+     * 必须和「压根没配过」分开：两者都回落到内置源的话，界面上看着一切正常，
+     * 而用户下一次任何保存都会把自己加的源整个冲掉。
+     */
+    private val _unreadable = MutableStateFlow(false)
+    val unreadable: StateFlow<Boolean> = _unreadable.asStateFlow()
 
     val sources: Flow<List<SourceConfig>> = context.dataStore.data.map { p ->
         val raw = p[KEY]
-        val stored = if (raw.isNullOrBlank()) null
-        else runCatching { json.decodeFromString<List<SourceConfig>>(raw) }.getOrNull()
+        val stored = raw?.takeIf { it.isNotBlank() }?.let {
+            runCatching { json.decodeFromString<List<SourceConfig>>(it) }.getOrNull()
+        }
+        _unreadable.value = raw.isNullOrBlank().not() && stored == null
         // 已经撤掉的内置源不能因为「老用户的列表里还留着这一条」就继续冒出来；
         // 用户自己加的源 id 形如 src_xxx，落不到 retiredIds 里，不受影响。
-        (stored ?: Seed.sources).filterNot { it.id in Seed.retiredIds }
+        val list = (stored ?: lastGood ?: Seed.sources).filterNot { it.id in Seed.retiredIds }
+        if (stored != null) lastGood = list
+        list
     }
 
     /** 按优先级排序、且已启用的源。 */
@@ -75,7 +96,16 @@ class SourceRepository(private val context: Context) {
 
     private suspend fun write(list: List<SourceConfig>) {
         val sorted = list.sortedBy { it.priority }
-        context.dataStore.edit { it[KEY] = json.encodeToString(sorted) }
+        val encoded = json.encodeToString(sorted)
+        context.dataStore.edit { p ->
+            val prev = p[KEY]
+            // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
+            // 而不是被「看起来正常」的新列表就地替换掉。
+            if (!prev.isNullOrBlank() && runCatching { json.decodeFromString<List<SourceConfig>>(prev) }
+                    .isFailure
+            ) p[BACKUP_KEY] = prev
+            p[KEY] = encoded
+        }
     }
 }
 

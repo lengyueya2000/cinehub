@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -78,9 +79,18 @@ fun LibraryScreen(
     val sources by vm.sources.collectAsState()
 
     var kindMovie by remember { mutableStateOf(true) }
-    var miss by remember { mutableStateOf<DoubanItem?>(null) }
+    var miss by remember { mutableStateOf<Pair<DoubanItem, String>?>(null) }
     LaunchedEffect(chart) { kindMovie = chart.kind == "movie" }
     LaunchedEffect(Unit) { vm.ensureDouban() }
+
+    /**
+     * 这一页还在不在。
+     *
+     * 拿片名去源里搜要一两秒，回来时用户可能已经切到别的 Tab 了 —— 那种「迟到的命中」
+     * 照原样去改路由，就是把人从片库抛进一个他根本没点的详情页。
+     */
+    var mounted by remember { mutableStateOf(true) }
+    DisposableEffect(Unit) { onDispose { mounted = false } }
 
     val enabledSources = sources.count { it.enabled }
     val charts = if (kindMovie) DoubanChart.MOVIE else DoubanChart.TV
@@ -166,15 +176,21 @@ fun LibraryScreen(
                             rank = d.rank.takeIf { n -> n > 0 },
                             badge = if (resolving == d.id) "找片中" else null,
                             onLongClick = { onOpenDoubanPage(d.url) },
-                            onClick = { vm.openFromDouban(d, onHit = { m -> onOpenDetail(m.sourceId, m.id) }, onMiss = { miss = it }) },
+                            onClick = {
+                                vm.openFromDouban(
+                                    d,
+                                    onHit = { m -> if (mounted) onOpenDetail(m.sourceId, m.id) },
+                                    onMiss = { it2, why -> if (mounted) miss = it2 to why },
+                                )
+                            },
                         )
                     }
                 }
             }
         }
 
-        // 豆瓣有这部、手上的源搜不到 —— 如实说完，再把去豆瓣的路递过去。
-        miss?.let { m ->
+        // 豆瓣有这部、手上的源对不上 —— 如实说完对不上的到底是哪一种，再把去豆瓣的路递过去。
+        miss?.let { (m, why) ->
             Row(
                 Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                     .padding(Sp.s4).clip(R.lg).background(T.Surface2).border(1.dp, T.Border, R.lg)
@@ -182,8 +198,16 @@ fun LibraryScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("《${m.title}》豆瓣有，影枢接的 $enabledSources 个源里没搜到同名", color = T.Text, fontSize = Fs.sm)
-                    Text("可能是源里没有，也可能只是片名写法不一样", color = T.TextFaint, fontSize = Fs.xxs)
+                    Text(
+                        "《${m.title}》${m.year?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""} 豆瓣有，$why",
+                        color = T.Text,
+                        fontSize = Fs.sm,
+                    )
+                    Text(
+                        "在 $enabledSources 个启用的源里搜过 —— 可能是源里真没有，也可能只是片名写法不一样",
+                        color = T.TextFaint,
+                        fontSize = Fs.xxs,
+                    )
                 }
                 Spacer8()
                 Row(
@@ -243,6 +267,7 @@ private fun Long.ofTime(): String =
 @Composable
 fun DownloadsScreen(vm: AppViewModel) {
     val tasks by vm.downloads.collectAsState()
+    val space by vm.downloadSpace.collectAsState()
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {
         Box(Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s3)) {
@@ -251,7 +276,7 @@ fun DownloadsScreen(vm: AppViewModel) {
                 Spacer4()
                 Text(
                     if (tasks.isEmpty()) "还没有缓存任何内容"
-                    else "${tasks.count { it.status == DownloadStatus.Done }} / ${tasks.size} 完成 · 共 ${fmtBytes(vm.downloadSpace())}",
+                    else "${tasks.count { it.status == DownloadStatus.Done }} / ${tasks.size} 完成 · 共 ${fmtBytes(space)}",
                     color = T.TextFaint,
                     fontSize = Fs.xxs,
                 )

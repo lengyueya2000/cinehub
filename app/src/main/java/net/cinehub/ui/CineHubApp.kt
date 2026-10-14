@@ -113,10 +113,18 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
             is Route.Favorites -> Route.Sources
             is Route.History -> Route.Sources
             is Route.Player -> {
+                // stopPlaying() 会把 playing 清掉，所以「刚才是哪一部」要先拿到手。
+                val playedId = vm.playing.value?.mediaId
                 vm.stopPlaying()
                 val d = vm.detail.value
-                if (d != null) Route.Detail(vm.activeSourceId.value ?: d.media.sourceId, d.media.id)
-                else Route.Home
+                // 只有详情页上挂着的就是刚才播的那一部才回得去。从「继续观看」或
+                // 下载页直接起播时没人打开过详情页，那时回 Detail 等于把上一部的
+                // 页面当成这一部摆给用户看。
+                if (d != null && playedId != null && d.media.id == playedId) {
+                    Route.Detail(vm.activeSourceId.value ?: d.media.sourceId, d.media.id)
+                } else {
+                    Route.Home
+                }
             }
         }
     }

@@ -32,6 +32,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -74,6 +75,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val checking by vm.checking.collectAsState()
+    val unreadable by vm.sourcesUnreadable.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
 
@@ -171,10 +173,22 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     }
                     Spacer12()
                     Text(
-                        "长按拖动排序优先级 · 数字越小越优先",
+                        "点某一行的「上移」调整优先级 · 数字越小越优先",
                         color = T.TextDim,
                         fontSize = Fs.xxs,
                     )
+                    // 落盘那份读不通时不能装作一切正常：现在屏上这几条是内置源，
+                    // 用户自己加的那几条还在盘上的存档里，一次保存就会把显示中的这份写回去。
+                    if (unreadable) {
+                        Spacer8()
+                        Text(
+                            "注意：本机存的源列表这一版读不通（多半是刚换过格式）。现在显示的是内置源，" +
+                                "原来那份已另存了一份没动 —— 别急着改，先试升级到能读的版本。",
+                            color = T.Warn,
+                            fontSize = Fs.xxs,
+                            lineHeight = Fs.xxs * 1.6f,
+                        )
+                    }
                 }
             }
 
@@ -246,8 +260,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     onToggle = { vm.toggleSource(cfg.id, it) },
                     onDelete = { vm.deleteSource(cfg.id) },
                     onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
-                    onUp = {
-                        if (i > 0) {
+                    onUp = if (i == 0) null else {
+                        {
                             val ids = sources.map { it.id }.toMutableList()
                             val tmp = ids[i - 1]; ids[i - 1] = ids[i]; ids[i] = tmp
                             vm.reorder(ids)
@@ -298,7 +312,7 @@ private fun SourceRow(
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
     onOpenSite: () -> Unit,
-    onUp: () -> Unit,
+    onUp: (() -> Unit)?,
 ) {
     val h = report?.health ?: Health.Unknown
     val border = when (h) {
@@ -437,12 +451,22 @@ private fun SourceRow(
                         .padding(horizontal = 6.dp, vertical = 2.dp),
                 )
                 Spacer8()
-                Icon(
-                    Icons.Filled.Refresh, null,
-                    tint = T.TextFaint,
-                    modifier = Modifier.size(14.dp).clickable(onClick = onUp),
-                )
-                Spacer8()
+                // 上一档是「↑」而不是刷新图标 —— 图标是「重新检测」那一层已经在用的，
+                // 同一个符号在一行里表示两件事，用户按下去之前猜不出来。
+                // 第一行没有可上的位置，就不摆一个按了没反应的按钮。
+                if (onUp != null) {
+                    Text(
+                        "↑ 上移",
+                        color = T.TextDim,
+                        fontSize = Fs.tiny,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clip(R.sm)
+                            .border(1.dp, T.Border, R.sm)
+                            .clickable(onClick = onUp)
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                    Spacer8()
+                }
                 Icon(
                     Icons.Filled.Delete, null,
                     tint = T.TextFaint,
@@ -468,6 +492,14 @@ private fun AddSourceSheet(
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
     var busy by remember { mutableStateOf(false) }
+
+    // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
+    // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
+    // 「测试并保存」实际只测了第一次，而界面还写着「保存并启用」。
+    LaunchedEffect(name, url, kind, token, playPath) {
+        tested = null
+        result = null
+    }
 
     // 任何字段改动都让上一次的探测结果失效，否则会把旧配置存下来
     fun invalidate() {

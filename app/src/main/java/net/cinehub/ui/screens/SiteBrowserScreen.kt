@@ -1,6 +1,7 @@
 package net.cinehub.ui.screens
 
 import android.annotation.SuppressLint
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -78,12 +79,19 @@ fun SiteBrowserScreen(
     var title by remember { mutableStateOf(label) }
     var progress by remember { mutableIntStateOf(0) }
     /**
-     * 站点页面请求过的媒体地址，按出现顺序留着让用户自己挑。
+     * 站点页面请求过的媒体地址，留着让用户自己挑。
      *
      * 连它被请求时带的 Referer / Cookie 一起留着：不少解析页给的地址只认
      * 「就是我这页发出去的那次请求」，只把 URL 交给播放器会拿到 404（实测西瓜影院就是这样）。
+     *
+     * 这里只保留最近接住的 [MaxCapturedLinks] 条，超出丢最老的。理由：一个长页面加载时
+     * 往往先抖出一串预览 / 广告 / 埋点地址，用户真正要看的那条常常是第 4 条以后 ——
+     * 无界留着既白白涨内存、又在界面最关键的「挑一条」这一步骗人。丢就丢最老的那头，
+     * 因为用户此刻更需要看到最新接到的那条（那多半就是他刚点播放的这一集），旧的预览早该让位。
      */
     var links by remember { mutableStateOf<List<Captured>>(emptyList()) }
+    // 累计接住过多少条 —— 列表被截到 20 条后，界面仍要如实说「一共接到过多少」
+    var totalSeen by remember { mutableIntStateOf(0) }
     val queue = remember { ConcurrentLinkedQueue<Captured>() }
     var web by remember { mutableStateOf<WebView?>(null) }
     // 从「站点」入口进来只是为了登录，此时没有正在放的片子，接住的地址无处可交
@@ -93,20 +101,38 @@ fun SiteBrowserScreen(
 
     // shouldInterceptRequest 在 WebView 自己的线程上回调，跨到主线程只能靠轮询这份队列
     LaunchedEffect(queue) {
+        var seq = 0
         while (true) {
             val drained = generateSequence { queue.poll() }.toList()
             if (drained.isNotEmpty()) {
-                links = (links + drained).distinctBy { it.url }
+                // 按到达顺序盖序号，越新越大 —— 界面靠它认「最新接到的那条」
+                val stamped = drained.map { it.copy(seq = seq++) }
+                totalSeen += stamped.size
+                links = (links + stamped).distinctBy { it.url }.takeLast(MaxCapturedLinks)
             }
             delay(400)
         }
     }
 
-    DisposableEffect(Unit) {
+    // 收尾挂在生命周期上而不是按钮上：系统返回键退出这一页时也必须走到
+    DisposableEffect(web) {
+        val wv = web
         onDispose {
-            // 登录态就存在本机 WebView 的 cookie 里，退出时落盘，下次进这个源不用再登一遍
+            if (wv != null) {
+                // 停loading只停了页面自己的加载，页面里那个正在播的 <video> 会继续出声继续耗流量 ——
+                // 先让页面自己把媒体停了，再 onPause 摁住后台播放/定时，stopLoading 掐掉还在跑的请求
+                runCatching { wv.evaluateJavascript(PauseMediaJs, null) }
+                runCatching { wv.onPause() }
+                runCatching { wv.stopLoading() }
+                // 必须先从父布局摘出来再 destroy，否则 WebView 被父 view 引用着，销毁不掉、还泄漏
+                runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
+                runCatching { wv.destroy() }
+            }
+            // 会话要落盘，不能清。这一页有两个用处：接住直链，以及从「播放源管理 → 站点」
+            // 进来登用户自己的账号 —— README 写的边界就是「凭证只留在本机 WebView 的 cookie 里」。
+            // 清掉等于每次进来都得重登一遍；而 removeAllCookies 清的还是整个 App 的 cookie 域，
+            // 会把用户在别的源刚登好的会话一起抹了。
             runCatching { CookieManager.getInstance().flush() }
-            web?.stopLoading()
         }
     }
 
@@ -139,7 +165,7 @@ fun SiteBrowserScreen(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    "站点页面 · 登录与解析都在对方自己的页面里完成",
+                    "站点页面 · 登录与解析都在对方自己的页面里完成 · 关闭会停掉页面里正在播的",
                     color = T.TextFaint,
                     fontSize = Fs.tiny,
                 )
@@ -194,19 +220,26 @@ fun SiteBrowserScreen(
         )
 
         if (links.isNotEmpty()) {
+            // 挑「最可能有用」的几条，不是插入顺序的前几条：最新接到的排最前，其余按像不像正片排。
+            val ordered = pickUsefulFirst(links)
+            val shown = ordered.take(LinksShown)
             Column(
                 Modifier.fillMaxWidth().background(T.Surface)
                     .padding(horizontal = Sp.s4, vertical = Sp.s3),
                 verticalArrangement = Arrangement.spacedBy(Sp.s2),
             ) {
                 Text(
-                    if (playing == null) "站点给了 ${links.size} 个地址 —— 先在影枢里点播一部影片，再回来挑一个"
-                    else "站点给了 ${links.size} 个地址 —— 挑一个交给影枢播放",
+                    when {
+                        playing == null ->
+                            "接到 $totalSeen 个地址，保留最近 ${links.size} 条 —— 先在影枢里点播一部影片，再回来挑一个"
+                        else ->
+                            "接到 $totalSeen 个地址，保留最近 ${links.size} 条 —— 挑一个交给影枢播放"
+                    },
                     color = T.Text,
                     fontSize = Fs.xs,
                     fontWeight = FontWeight.SemiBold,
                 )
-                links.take(3).forEach { c ->
+                shown.forEach { c ->
                     val canHandOff = playing != null
                     Row(
                         Modifier.fillMaxWidth().clip(R.sm).background(T.Surface2)
@@ -241,13 +274,74 @@ fun SiteBrowserScreen(
                         )
                     }
                 }
+                // 说清看到的是全部还是截断后的几条，别让人以为只有这几条
+                if (shown.size < links.size) {
+                    Text(
+                        "以上按「最新接到 / 最像正片」列出 ${shown.size} 条，" +
+                            "还有 ${links.size - shown.size} 条没列出（最多只留最近 $MaxCapturedLinks 条）。",
+                        color = T.TextFaint,
+                        fontSize = Fs.tiny,
+                    )
+                }
             }
         }
     }
 }
 
-/** 接住的一条地址，连同它被请求时携带的条件。 */
-private data class Captured(val url: String, val headers: Map<String, String>)
+/**
+ * 接住的一条地址，连同它被请求时携带的条件。
+ *
+ * [seq] 是接住时的到达序号，越新越大 —— 只用来在界面上认「最新接到的那条」。
+ */
+private data class Captured(val url: String, val headers: Map<String, String>, val seq: Int = 0)
+
+// 列表只留最近这么多条：再多就是页面加载抖出来的噪声，涨内存还骗界面
+private const val MaxCapturedLinks = 20
+
+// 界面一次列几条 —— 多了划不到、少了怕漏掉真正那条，4 条够挑
+private const val LinksShown = 4
+
+// 让页面自己把在放的媒体停了：影枢不能替站点「拆」它的播放器，
+// 但用户要走了，暂停它自己正在出声的 video/audio 是本分
+private const val PauseMediaJs =
+    "document.querySelectorAll('video,audio').forEach(function(e){try{e.pause();}catch(x){}});"
+
+/**
+ * 明显是预览 / 广告 / 埋点的地址特征 —— 只用来把这类压到最后，
+ * 绝不拿它去猜地址或伪造来源。命中的都是 URL 里写得很直白的标记词。
+ */
+private val JunkMarkers = listOf("preview", "trailer", "advert", "advertisement", "banner", "beacon", "splash")
+
+/**
+ * 这条地址有多像「正片」，分越高越该靠前。
+ *
+ * 判断只取自 URL —— 在 shouldInterceptRequest 这一层只有请求本身，拿不到响应的
+ * content-type 和体积，所以不假装知道，只按扩展名和明显的预览标记粗排：
+ * 整集的清单（.m3u8 / .mpd）最像正片，完整文件次之，单切片（.ts 等）多半不是要挑的那条。
+ */
+private fun looksLikeMainFeature(url: String): Int {
+    val path = url.substringBefore('?').lowercase()
+    if (JunkMarkers.any { path.contains(it) }) return 0
+    return when {
+        path.endsWith(".m3u8") || path.endsWith(".mpd") -> 3
+        path.endsWith(".mp4") || path.endsWith(".mkv") || path.endsWith(".mov") -> 2
+        else -> 1
+    }
+}
+
+/**
+ * 界面显示顺序：最新接到的那条排最前（用户刚点的多半就是它），
+ * 其余按「有多像正片」降序，分数相同再看谁更新。
+ */
+private fun pickUsefulFirst(links: List<Captured>): List<Captured> {
+    if (links.isEmpty()) return emptyList()
+    val newest = links.maxOf { it.seq }
+    return links.sortedWith(
+        compareByDescending<Captured> { it.seq == newest }
+            .thenByDescending { looksLikeMainFeature(it.url) }
+            .thenByDescending { it.seq }
+    )
+}
 
 /**
  * 把这次请求自带的 Referer / Cookie 一起留下。

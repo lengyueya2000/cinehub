@@ -23,7 +23,6 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -41,7 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -55,6 +54,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import net.cinehub.data.model.HistoryEntry
+import net.cinehub.data.model.Media
+import net.cinehub.data.model.SourceConfig
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.PosterCard
@@ -69,8 +70,6 @@ import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
 
-private val CATEGORIES = listOf("推荐", "电影", "剧集", "动漫", "综艺", "短剧")
-
 @Composable
 fun HomeScreen(
     vm: AppViewModel,
@@ -84,11 +83,21 @@ fun HomeScreen(
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val history by vm.watchHistory.collectAsState()
-    var cat by remember { mutableIntStateOf(0) }
+    // 选中的类型是本页的临时状态：退出首页就消失，不写进 ViewModel、不落盘。
+    // 键在 home 上 —— 换了一页内容就是另一批条目，旧筛选不该继续作用在它上面。
+    var cat by remember(home) { mutableStateOf<String?>(null) }
 
     val hero = home.firstOrNull()
+    // 下面的列表从第二条起列（hero 已经是这一页的第一条），否则同一部片会在屏幕上出现两次。
     val rest = home.drop(1)
     val enabledSources = sources.count { it.enabled }
+
+    // 芯片只列这一页里真出现过的类型（写死一串名字就会造出点了没反应的假芯片）。
+    // 一个可信的类型都取不到时整排不渲染，而不是留一排骗人的按钮。
+    val chips = remember(rest) { categoryChips(rest) }
+    // 不给类型的条目在选中某类型时被排除 —— 这是筛选的定义，不是列表坏了，
+    // 所以筛空了要专门说一句，并留一个清掉筛选的动作。
+    val shown = if (cat == null) rest else rest.filter { it.category?.trim() == cat }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -205,25 +214,22 @@ fun HomeScreen(
             }
         }
 
-        item {
-            LazyRow(
-                Modifier.padding(top = Sp.s4),
-                contentPadding = PaddingValues(horizontal = Sp.s4),
-                horizontalArrangement = Arrangement.spacedBy(Sp.s2),
-            ) {
-                items(CATEGORIES.size) { i ->
-                    val on = i == cat
-                    Text(
-                        CATEGORIES[i],
-                        color = if (on) Color.White else T.TextDim,
-                        fontSize = Fs.sm,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier
-                            .clip(R.full)
-                            .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
-                            .clickable { cat = i }
-                            .padding(horizontal = 14.dp, vertical = 7.dp),
-                    )
+        if (chips.isNotEmpty()) {
+            item {
+                LazyRow(
+                    Modifier.padding(top = Sp.s4),
+                    contentPadding = PaddingValues(horizontal = Sp.s4),
+                    horizontalArrangement = Arrangement.spacedBy(Sp.s2),
+                ) {
+                    item {
+                        CatChip("全部", on = cat == null) { cat = null }
+                    }
+                    items(chips) { (name, count) ->
+                        // 再点一次已选中的芯片等于取消，回到不过滤的原样
+                        CatChip("$name $count", on = cat == name) {
+                            cat = if (cat == name) null else name
+                        }
+                    }
                 }
             }
         }
@@ -231,60 +237,125 @@ fun HomeScreen(
         if (rest.isNotEmpty()) {
             item {
                 SectionHead(
-                    "热播榜",
-                    trailing = "全部",
+                    homeSectionTitle(rest, sources),
+                    trailing = if (cat != null) "清除筛选" else null,
+                    onTrailing = if (cat != null) ({ cat = null }) else null,
                     modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s4),
                 )
             }
-            item {
-                LazyRow(
-                    contentPadding = PaddingValues(horizontal = Sp.s4),
-                    horizontalArrangement = Arrangement.spacedBy(11.dp),
-                ) {
-                    itemsIndexed(rest.take(12)) { i, m ->
-                        PosterCard(
-                            title = m.title,
-                            subtitle = m.remark ?: m.category,
-                            cover = m.cover,
-                            rank = if (i < 9) i + 1 else null,
-                            badge = qualityTag(m.remark, m.title),
-                            modifier = Modifier.width(112.dp),
-                            onClick = { onOpenDetail(m.sourceId, m.id) },
+
+            if (shown.isEmpty()) {
+                // 芯片是从这份列表里现取的，正常筛不空；真筛空了只可能是内容刚被换掉。
+                // 这时候要说的是「这个条件下没有」而不是「没有内容」，并给一个能点的退出口。
+                item {
+                    Column(Modifier.padding(horizontal = Sp.s4)) {
+                        Text("「$cat」在这一页里没有内容", color = T.TextDim, fontSize = Fs.sm)
+                        Spacer4()
+                        Text(
+                            "有些播放源不给条目返回类型信息，这类内容会被类型筛选排除掉。",
+                            color = T.TextFaint,
+                            fontSize = Fs.xs,
+                        )
+                        Spacer8()
+                        Text(
+                            "清除筛选",
+                            color = T.Play400,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable { cat = null },
                         )
                     }
                 }
             }
-        }
 
-        if (rest.size > 6) {
-            item {
-                SectionHead(
-                    "最近更新",
-                    modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s4),
-                )
-            }
-            item {
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(3),
-                    modifier = Modifier.fillMaxWidth().height(gridHeight(rest.size - 6)),
-                    contentPadding = PaddingValues(horizontal = Sp.s4),
-                    horizontalArrangement = Arrangement.spacedBy(11.dp),
-                    verticalArrangement = Arrangement.spacedBy(Sp.s4),
-                    userScrollEnabled = false,
-                ) {
-                    items(rest.drop(6)) { m ->
-                        PosterCard(
-                            title = m.title,
-                            subtitle = m.remark ?: m.category,
-                            cover = m.cover,
-                            badge = qualityTag(m.remark, m.title),
-                            onClick = { onOpenDetail(m.sourceId, m.id) },
-                        )
+            if (shown.isNotEmpty()) {
+                item {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = Sp.s4),
+                        horizontalArrangement = Arrangement.spacedBy(11.dp),
+                    ) {
+                        items(shown.take(12)) { m ->
+                            PosterCard(
+                                title = m.title,
+                                subtitle = m.remark ?: m.category,
+                                cover = m.cover,
+                                badge = qualityTag(m.remark, m.title),
+                                modifier = Modifier.width(112.dp),
+                                onClick = { onOpenDetail(m.sourceId, m.id) },
+                            )
+                        }
+                    }
+                }
+                // 这一页比 12 条长，剩下的换成网格接着列 —— 和上面那排是同一条列表的前后段，
+                // 不重叠，所以不再另起一个「最近更新」标题（那两句都说的是同一批内容）。
+                if (shown.size > 12) {
+                    item {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxWidth().height(gridHeight(shown.size - 12))
+                                .padding(top = Sp.s4),
+                            contentPadding = PaddingValues(horizontal = Sp.s4),
+                            horizontalArrangement = Arrangement.spacedBy(11.dp),
+                            verticalArrangement = Arrangement.spacedBy(Sp.s4),
+                            userScrollEnabled = false,
+                        ) {
+                            items(shown.drop(12)) { m ->
+                                PosterCard(
+                                    title = m.title,
+                                    subtitle = m.remark ?: m.category,
+                                    cover = m.cover,
+                                    badge = qualityTag(m.remark, m.title),
+                                    onClick = { onOpenDetail(m.sourceId, m.id) },
+                                )
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+/**
+ * 首页列表的栏目标题：只说这份数据撑得起的话。
+ *
+ * 仓库给的 home() 是「第一个能取到内容的源」返回的那一页，顺序就是源自己列的顺序 ——
+ * 既没有热度也没有更新时间，所以「热播榜」「最近更新」两个标题都在承诺没做过的排序。
+ * 这里只陈述真是如此的事：这些条目出自哪个源的这一页。
+ */
+private fun homeSectionTitle(items: List<Media>, sources: List<SourceConfig>): String {
+    val ids = items.map { it.sourceId }.distinct()
+    // 万一将来首页改成多源拼接，这句「均来自」就不成立了，退回一句不会错的话
+    val name = if (ids.size == 1) sources.firstOrNull { it.id == ids.first() }?.name else null
+    return if (name != null) "均来自「$name」· 这一页" else "这一页给的"
+}
+
+/**
+ * 从这一页里现取可信的类型芯片（类型名 + 命中条数）。
+ *
+ * 芯片写的必须是数据里真有的东西：点了就能改列表，数量也一并标出来，
+ * 免得「点了以后什么都不剩」被当成坏了。
+ */
+private fun categoryChips(items: List<Media>): List<Pair<String, Int>> =
+    items.mapNotNull { it.category?.trim()?.takeIf { c -> c.isNotEmpty() } }
+        .groupingBy { it }.eachCount()
+        .entries.sortedByDescending { it.value }
+        .map { it.key to it.value }
+
+/** 类型芯片。选中态靠底色 + 文字双重表达，不单靠颜色。 */
+@Composable
+private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
+    Text(
+        label,
+        color = if (on) Color.White else T.TextDim,
+        fontSize = Fs.sm,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier
+            .clip(R.full)
+            .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+    )
 }
 
 private fun gridHeight(n: Int): androidx.compose.ui.unit.Dp {

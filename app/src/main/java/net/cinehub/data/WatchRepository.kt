@@ -6,6 +6,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +46,7 @@ class WatchRepository(private val context: Context) {
     val history: StateFlow<List<HistoryEntry>> = _history.asStateFlow()
 
     private var lastSaveAt = 0L
+    private var pendingSave: Job? = null
 
     init {
         scope.launch { load() }
@@ -106,11 +109,23 @@ class WatchRepository(private val context: Context) {
         snapshot()
     }
 
-    /** 位置上报走这条：1.5 秒内的连续写入合并成一次。 */
+    /**
+     * 位置上报走这条：1.5 秒内的连续写入合并成一次。
+     *
+     * 合并不能靠「丢掉后面那次」—— 退出播放时补写的那一笔正好落在窗口里，
+     * 丢掉就等于用户下次进来从十几秒前开始。所以窗口内的写改成延后补一次。
+     */
     private fun saveSoon() {
-        val now = System.currentTimeMillis()
-        if (now - lastSaveAt < 1_500L) return
-        save()
+        val wait = 1_500L - (System.currentTimeMillis() - lastSaveAt)
+        if (wait <= 0L) {
+            save()
+            return
+        }
+        pendingSave?.cancel()
+        pendingSave = scope.launch {
+            delay(wait)
+            save()
+        }
     }
 
     private fun snapshot() {
@@ -128,8 +143,13 @@ class WatchRepository(private val context: Context) {
 
     private suspend fun load() {
         val p = context.watchStore.data.first()
-        _favorites.value = p[KEY_FAV].decode<Favorite>()
-        _history.value = p[KEY_HIS].decode<HistoryEntry>().sortedByDescending { it.updatedAt }
+        // 同上：读盘这段时间里用户点的收藏、播的那一集，不能被整份覆盖掉。
+        _favorites.value =
+            (_favorites.value + p[KEY_FAV].decode<Favorite>()).distinctBy { it.key }
+        _history.value = (_history.value + p[KEY_HIS].decode<HistoryEntry>())
+            .distinctBy { it.key }
+            .sortedByDescending { it.updatedAt }
+            .take(MAX_HISTORY)
     }
 
     private inline fun <reified T> String?.decode(): List<T> =

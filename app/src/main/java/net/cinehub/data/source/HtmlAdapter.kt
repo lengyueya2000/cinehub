@@ -67,6 +67,10 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
             id = id,
             title = title.trim(),
             cover = cover,
+            // 详情页能不能给出年份看站点。缺年份会让同一部片在收藏/观看记录里分裂成两条
+            // （卡片那条键带 |2026、详情这条不带），所以取到就带上，取不到由上层从卡片补。
+            year = doc.selectFirst("[class*=year],.video-year,.tag-text")?.text()
+                ?.let { YEAR.find(it)?.value } ?: YEAR.find(title)?.value,
             intro = intro?.trim(),
             sourceId = config.id,
         )

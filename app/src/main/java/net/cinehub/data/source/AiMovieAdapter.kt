@@ -13,6 +13,8 @@ import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.StreamUrls
 import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.net.Http
+import net.cinehub.data.quietly
+import net.cinehub.data.shortReason
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -102,7 +104,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
     /** 建匿名会话：站点自己的未登录访客流程，影枢不代为登录任何人的账号。 */
     private suspend fun ensureSession() {
         if (sessionCookie != null) return
-        runCatching {
+        quietly {
             val headers = AiMovieSign.headers("POST", ANON_PATH).toMutableMap()
             headers["Content-Type"] = "application/json"
             Http.post(
@@ -112,6 +114,8 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
                 timeoutSec = 15,
             ).setCookie?.takeIf { it.isNotBlank() }?.let { sessionCookie = it }
         }
+        // 建不成会话不在这儿报错：后面的 api() 会撞上同一个原因，那时报一次就够了，
+        // 而且报的是用户真正做的那一步（搜索/取线路），不是后台的准备工作。
     }
 
     override suspend fun browse(page: Int): List<Media> {
@@ -176,12 +180,12 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 这样额度只在用户真的点开某一集时花，而不是开一次详情页就把整部剧刷一遍。
      */
     private fun mark(variant: String, episodeToken: String?): String =
-        "$MARK$variant|$episodeToken"
+        "$MARK$variant|${episodeToken ?: ""}"
 
     /** 分集列表：`/v1/catalog/{variant}/episodes`。这一条不花额度。 */
     private suspend fun episodeIdsOf(variant: String): List<Triple<Int, String, String>> {
         val enc = java.net.URLEncoder.encode(variant, "UTF-8")
-        val root = runCatching {
+        val root = quietly {
             json.parseToJsonElement(api("/v1/catalog/$enc/episodes")).jsonObjectOrNull()
         }.getOrNull() ?: return emptyList()
         return root["episodes"]?.jsonArrayOrNull()?.mapIndexedNotNull { i, el ->
@@ -194,7 +198,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
     /** 按 variant id 取目录卡片（标题 / 封面 / 演职员）。这一条也不花额度。 */
     private suspend fun cardOf(variant: String): JsonObject? {
         val enc = java.net.URLEncoder.encode(variant, "UTF-8")
-        return runCatching {
+        return quietly {
             json.parseToJsonElement(api("/v1/catalog/$enc")).jsonObjectOrNull()
         }.getOrNull()
     }
@@ -212,12 +216,10 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
             ensureSession()
             val rest = episodeUrl.removePrefix(MARK)
             val variant = rest.substringBefore('|')
-            val token = rest.substringAfter('|').takeIf { it.isNotBlank() }
-            val line = bestLine(variant, token)
-                ?: return StreamResolution.Failed(
-                    "这一集没有取到可直接播放的线路（站点只给了需要二次解析的地址）"
-                )
-            return StreamResolution.Ready(line)
+            // `!= "null"` 是给老任务兜底的：以前 mark() 把 null 直接拼进了坐标，
+            // 那样存下来的下载任务解一次字符串就是字面量 "null"，会去请求 ?episode=null。
+            val token = rest.substringAfter('|').takeIf { it.isNotBlank() && it != "null" }
+            return StreamResolution.Ready(bestLine(variant, token))
         }
         if (episodeUrl.startsWith("resolve://")) return StreamResolution.NeedsClientScript
         if (StreamUrls.isMediaUrl(episodeUrl)) return StreamResolution.Ready(episodeUrl)
@@ -232,25 +234,48 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 站点给的是一堆同质备份（新浪资源 / 红牛资源 / …），用户在界面上分不出好坏，
      * 所以按站点自己的标记挑：已解析过的优先、其次按它的偏好权重。
      * 只留 `url_kind == m3u8` 且本身就是 http 直链的条目 —— `resolve://` 票证不碰。
+     *
+     * 拿不到就抛，而且要说清是哪一种拿不到：接口没答话、答的样子不认识、
+     * 和这一集真的只给了需要二次解析的地址，是三件不同的事。
+     * 以前统一写成最后一种，用户对着「站点只给了需要二次解析的地址」根本没法判断，
+     * 而真相可能是匿名额度用完了。
      */
-    private suspend fun bestLine(variant: String, episodeToken: String?): String? {
+    private suspend fun bestLine(variant: String, episodeToken: String?): String {
         val enc = java.net.URLEncoder.encode(variant, "UTF-8")
         val path = if (episodeToken == null) "/v1/playback/entry/$enc"
         else "/v1/playback/entry/$enc?episode=" + java.net.URLEncoder.encode(episodeToken, "UTF-8")
-        val root = runCatching { json.parseToJsonElement(api(path)).jsonObjectOrNull() }.getOrNull()
-            ?: return null
+        val body = quietly { api(path) }
+            .fold(
+                onSuccess = { it },
+                onFailure = { e ->
+                    error(
+                        "向站点问这一集的线路时没问出来：${e.shortReason()}" +
+                            "（懂片帝AI 的匿名额度按天算，用完了也会这样）"
+                    )
+                },
+            )
+        val root = quietly { json.parseToJsonElement(body).jsonObjectOrNull() }.getOrNull()
+            ?: error("站点这次的回答不是预期那份 JSON（可能改版了）")
 
-        val candidates = root["line_options"]?.jsonArrayOrNull()?.mapNotNull { el ->
+        val lines = root["line_options"]?.jsonArrayOrNull()
+            ?: error("站点没给出这一集的线路列表（返回里少了 line_options）")
+        val candidates = lines.mapNotNull { el ->
             val line = el.jsonObjectOrNull() ?: return@mapNotNull null
             val url = line.str("url") ?: return@mapNotNull null
             if (line.str("url_kind") != "m3u8" || !url.startsWith("http")) return@mapNotNull null
             val resolved = line["resolved"]?.primitiveOrNull()?.content == "true"
             val weight = line["preference_weight"]?.primitiveOrNull()?.content?.toLongOrNull() ?: 0L
             Triple(url, resolved, weight)
-        }?.sortedWith(
+        }.sortedWith(
             compareByDescending<Triple<String, Boolean, Long>> { it.second }
                 .thenByDescending { it.third }
-        ) ?: return null
+        )
+        if (candidates.isEmpty()) {
+            error(
+                "这一集站点只给了需要二次解析的地址（resolve:// 那一类），影枢不触发对方的解析。" +
+                    "换一条线路或换一个源。"
+            )
+        }
 
         // 站点把一堆同质备份都标成 resolved，但其中相当一部分已经 404 了 ——
         // 按它的标记挑一条就交给播放器，用户看到的就是「播放失败：Source error」。
@@ -259,11 +284,11 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
             if (looksPlayable(url)) return url
         }
         // 全都探不动时退回站点的首选 —— 至少失败原因是它自己的，不是影枢挑的
-        return candidates.firstOrNull()?.first
+        return candidates.first().first
     }
 
     /** 探一下这个地址现在是否真的给得出 m3u8 正文。 */
-    private suspend fun looksPlayable(url: String): Boolean = runCatching {
+    private suspend fun looksPlayable(url: String): Boolean = quietly {
         val body = Http.getWithHeaders(url, headers = emptyMap(), timeoutSec = 10).body
         body.startsWith("#EXTM3U") || body.contains("#EXT-X-STREAM-INF")
     }.getOrDefault(false)

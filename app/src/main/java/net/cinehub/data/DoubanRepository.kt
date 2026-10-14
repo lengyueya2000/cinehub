@@ -110,6 +110,7 @@ class DoubanRepository(private val context: Context) {
             id = id, title = title,
             url = str("url") ?: subjectUrl(id),
             cover = str("cover"), rate = str("rate"),
+            year = str("year"),
         )
     }
 
@@ -122,6 +123,7 @@ class DoubanRepository(private val context: Context) {
             cover = str("cover_url"),
             rate = str("score") ?: this["rating"]?.jsonArray?.firstOrNull()?.jsonPrimitive?.contentOrNull,
             kinds = list("types"), regions = list("regions"),
+            year = str("year"),
             rank = runCatching { this["rank"]!!.jsonPrimitive.long.toInt() }.getOrDefault(0),
         )
     }

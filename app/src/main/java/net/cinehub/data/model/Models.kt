@@ -92,3 +92,18 @@ data class SourceAvailability(
     val latencyMs: Long? = null,
     val note: String? = null,
 )
+
+/**
+ * 一次跨源搜索的成果：归并好的条目，加上**没查动的源和它的原因**。
+ *
+ * 只返回 List 的话，「所有源都超时了」和「搜到了但一片都没有」在界面上长一样，
+ * 用户只能猜。失败原因留到界面这一层才说得出「少了哪几个源」。
+ */
+data class SearchOutcome(
+    val items: List<AggregatedMedia>,
+    val failures: List<Failure> = emptyList(),
+) {
+    data class Failure(val sourceName: String, val reason: String)
+
+    val isEmpty: Boolean get() = items.isEmpty()
+}
