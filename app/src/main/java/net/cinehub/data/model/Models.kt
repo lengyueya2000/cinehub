@@ -57,8 +57,13 @@ fun titleFingerprint(s: String): String =
         "第${cnNumber(m.groupValues[1]) ?: m.groupValues[1]}${m.groupValues[2]}"
     }
 
-/** 去掉「第几季/第几部」尾巴的片名 —— 拿去当兜底搜索词用（见 [titleSearchVariants]）。 */
-fun withoutSeason(s: String): String = SEASON_CN.replace(normalizeTitle(s), "")
+/**
+ * 去掉「第几季/第几部」尾巴，其余原样留着 —— 只当兜底搜索词用（见 [titleSearchVariants]）。
+ *
+ * 刻意不顺手去标点：这些站点的 LIKE 恰恰匹配不了被削过标点的写法（见 siblingsOf 的说明），
+ * 一并去掉只会多发一趟注定落空的查询。
+ */
+fun withoutSeason(s: String): String = SEASON_CN.replace(s, "")
 
 /**
  * 拿一个片名去源里搜时该依次试的几种写法：原样 → 去掉空白 → 去掉季号。
@@ -68,6 +73,7 @@ fun withoutSeason(s: String): String = SEASON_CN.replace(normalizeTitle(s), "")
  * 认领哪一条交给 [titleFingerprint] —— 放宽检索词不等于放宽判定，不会把第二季认成第五季。
  *
  * 每档都是全源扇出，所以调用方应当**试到命中就停**，别三档都发。
+ * 标题既没空格也没季号时，这里就只剩「原样」一档。
  */
 fun titleSearchVariants(title: String): List<String> {
     val flat = title.filterNot { it.isWhitespace() }

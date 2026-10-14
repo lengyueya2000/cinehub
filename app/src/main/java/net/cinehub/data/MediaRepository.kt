@@ -237,16 +237,14 @@ class MediaRepository(private val sources: SourceRepository) {
     }
 
     /**
-     * 在一个源里找这部片，按「原样 → 去掉空白 → 去掉第几季尾巴」依次试，试到对上为止。
-     *
-     * 两趟都有据：
+     * 三档都有据：
      * - 空格 —— 豆瓣写「绝望写手 第五季」、源里存的是连写的那串，LIKE 匹配认不得空格；
      *   只发原样那次，源会被判成「没这部片」。
      * - 季号写法 —— 懂片帝写「第5季」、4kku 写「第五季」，从任一种写法出发去 LIKE 另一个
      *   都落空，而「绝望写手」这一截两边都在。比对口径由 [titleFingerprint] 兜住，
      *   所以放宽检索词不会把第二季认成第五季。
      *
-     * 标题既没空格也没季号时只会跑一趟；只有真的没找到才继续试。
+     * 标题既没空格也没季号时只剩第一档；只有真的没找到才继续往下试。
      */
     private suspend fun findInSource(
         cfg: SourceConfig,
@@ -254,10 +252,11 @@ class MediaRepository(private val sources: SourceRepository) {
         want: String,
         year: String?,
     ): Pair<List<Media>, Throwable?> {
-        val adapter = SourceAdapters.create(cfg)
         var lastErr: Throwable? = null
         for (q in titleSearchVariants(title)) {
-            val r = quietly { adapter.search(q, 1) }
+            // create() 也放在 quietly 里：这趟跑在 viewModelScope 上，外面没有 catch，
+            // 一个源构造不出来不该把整张详情页带走
+            val r = quietly { SourceAdapters.create(cfg).search(q, 1) }
             val hits = r.getOrNull().orEmpty().filter { sameWork(it, want, year) }
             if (hits.isNotEmpty()) return hits to null
             lastErr = r.exceptionOrNull()

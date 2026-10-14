@@ -1093,9 +1093,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val want = titleFingerprint(item.title)
                 var cands = emptyList<AggregatedMedia>()
+                var silent = emptyList<String>()
                 // 原样那次命中就不要再发第二次：多一趟是全源扇出，不该白付
                 for (form in titleSearchVariants(item.title)) {
-                    cands = mediaRepo.search(form).items.filter { titleFingerprint(it.media.title) == want }
+                    val outcome = mediaRepo.search(form)
+                    cands = outcome.items.filter { titleFingerprint(it.media.title) == want }
+                    silent = outcome.failures.map { it.sourceName }
                     if (cands.isNotEmpty()) break
                 }
                 // 同名不同片是常事（翻拍、续集、同名综艺）。豆瓣给了年份就按年份挑；
@@ -1109,7 +1112,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val why = when {
                     match != null -> null
-                    cands.isEmpty() -> "接的源里搜不到同名的片子"
+                    // 「都没连上」和「连上了但没这部片」是两回事，不能都写成「搜不到」
+                    cands.isEmpty() && silent.isEmpty() -> "接的源里搜不到同名的片子"
+                    cands.isEmpty() -> "接的源里搜不到同名的片子（${silent.joinToString("、")} 这一趟没答上话）"
                     else -> "同名的有 ${cands.size} 部，对不上豆瓣标的 $year 年那部 —— 认不准就不硬指"
                 }
                 if (match == null) onMiss(item, why!!) else onHit(match.media)
