@@ -268,8 +268,11 @@ fun DetailScreen(
                         Spacer8()
                     }
                     if (lines.size > 1) {
+                        // 这一格是「换下一条」，所以把当前这条的名字也写出来 ——
+                        // 懂片帝AI 能给到二十几条，只报「线路 3/28」等于让用户盲切；
+                        // 要一次跳到指定那条，去播放器里的「线路」面板（那里是滚动列表）
                         Text(
-                            "线路 ${lineIdx + 1}/${lines.size}",
+                            "线路 ${(line?.name ?: "").take(10)} ${lineIdx + 1}/${lines.size} ›",
                             color = T.Src500,
                             fontSize = Fs.xs,
                             fontWeight = FontWeight.SemiBold,

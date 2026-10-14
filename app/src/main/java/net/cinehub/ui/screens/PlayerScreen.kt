@@ -27,7 +27,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
@@ -795,7 +797,9 @@ fun PlayerScreen(
                                 Chip("倍速 ${fmtSpeed(speed)}") { panel = Panel.Speed }
                                 Spacer8()
                                 if (lines.size > 1) {
-                                    Chip("线路 ${safeLine + 1}") { panel = Panel.Line }
+                                    // 条数一并写出来：懂片帝AI 那种源有十几条，只报「线路 2」
+                                    // 用户不知道后面还有得挑
+                                    Chip("线路 ${safeLine + 1}/${lines.size}") { panel = Panel.Line }
                                     Spacer8()
                                 }
                                 if (videoHeights.isNotEmpty()) {
@@ -960,26 +964,31 @@ fun PlayerScreen(
                         Panel.Line -> {
                             Text("线路", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
                             Spacer8()
-                            lines.forEachIndexed { i, l ->
-                                Text(
-                                    l.name.take(18),
-                                    color = if (i == safeLine) T.Play400 else T.Text,
-                                    fontSize = Fs.sm,
-                                    modifier = Modifier.fillMaxWidth()
-                                        .clip(R.sm)
-                                        .background(
-                                            if (i == safeLine) T.Play500.copy(alpha = .16f) else Color.Transparent
-                                        )
-                                        .clickable {
-                                            // 换线路 = 换一套地址，集数按 index 对齐
-                                            val cur = playing?.episodeIndex ?: 1
-                                            lines.getOrNull(i)?.episodes?.firstOrNull { it.index == cur }
-                                                ?.let { playEpisode(it) }
-                                            lineIndex = i
-                                            panel = null
-                                        }
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                )
+                            // 懂片帝AI 那种源一次能给出十几条线路，一屏摆不下 —— 滚动列，别把它们裁掉
+                            Column(
+                                Modifier.weight(1f).verticalScroll(rememberScrollState()),
+                            ) {
+                                lines.forEachIndexed { i, l ->
+                                    Text(
+                                        l.name.take(18),
+                                        color = if (i == safeLine) T.Play400 else T.Text,
+                                        fontSize = Fs.sm,
+                                        modifier = Modifier.fillMaxWidth()
+                                            .clip(R.sm)
+                                            .background(
+                                                if (i == safeLine) T.Play500.copy(alpha = .16f) else Color.Transparent
+                                            )
+                                            .clickable {
+                                                // 换线路 = 换一套地址，集数按 index 对齐
+                                                val cur = playing?.episodeIndex ?: 1
+                                                lines.getOrNull(i)?.episodes?.firstOrNull { it.index == cur }
+                                                    ?.let { playEpisode(it) }
+                                                lineIndex = i
+                                                panel = null
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    )
+                                }
                             }
                         }
 
