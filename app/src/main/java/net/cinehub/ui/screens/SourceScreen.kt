@@ -385,11 +385,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 
         if (showAdd) {
             AddSourceSheet(
-                candidates = net.cinehub.data.Seed.candidates,
                 onDismiss = { showAdd = false },
-                onTest = { name, url, kind, token, playPath, html, cb ->
-                    vm.testSource(name, url, kind, token, playPath, html, cb)
-                },
+                onTest = { name, url, kind, token, playPath, cb -> vm.testSource(name, url, kind, token, playPath, cb) },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
                     showAdd = false
@@ -605,9 +602,8 @@ private fun SourceRow(
 /** 添加播放源：底部弹层，带实时连通性反馈。 */
 @Composable
 private fun AddSourceSheet(
-    candidates: List<SourceConfig>,
     onDismiss: () -> Unit,
-    onTest: (String, String, SourceKind, String?, String?, net.cinehub.data.model.HtmlRules?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
+    onTest: (String, String, SourceKind, String?, String?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
     onSave: (SourceConfig) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
@@ -615,8 +611,6 @@ private fun AddSourceSheet(
     var token by remember { mutableStateOf("") }
     var playPath by remember { mutableStateOf("") }
     var kind by remember { mutableStateOf(SourceKind.Html) }
-    // 候选配置带的那套解析规则；自己换接入方式就该作废，不能再拿旧模板去试新方式
-    var presetHtml by remember { mutableStateOf<net.cinehub.data.model.HtmlRules?>(null) }
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -624,7 +618,7 @@ private fun AddSourceSheet(
     // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
     // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
     // 「测试并保存」实际只测了第一次，而界面还写着「保存并启用」。
-    LaunchedEffect(name, url, kind, token, playPath, presetHtml) {
+    LaunchedEffect(name, url, kind, token, playPath) {
         tested = null
         result = null
     }
@@ -666,49 +660,6 @@ private fun AddSourceSheet(
             )
             Spacer16()
 
-            // 候选配置：影枢没能替这些站打包票，所以不进内置列表，只在这里把表单填好，
-            // 通不通由下面那次「测试」当着用户的面说。
-            if (candidates.isNotEmpty()) {
-                Text(
-                    "没头绪就先点一个",
-                    color = T.TextDim,
-                    fontSize = Fs.xs,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Spacer8()
-                candidates.forEach { c ->
-                    Row(
-                        Modifier.fillMaxWidth().clip(R.md)
-                            .background(T.Surface2)
-                            .border(1.dp, T.Border, R.md)
-                            .clickable {
-                                name = c.name
-                                url = c.baseUrl
-                                kind = c.kind
-                                playPath = c.playPath ?: ""
-                                presetHtml = c.html
-                            }
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(c.name, color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.SemiBold)
-                            Spacer4()
-                            Text(
-                                c.tags.joinToString(" · "),
-                                color = T.Warn,
-                                fontSize = Fs.tiny,
-                                lineHeight = Fs.tiny * 1.6f,
-                            )
-                        }
-                        Spacer8()
-                        Text("填入", color = T.Src400, fontSize = Fs.xs, fontWeight = FontWeight.Bold)
-                    }
-                    Spacer8()
-                }
-                Spacer16()
-            }
-
             Field("名称", "用于界面展示") {
                 Box(
                     Modifier.fillMaxWidth().height(44.dp).clip(R.md)
@@ -749,12 +700,12 @@ private fun AddSourceSheet(
             Field("接入方式", "不确定就选网页解析") {
                 Column(verticalArrangement = Arrangement.spacedBy(Sp.s2)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
-                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
+                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
-                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
+                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
                     }
                 }
             }
@@ -860,7 +811,7 @@ private fun AddSourceSheet(
                             }
                             busy = true
                             result = null
-                            onTest(name, url, kind, token, playPath, presetHtml) { ok, msg, cfg ->
+                            onTest(name, url, kind, token, playPath) { ok, msg, cfg ->
                                 busy = false
                                 result = ok to msg
                                 tested = cfg

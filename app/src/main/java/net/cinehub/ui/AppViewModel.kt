@@ -310,10 +310,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String? = null,
         playPath: String? = null,
-        html: net.cinehub.data.model.HtmlRules? = null,
         onResult: (ok: Boolean, message: String, tested: SourceConfig?) -> Unit,
     ) = viewModelScope.launch {
-        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath, html)
+        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
@@ -341,7 +340,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String?,
         playPath: String? = null,
-        html: net.cinehub.data.model.HtmlRules? = null,
     ): SourceConfig = SourceConfig(
         id = "src_" + System.currentTimeMillis().toString(36),
         name = name.ifBlank { baseUrl },
@@ -354,8 +352,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         else net.cinehub.data.model.AuthMode.Cookie,
         playPath = playPath?.takeIf { it.isNotBlank() },
         html = when (kind) {
-            // 候选配置带着自己那套模板来（比如按苹果 CMS 猜的），手填的地址只能退到通用的
-            SourceKind.Html -> html ?: net.cinehub.data.source.DefaultRules.generic
+            SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic
             else -> null
         },
     )
