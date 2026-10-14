@@ -513,6 +513,17 @@ fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                 fontSize = Fs.xs,
                 lineHeight = Fs.xs * 1.7f,
             )
+            Spacer4()
+            // 这个数字得说全：一档是「每一集」各开这么多，不是全局共用。
+            // 用户按 8 路想的是「总共 8 条连接」，实际会看到 24 条 —— 说错方向
+            // 就等于把这页劝退的话（「容易被拦」）指到了不存在的地方。
+            Text(
+                "最多同时缓存 3 集，所以这一档是每集各开：调到 8 路时总共会有 24 条连接在飞。",
+                color = T.TextFaint,
+                fontSize = Fs.xs,
+                lineHeight = Fs.xs * 1.7f,
+            )
+
             Spacer8()
             Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                 listOf(1, 2, 4, 8).forEach { n ->

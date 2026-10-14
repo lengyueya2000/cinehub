@@ -241,6 +241,19 @@ class DownloadRepository(
         return if (f.isFile && f.length() > 0) "file://" + f.absolutePath else null
     }
 
+    /**
+     * 这一条记录的入口文件真的在盘上吗。
+     *
+     * 只验入口，不逐片数：验一遍分片要把整棵目录点一次，而这里在 init 的协程里，
+     * 用户可能马上就要进下载页。入口在、目录没被整体删掉，这一条就能播；
+     * 个别分片被单独删掉的极端情况交给播放自己报错，不在这儿假装查得出来。
+     */
+    private fun entryOnDisk(t: DownloadTask): Boolean {
+        val name = t.fileName ?: return false
+        val f = File(dirOf(t.id), name)
+        return f.isFile && f.length() > 0L
+    }
+
     // ---------- 执行 ----------
 
     /**
@@ -331,13 +344,18 @@ class DownloadRepository(
         val res = media.resolveStream(cfg, page)
         val direct = (res as? StreamResolution.Ready)?.url ?: error(res.userNote() ?: "解析不到可下载的地址")
 
+        // 目录名是拿站点的 vid 拼出来的，长度没人保证 —— 文件系统对单个名字有上限，
+        // 超了 mkdirs 只是返回 false，接着写文件抛 IOException，最后显示成「连接被对方切断」。
+        // 建不出来就明说建不出来，别让人去查网络。
         val dir = dirOf(id)
+        if (!dir.isDirectory && !dir.mkdirs())
+            error("手机上来不及腾出存放这一集的目录（缓存空间可能刚被清过）—— 关掉缓存全部，重试这一集。")
         if (t.segmentsDone == 0 && t.bytesDone == 0L && t.fileName == null) {
             // 全新一次缓存：从空目录开始。否则上一次（或上一次被删除时）残留的分片会被
             // 当成「已经下好了」直接跳过，进度是真的、文件却是空的。
             dir.deleteRecursively()
+            if (!dir.mkdirs()) error("清掉旧文件之后目录建不回来 —— 这台设备的存储此刻写不了东西。")
         }
-        dir.mkdirs()
         if (isHls(direct)) downloadHls(id, dir, direct, cfg)
         else downloadSingle(id, dir, direct, cfg)
     }
@@ -444,6 +462,13 @@ class DownloadRepository(
         // 要做的那一步，影枢照做。但它只用自己的会话去取 —— 站点不给的密钥不去换、不猜。
         // SAMPLE-AES / 私有 METHOD 属于 DRM 那一类（要还原对方的解密方案才成文件），不碰。
         requirePlainOrAes128(playlist)
+        // 字节区间切片（一个文件按 Range 切成 N 段，fMP4 单文件流常用）当前不支持：
+        // 那些分片的 URI 行是同一个文件名重复出现，照普通分片处理就是同一个 URL 取 N 次整块、
+        // 写成 N 份 seg_xxxxx.ts，本地列表又不再带 BYTERANGE —— 结果是体积 N 倍、内容重复，
+        // 而进度照样 100%、标着「可离线播放」。宁可现在报错，也不产出一个坏文件。
+        if (playlist.contains("#EXT-X-BYTERANGE")) error(
+            "这条线路用字节区间切片（一个文件按区间切段），当前缓存不支持 —— 换一条按普通分片切的线路。",
+        )
 
         val segs = parseSegments(playlist, listUrl)
         if (segs.isEmpty()) error("这份 m3u8 里没有分片")
@@ -491,12 +516,17 @@ class DownloadRepository(
             repeat(workers) {
                 launch(Dispatchers.IO) {
                     for (seg in ch) {
+                        // 每一次动手之前先看这一笔还在不在：暂停 / 删除已经把 job 摘走了，
+                        // 而这里头读的是上一片的字节数 —— 不管就会继续往已经显示「已暂停」的
+                        // 那一行加进度，速度曲线也跟着爬。
+                        coroutineContext.ensureActive()
                         val f = File(dir, seg.name)
                         val wrote = if (f.isFile && f.length() > 0L) f.length()
                         else fetchBytes(id, seg.url, cfg, f, keyOf(seg.crypt))
                         val d = doneN.incrementAndGet()
                         val b = bytesN.addAndGet(wrote)
                         if (d % 4 == 0 || d == segs.size) {
+                            coroutineContext.ensureActive()
                             reportBytes(id, b)
                             patch(id) {
                                 it.copy(
@@ -577,8 +607,16 @@ class DownloadRepository(
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
             .newCall(b.build())
-        // 挂到这一组里，暂停 / 删除时才掐得住：分片并发之后一个任务同时有好几个连接在飞
-        calls.getOrPut(id) { java.util.Collections.synchronizedSet(mutableSetOf()) } += call
+        // 挂到这一组里，暂停 / 删除时才掐得住：分片并发之后一个任务同时有好几个连接在飞。
+        //
+        // 用 compute 而不是 getOrPut：后者是「先 get、没有就 put」，在 ConcurrentHashMap 上
+        // 也不原子。8 路 worker 会几乎同时进这里，两边都读到 null、各建一个 set，
+        // 后 put 的那个把前一个覆盖掉 —— 先那个 Call 就挂在一个已经脱离 map 的 set 上，
+        // cancelCalls 再也找不到它：用户按了暂停，它还在下、还在往界面写进度。
+        calls.compute(id) { _, set ->
+            (set ?: java.util.Collections.synchronizedSet(mutableSetOf<okhttp3.Call>()))
+                .apply { add(call) }
+        }
         return call
     }
 
@@ -586,9 +624,18 @@ class DownloadRepository(
         calls.remove(id)?.forEach { runCatching { it.cancel() } }
     }
 
-    /** 请求结束（成功、失败、被取消都算）后把它从组里摘掉，别攒着一堆死对象。 */
+    /**
+     * 请求结束（成功、失败、被取消都算）后把它从组里摘掉，别攒着一堆死对象。
+     *
+     * 同样走 compute：摘到空组就把这个 key 一起删掉，否则一个被接管走的 id 会在 map 里
+     * 永远留一个空 set。
+     */
     private fun untrackCall(id: String, call: okhttp3.Call) {
-        calls[id]?.remove(call)
+        calls.compute(id) { _, set ->
+            set ?: return@compute null
+            synchronized(set) { set.remove(call) }
+            if (set.isEmpty()) null else set
+        }
     }
 
     /**
@@ -620,7 +667,14 @@ class DownloadRepository(
 
     // ---------- m3u8 ----------
 
-    private data class Segment(val dur: Double, val url: String, val name: String, val crypt: Crypt?)
+    private data class Segment(
+        val dur: Double,
+        val url: String,
+        val name: String,
+        val crypt: Crypt?,
+        /** 源列表里这一段之前有 `#EXT-X-DISCONTINUITY`：本地列表要照写出来。 */
+        val discontinuity: Boolean = false,
+    )
 
     /** 一把密钥：地址 + 这一段的 IV。 */
     private data class Crypt(val uri: String, val iv: ByteArray)
@@ -718,12 +772,19 @@ class DownloadRepository(
      *
      * HLS 的写法是 `#EXT-X-KEY` 从它那一行起对后续分片生效，中途可以换钥；
      * 没给 IV 的分片按协议拿自己的序号当 IV，所以序号也要一路数着。
+     *
+     * 拼不出来的地址**计数并在最后报错**，不能悄悄跳过：跳过的话 `segmentsTotal` 用的就是
+     * 缩过的那份，进度照样走到 100%、本地列表照样写成 ENDLIST，界面亮着「可离线播放」，
+     * 而文件中间缺内容。这类站给没做百分号编码的分片地址很常见（空格、`{}`、中文、
+     * `%` 后面不跟十六进制 —— `URI.resolve` 对这些直接抛）。
      */
     private fun parseSegments(playlist: String, base: String): List<Segment> {
         val out = mutableListOf<Segment>()
         var dur = 0.0
         var key: Pair<String, ByteArray?>? = null
         var seq = 0L
+        var disc = false
+        var dropped = 0
         playlist.lineSequence().forEach { raw ->
             val l = raw.trim()
             when {
@@ -735,17 +796,27 @@ class DownloadRepository(
 
                 l.startsWith("#EXT-X-KEY") -> key = parseKey(l, base)
 
+                // 不连续标记要留着带到本地列表里：丢了它，解码器会跨边界硬接两段
+                // 参数不一致的流，画面花一下 —— 而那份边界是站点自己标出来的
+                l.startsWith("#EXT-X-DISCONTINUITY") -> disc = true
+
                 l.isEmpty() || l.startsWith("#") -> Unit
                 else -> {
                     val idx = out.size
-                    val abs = resolve(base, l) ?: return@forEach
+                    val abs = resolve(base, l) ?: run { dropped++; return@forEach }
                     out += Segment(
                         dur, abs, "seg_%05d%s".format(idx, pathExt(abs, ".ts")),
                         key?.let { Crypt(it.first, it.second ?: seqIv(seq + idx)) },
+                        disc,
                     )
+                    disc = false
                 }
             }
         }
+        if (dropped > 0) error(
+            "有 $dropped 个分片地址拼不出完整地址（站点给的是没做转义的相对地址），" +
+                "缓存下来中间会缺内容 —— 这一条不存了，换一条线路试试。",
+        )
         return out
     }
 
@@ -784,6 +855,7 @@ class DownloadRepository(
         append("#EXT-X-PLAYLIST-TYPE:VOD\n")
         initName?.let { append("#EXT-X-MAP:URI=\"").append(it).append("\"\n") }
         segs.forEach {
+            if (it.discontinuity) append("#EXT-X-DISCONTINUITY\n")
             append("#EXTINF:").append(it.dur).append(",\n")
             append(it.name).append('\n')
         }
@@ -839,10 +911,25 @@ class DownloadRepository(
         val stored = raw?.takeIf { it.isNotBlank() }?.let {
             runCatching { json.decodeFromString<List<DownloadTask>>(it) }.getOrElse { emptyList() }
         }.orEmpty()
-        // 进程被系统回收后没有协程还在跑，界面上却显示「下载中」是骗人 —— 落回已暂停
+        // 进程被系统回收后没有协程还在跑，界面上却显示「下载中」是骗人 —— 落回已暂停。
+        //
+        // 而「已缓存」这一句更要验：记录是落盘的，文件却可能被系统清理、被手机管家、
+        // 被用户手动删掉 —— 光信记录就会留着一行点不开的「可离线播放」，
+        // 而且 enqueue 看见 Done 直接返回，用户连重下的入口都没有。
         val fixed = stored.map {
-            if (it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued)
-                it.copy(status = DownloadStatus.Paused) else it
+            when {
+                it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued ->
+                    it.copy(status = DownloadStatus.Paused)
+
+                it.status == DownloadStatus.Done && !entryOnDisk(it) -> it.copy(
+                    status = DownloadStatus.Paused,
+                    segmentsDone = 0,
+                    bytesDone = 0L,
+                    error = "缓存文件已经不在了（多半被系统或清理软件删掉了）—— 点继续会重新缓存这一集。",
+                )
+
+                else -> it
+            }
         }
         // 落盘读回来之前用户可能已经排了一个任务：整份覆盖会把那一笔吞掉，
         // 之后任何一次保存再把「没有它」的状态写回磁盘。所以合并，内存里的优先。
@@ -877,7 +964,28 @@ class DownloadRepository(
         /** 速度取多长的窗口：太长会把刚连上时的慢平均进来，太短抖得读不出。 */
         const val SPEED_WINDOW_MS = 3_000L
 
-        fun keyOf(sourceId: String, mediaId: String, episodeIndex: Int) =
-            "dl_${sourceId}_${mediaId}_$episodeIndex".replace(Regex("[^A-Za-z0-9_.-]"), "_")
+        /**
+         * 目录名的长度上限。
+         *
+         * ext4 之类给单个目录名的上限是 255 字节，看着很宽，但这条路径下每个分片还要再加
+         * 自己的名字，而且个别文件系统更紧。留到 96 是把它当「明显不正常的信号」用，
+         * 不是当优化。
+         */
+        const val MAX_KEY_LEN = 96
+
+        fun keyOf(sourceId: String, mediaId: String, episodeIndex: Int): String {
+            val raw = "dl_${sourceId}_${mediaId}_$episodeIndex"
+                .replace(Regex("[^A-Za-z0-9_.-]"), "_")
+            if (raw.length <= MAX_KEY_LEN) return raw
+            // 超长的只可能是站点把一整串参数当成 vid 下发（m3u 地址、带签名的路径都见过）。
+            // 截断不行：两个 id 前缀相同时会撞进同一个目录，两集内容互相覆盖。
+            // 所以整串压成定长摘要 —— 同一集每次算出来还是同一个目录，续传认得它。
+            // 这里的摘要只为把名字压短，没有任何安全含义。
+            val digest = java.security.MessageDigest.getInstance("MD5")
+                .digest(raw.toByteArray())
+                .joinToString("") { "%02x".format(it) }
+                .substring(0, 16)
+            return "dl_${digest}_$episodeIndex"
+        }
     }
 }
