@@ -12,40 +12,57 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import net.cinehub.data.model.DownloadStatus
+import net.cinehub.data.model.Health
+import net.cinehub.data.model.HealthReport
+import net.cinehub.data.model.SourceConfig
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.components.PosterCard
+import net.cinehub.ui.components.SectionHead
 import net.cinehub.ui.components.Spacer4
+import net.cinehub.ui.components.StatusDot
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
 
 /**
- * 「我的」：几行同级入口。
+ * 「我的」：三条海报轨 + 一组设置入口。
  *
- * 之前这一页就是播放源管理本身，收藏和最近观看被塞在它头顶，看起来像源管理的附属品。
- * 它们其实平级 —— 都是「我自己的东西」，所以这里只放菜单，各页各自成一屏。
+ * 这一页的主角是「我自己的东西」，所以收藏 / 最近观看 / 离线缓存各占一条横轨，
+ * 用和首页一样的海报语言 —— 全是首页没有的：首页那条「继续观看」只列没看完的，
+ * 这里列的是完整历史（含已看完的）；收藏与缓存首页根本不出现。
+ *
+ * 源的健康状况仍要在这一页说话（它是全应用唯一需要盯的东西），但不抢主角：
+ * 收在设置组第一行的圆点 + 文字里，点进去才是完整的管理页。
  */
 @Composable
 fun MineScreen(
@@ -53,105 +70,295 @@ fun MineScreen(
     onOpenSourceManage: () -> Unit,
     onOpenFavorites: () -> Unit,
     onOpenHistory: () -> Unit,
+    onOpenDownloads: () -> Unit,
     onOpenDownloadSettings: () -> Unit,
+    onOpenDetail: (sourceId: String, mediaId: String) -> Unit,
 ) {
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val favorites by vm.favorites.collectAsState()
     val history by vm.watchHistory.collectAsState()
-    val segParallel by vm.segParallel.collectAsState()
     val downloads by vm.downloads.collectAsState()
+    val segParallel by vm.segParallel.collectAsState()
 
-    val enabled = sources.count { it.enabled }
-    val ok = sources.count { health[it.id]?.health == net.cinehub.data.model.Health.Ok }
-    val slow = sources.count { health[it.id]?.health == net.cinehub.data.model.Health.Slow }
-    val down = sources.count { health[it.id]?.health == net.cinehub.data.model.Health.Down }
+    val cached = downloads.filter { it.status == DownloadStatus.Done }
+    val enabled = sources.filter { it.enabled }
+    val down = enabled.count { health[it.id]?.health == Health.Down }
+    val slow = enabled.count { health[it.id]?.health == Health.Slow }
+    val ok = enabled.count { health[it.id]?.health == Health.Ok }
+
+    val ctx = LocalContext.current
+    // 版本号从包里取，不写死 —— 写死的那份迟早开始说谎
+    val version = remember {
+        runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull()
+    }
 
     LazyColumn(
         Modifier.fillMaxSize().background(T.Bg),
-        contentPadding = PaddingValues(top = Sp.s2, bottom = Sp.s6),
-        verticalArrangement = Arrangement.spacedBy(Sp.s2),
+        contentPadding = PaddingValues(top = Sp.s2, bottom = Sp.s7),
     ) {
         item {
             Column(Modifier.padding(horizontal = Sp.s4, vertical = Sp.s3)) {
                 Text("我的", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
                 Spacer4()
+                // 承载信息的文字一律 TextDim：TextFaint 在纯黑上只有 3.5:1，够不上正文门槛
+                Text("收藏、看过的与存下来的", color = T.TextDim, fontSize = Fs.xxs)
+            }
+        }
+
+        // ---------- 收藏 ----------
+        item {
+            SectionHead(
+                "收藏",
+                trailing = if (favorites.isEmpty()) null else "全部 ›",
+                onTrailing = if (favorites.isEmpty()) null else onOpenFavorites,
+                modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s4, bottom = Sp.s2),
+            )
+        }
+        if (favorites.isEmpty()) {
+            // 空的时候不留一条空轨 —— 但这一栏是这页的开场，给一句下一步该干什么
+            item {
                 Text(
-                    "播放源、收藏与观看记录都在这里",
-                    color = T.TextFaint,
-                    fontSize = Fs.xxs,
+                    "还没有收藏。详情页封面下面那颗心点一下，这里就会出现。",
+                    color = T.TextDim,
+                    fontSize = Fs.xs,
+                    modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s2),
+                )
+            }
+        } else {
+            item {
+                PosterRail {
+                    items(favorites.take(RAIL_MAX), key = { "fav_" + it.key }) { f ->
+                        PosterCard(
+                            title = f.title,
+                            subtitle = listOfNotNull(f.year, f.category).joinToString(" · ")
+                                .ifBlank { "已收藏" },
+                            cover = f.cover,
+                            modifier = Modifier.width(RAIL_W),
+                            onClick = { onOpenDetail(f.sourceId, f.mediaId) },
+                        )
+                    }
+                }
+            }
+        }
+
+        // ---------- 最近观看 ----------
+        // 整段只在有内容时出现：一条记录都没有时，这里没话可说
+        if (history.isNotEmpty()) {
+            item {
+                SectionHead(
+                    "最近观看",
+                    trailing = "全部 ›",
+                    onTrailing = onOpenHistory,
+                    modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s5, bottom = Sp.s2),
+                )
+            }
+            item {
+                PosterRail {
+                    items(history.take(RAIL_MAX), key = { "his_" + it.key }) { e ->
+                        PosterCard(
+                            title = e.title,
+                            subtitle = if (e.finished) "已看完 · ${e.episodeName}" else e.where,
+                            cover = e.cover,
+                            modifier = Modifier.width(RAIL_W),
+                            // 看完的那一部进度条不再画 —— 封底留白就是「不用再接」
+                            progress = if (e.resumable && e.durationSec > 0)
+                                (e.positionSec.toFloat() / e.durationSec).coerceIn(0f, 1f) else null,
+                            onClick = { vm.resumeFromHistory(e) },
+                        )
+                    }
+                }
+            }
+        }
+
+        // ---------- 离线缓存 ----------
+        if (cached.isNotEmpty()) {
+            item {
+                SectionHead(
+                    "离线缓存",
+                    trailing = "管理 ›",
+                    onTrailing = onOpenDownloads,
+                    modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s5, bottom = Sp.s2),
+                )
+            }
+            item {
+                PosterRail {
+                    items(cached.take(RAIL_MAX), key = { "dl_" + it.id }) { t ->
+                        PosterCard(
+                            title = t.mediaTitle,
+                            subtitle = t.episodeName,
+                            cover = t.mediaCover,
+                            badge = "可离线",
+                            modifier = Modifier.width(RAIL_W),
+                            onClick = { vm.playCached(t) },
+                        )
+                    }
+                }
+            }
+        }
+
+        // ---------- 设置 ----------
+        item {
+            SectionHead(
+                "设置",
+                modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s6, bottom = Sp.s2),
+            )
+        }
+        item {
+            Column(
+                Modifier.padding(horizontal = Sp.s4)
+                    .fillMaxWidth().clip(R.lg).background(T.Surface2).border(1.dp, T.Border, R.lg),
+            ) {
+                SettingRow(
+                    icon = Icons.Filled.Settings,
+                    tint = T.Src500,
+                    title = "播放源管理",
+                    // 健康不只靠颜色：结论先写成字，圆点只是让它更快扫到
+                    extra = { SourceHealthStrip(enabled, health, ok, slow, down) },
+                    onClick = onOpenSourceManage,
+                )
+                Divider()
+                SettingRow(
+                    icon = Icons.Outlined.Download,
+                    tint = T.Ok,
+                    title = "离线缓存",
+                    sub = if (cached.isEmpty()) "还没有缓存好的集"
+                    else "${cached.size} 集可离线播放 · ${
+                        downloads.count { it.status == DownloadStatus.Running }
+                    } 集下载中",
+                    onClick = onOpenDownloads,
+                )
+                Divider()
+                SettingRow(
+                    icon = Icons.Outlined.Tune,
+                    tint = T.Gold,
+                    title = "下载设置",
+                    sub = "缓存一集时同时开 $segParallel 条连接取分片",
+                    onClick = onOpenDownloadSettings,
                 )
             }
         }
+
         item {
-            MenuRow(
-                icon = Icons.Filled.Settings,
-                tint = T.Src500,
-                title = "播放源管理",
-                sub = "$enabled 个源已接入 · $ok 正常 / $slow 较慢 / $down 不可用",
-                onClick = onOpenSourceManage,
-            )
-        }
-        item {
-            MenuRow(
-                icon = Icons.Filled.Favorite,
-                tint = T.Play400,
-                title = "收藏",
-                sub = if (favorites.isEmpty()) "还没有收藏，详情页那颗心点一下" else "${favorites.size} 部",
-                onClick = onOpenFavorites,
-            )
-        }
-        item {
-            MenuRow(
-                icon = Icons.Filled.History,
-                tint = T.Gold,
-                title = "最近观看",
-                sub = if (history.isEmpty()) "播过的片会记在这里，下次从那一秒接上"
-                else "${history.size} 部 · 最近一部 ${history.first().title}",
-                onClick = onOpenHistory,
-            )
-        }
-        item {
-            MenuRow(
-                icon = Icons.Outlined.Download,
-                tint = T.Ok,
-                title = "下载设置",
-                sub = if (downloads.isEmpty()) "缓存一集时同时开 $segParallel 条连接取分片"
-                else "${downloads.size} 个缓存任务 · 同时开 $segParallel 条连接",
-                onClick = onOpenDownloadSettings,
+            Text(
+                buildString {
+                    if (version != null) append("影枢 v$version")
+                    append(" · 收藏、进度与凭证只存这台设备")
+                },
+                color = T.TextFaint,
+                fontSize = Fs.tiny,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(start = Sp.s4, end = Sp.s4, top = Sp.s6),
             )
         }
     }
 }
 
+/** 横轨的外壳：左右留白与首页对齐，卡片之间 12dp。 */
 @Composable
-private fun MenuRow(
+private fun PosterRail(content: LazyListScope.() -> Unit) {
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = Sp.s4),
+        horizontalArrangement = Arrangement.spacedBy(Sp.s3),
+        content = content,
+    )
+}
+
+/** 组内分隔线：从文字起笔处开始，不穿图标。 */
+@Composable
+private fun Divider() = Box(
+    Modifier.fillMaxWidth().padding(start = Sp.s4 + 30.dp + Sp.s3).height(1.dp)
+        .background(T.BorderFaint)
+)
+
+@Composable
+private fun SettingRow(
     icon: ImageVector,
     tint: Color,
     title: String,
-    sub: String,
+    sub: String? = null,
+    extra: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
 ) {
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s2 / 2)
-            .clip(R.lg).background(T.Surface2)
-            .border(1.dp, T.Border, R.lg)
-            .clickable(onClick = onClick)
-            .padding(horizontal = Sp.s4, vertical = Sp.s4),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            Modifier.size(34.dp).clip(CircleShape).background(tint.copy(alpha = .14f)),
-            contentAlignment = Alignment.Center,
+    Column {
+        Row(
+            // 整行至少 52dp：这一页最小的可点项也要够拇指。
+            // heightIn 必须写在 padding 外面，否则它约束的是内容而不是整行，
+            // 单行标题那一条会被撑到 76dp，看着像坏了。
+            Modifier.fillMaxWidth().clickable(onClick = onClick)
+                .heightIn(min = 52.dp)
+                // 下面还要接一段状态条时，行的下内边距收紧，否则那一段看着像隔了一屏
+                .padding(start = Sp.s4, end = Sp.s4, top = Sp.s3, bottom = if (extra == null) Sp.s3 else Sp.s1),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(icon, null, tint = tint, modifier = Modifier.size(17.dp))
+            Box(
+                Modifier.size(30.dp).clip(R.sm).background(tint.copy(alpha = .13f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, null, tint = tint, modifier = Modifier.size(15.dp))
+            }
+            Spacer(Modifier.width(Sp.s3))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.SemiBold)
+                // 副标题紧贴标题：它俩是一句话，中间断开就会读成两件事
+                if (sub != null) {
+                    Text(
+                        sub,
+                        color = T.TextDim,
+                        fontSize = Fs.xxs,
+                        maxLines = 2,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
+            Icon(Icons.Filled.ChevronRight, null, tint = T.TextFaint, modifier = Modifier.size(18.dp))
         }
-        Spacer(Modifier.size(Sp.s3))
-        Column(Modifier.weight(1f)) {
-            Text(title, color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
-            Spacer4()
-            Text(sub, color = T.TextFaint, fontSize = Fs.xxs, maxLines = 1)
-        }
-        Icon(Icons.Filled.ChevronRight, null, tint = T.TextFaint, modifier = Modifier.size(20.dp))
+        extra?.invoke()
     }
 }
+
+/**
+ * 源健康：一句结论 + 一排圆点，缩进到和标题文字同一根起笔线上。
+ *
+ * 结论必须是字，圆点只是让它更快扫到 —— 单靠颜色传达状态是不合格的。
+ * 有源不可用时要点名：否则用户是到了详情页播放失败才发现的。
+ */
+@Composable
+private fun SourceHealthStrip(
+    enabled: List<SourceConfig>,
+    health: Map<String, HealthReport>,
+    ok: Int,
+    slow: Int,
+    down: Int,
+) {
+    if (enabled.isEmpty()) return
+    val indent = Sp.s4 + 30.dp + Sp.s3
+    val shown = enabled.take(6)
+    val worst = enabled.firstOrNull { health[it.id]?.health == Health.Down }
+        ?: enabled.firstOrNull { health[it.id]?.health == Health.Slow }
+    Column(Modifier.padding(start = indent, end = Sp.s4, bottom = Sp.s3)) {
+        Text(
+            when {
+                down > 0 && worst != null -> "$down 个不可用（${worst.name}）· $slow 个较慢"
+                slow > 0 -> "$slow 个较慢 · $ok 个正常"
+                ok == enabled.size -> "全部 $ok 个源正常"
+                else -> "还没检测过，点进去测一次"
+            },
+            color = when {
+                down > 0 -> T.Err
+                slow > 0 -> T.Warn
+                else -> T.TextDim
+            },
+            fontSize = Fs.xxs,
+        )
+        Row(Modifier.padding(top = Sp.s2)) {
+            shown.forEachIndexed { i, s ->
+                StatusDot(health[s.id]?.health ?: Health.Unknown, size = 6)
+                if (i < shown.lastIndex) Spacer(Modifier.width(Sp.s2))
+            }
+        }
+    }
+}
+
+private val RAIL_W = 104.dp
+private const val RAIL_MAX = 12

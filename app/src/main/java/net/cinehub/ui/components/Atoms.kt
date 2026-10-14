@@ -259,7 +259,9 @@ fun PosterCard(
         if (subtitle != null) {
             Text(
                 subtitle,
-                color = T.TextFaint,
+                // 副标题带的是「哪一集、看到几分、哪一年」这类信息，用 TextFaint 在纯黑上
+                // 只有 3.5:1，够不上正文 4.5:1 的门槛 —— 承载信息的文字一律 TextDim
+                color = T.TextDim,
                 fontSize = Fs.xxs,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

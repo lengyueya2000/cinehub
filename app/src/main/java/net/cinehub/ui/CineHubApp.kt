@@ -203,7 +203,9 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenSourceManage = { route = Route.SourceManage },
                         onOpenFavorites = { route = Route.Favorites },
                         onOpenHistory = { route = Route.History },
+                        onOpenDownloads = { route = Route.Downloads },
                         onOpenDownloadSettings = { route = Route.DownloadSettings },
+                        onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
                     is Route.DownloadSettings -> DownloadSettingsScreen(
