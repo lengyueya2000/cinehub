@@ -42,8 +42,9 @@ fun StreamResolution.userNote(): String? = when (this) {
     is StreamResolution.Ready -> null
 
     is StreamResolution.ThirdPartyPage ->
-        "这个源给的是${platform}的播放页，不是视频文件本身。" +
-            "影枢只在本机解码直链，不会去解析、转码别人的页面。"
+        "这个源给的是${platform}的播放页，不是视频文件本身，影枢不去逆向${platform}的页面。" +
+            "换一个源；或给这个源填上它自己的播放页路径（「播放源管理」→ 播放页路径），" +
+            "影枢就能打开源站那一页、在旁边接住它请求的流。"
 
     is StreamResolution.NeedsSession ->
         "直链只对登录用户开放，影枢不代为登录。" +

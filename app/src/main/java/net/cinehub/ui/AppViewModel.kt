@@ -23,6 +23,7 @@ import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.model.userNote
 import net.cinehub.data.source.SourceAdapters
 
@@ -104,6 +105,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val note: String? = null,
         /** 源站根地址 —— 播放器要带着它做 Referer，CDN 才认。 */
         val sourceBaseUrl: String? = null,
+        /**
+         * 「在站点页面里解析」该打开的地址。
+         *
+         * 源站给了自己的解析端时它是那个端的页面（在那里源站会像对自己的播放器一样
+         * 把流交出来）；没给就退回这一集的播放页。两者不是一回事：
+         * 直接打开爱奇艺的页面只会看到「APP内打开」。
+         */
+        val sitePageUrl: String? = null,
+        /** 接住的地址被页面请求时携带的条件，起播时原样带给播放器。 */
+        val streamHeaders: Map<String, String> = emptyMap(),
         /** 缓存这一集时要写进任务的键；本地回放也带着它，切回在线源才对得上。 */
         val mediaId: String? = null,
     )
@@ -118,14 +129,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 要在站点自己的页面里打开的地址，以及它是给哪个源用的。
      *
      * 只有一处能产生它：播放器上的「在站点页面里解析」和源管理里的「在站点里登录」。
+     * [referer] 是源站根地址 —— 源站的解析端按来源域名放行，
+     * WebView 不带它就会被当成陌生域名拒掉（实测西瓜影院的解析页就这么回过话）。
      */
-    data class Browser(val startUrl: String, val label: String)
+    data class Browser(
+        val startUrl: String,
+        val label: String,
+        val referer: String? = null,
+    )
 
     private val _browser = MutableStateFlow<Browser?>(null)
     val browser: StateFlow<Browser?> = _browser.asStateFlow()
 
-    fun openSiteBrowser(startUrl: String, label: String) {
-        _browser.value = Browser(startUrl, label)
+    fun openSiteBrowser(startUrl: String, label: String, referer: String? = null) {
+        _browser.value = Browser(startUrl, label, referer)
     }
 
     fun closeSiteBrowser() { _browser.value = null }
@@ -136,10 +153,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 只换 streamUrl，源、Referer、这一集都不动 —— 换源会让 Referer 对不上，
      * 而这条地址恰恰是原来那个源给出来的。
      */
-    fun useSiteLink(link: String) {
+    /**
+     * 把站点页面里接住的地址交给当前这一集。
+     *
+     * [headers] 是那条地址被页面请求时带的条件（Referer / Cookie）。
+     * 一起带过去，播放器才可能拿到和页面一样的响应 —— 只抄 URL 过去，
+     * 那些「只认自己页面」的地址会 404。
+     */
+    fun useSiteLink(link: String, headers: Map<String, String> = emptyMap()) {
         val cur = _playing.value ?: return
         if (!link.startsWith("http")) return
-        _playing.value = cur.copy(streamUrl = link, note = null)
+        _playing.value = cur.copy(streamUrl = link, note = null, streamHeaders = headers)
     }
 
     init {
@@ -194,9 +218,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         baseUrl: String,
         kind: SourceKind,
         authToken: String? = null,
+        playPath: String? = null,
         onResult: (ok: Boolean, message: String, tested: SourceConfig?) -> Unit,
     ) = viewModelScope.launch {
-        val cfg = buildConfig(name, baseUrl, kind, authToken)
+        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
@@ -220,6 +245,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         baseUrl: String,
         kind: SourceKind,
         authToken: String?,
+        playPath: String? = null,
     ): SourceConfig = SourceConfig(
         id = "src_" + System.currentTimeMillis().toString(36),
         name = name.ifBlank { baseUrl },
@@ -228,6 +254,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         authToken = authToken?.takeIf { it.isNotBlank() },
         authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None
         else net.cinehub.data.model.AuthMode.Cookie,
+        playPath = playPath?.takeIf { it.isNotBlank() },
         html = when (kind) {
             SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic
             else -> null
@@ -361,8 +388,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _playing.value = _playing.value?.copy(
                 streamUrl = (res as? StreamResolution.Ready)?.url,
                 note = noteOf(res),
+                sitePageUrl = sitePageFor(cfg, mediaId, episodeIndex, episodeUrl),
             )
         }
+    }
+
+    /**
+     * 「在站点页面里解析」该打开哪一页。
+     *
+     * 只有这一页属于**源站自己**才有意义：打开它，源站的播放器会去把流取回来，
+     * 影枢在旁边接住那条请求（4K影视 与西瓜影院走的都是这一条）。
+     * 接口型源给的是爱奇艺那类平台页 —— 那种页面面对内嵌 WebView 只会弹
+     * 「APP内打开」，拿它当入口等于骗用户点，所以宁可不给这个按钮。
+     */
+    private fun sitePageFor(
+        cfg: SourceConfig?,
+        mediaId: String?,
+        episodeIndex: Int,
+        episodeUrl: String?,
+    ): String? {
+        cfg?.playPageFor(mediaId, episodeIndex)?.let { return it }
+        val url = episodeUrl?.takeIf { it.isNotBlank() } ?: return null
+        return if (VideoPlatforms.platformOf(url) == null) url else null
     }
 
     /** 重试解析：用户在播放器里点「重试」时走这里，不换集也不换源。 */

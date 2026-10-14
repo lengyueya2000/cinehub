@@ -190,12 +190,18 @@ fun PlayerScreen(
         buffering = true
         if (url.isNullOrBlank()) return@LaunchedEffect
 
-        // 站点的 CDN 会校验 Referer/Origin，段地址常常只在带 Referer 时才给内容
+        // 站点的 CDN 会校验 Referer/Origin，段地址常常只在带 Referer 时才给内容。
+        // 从站点页面接住的地址优先按它被请求时那套条件发 —— 再叠一层源站根地址的
+        // Referer/Origin 反而会把对方绕糊涂（解析页只认自己那一页）。
+        val captured = playing?.streamHeaders.orEmpty()
         val props = buildMap {
-            val origin = playing?.sourceBaseUrl
-            if (!origin.isNullOrBlank()) {
-                put("Referer", "$origin/")
-                put("Origin", origin)
+            putAll(captured)
+            if (!captured.containsKey("Referer")) {
+                val origin = playing?.sourceBaseUrl
+                if (!origin.isNullOrBlank()) {
+                    put("Referer", "$origin/")
+                    put("Origin", origin)
+                }
             }
         }
 
@@ -554,8 +560,9 @@ fun PlayerScreen(
                                     .clickable { vm.retryPlay() }
                                     .padding(horizontal = 16.dp, vertical = 7.dp),
                             )
-                            // 地址在对方脚本手里时，唯一不越界的路是让站点自己的页面把它算出来
-                            if (playing?.sourceId != "local" && !playing?.episodeUrl.isNullOrBlank()) {
+                            // 地址在对方脚本手里时，唯一不越界的路是让站点自己的页面把它算出来。
+                            // 源站配了解析端，打开的就是那个端而不是平台页 —— 后者只会弹「APP内打开」
+                            if (playing?.sourceId != "local" && !playing?.sitePageUrl.isNullOrBlank()) {
                                 Spacer8()
                                 Text(
                                     "在站点页面里解析",
@@ -566,8 +573,9 @@ fun PlayerScreen(
                                         .border(1.dp, T.Src500.copy(alpha = .5f), R.full)
                                         .clickable {
                                             vm.openSiteBrowser(
-                                                playing?.episodeUrl ?: return@clickable,
+                                                playing?.sitePageUrl ?: return@clickable,
                                                 playing?.sourceName ?: "站点页面",
+                                                playing?.sourceBaseUrl?.let { "$it/" },
                                             )
                                         }
                                         .padding(horizontal = 12.dp, vertical = 6.dp),

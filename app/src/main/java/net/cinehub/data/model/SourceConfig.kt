@@ -33,8 +33,30 @@ data class SourceConfig(
     val authToken: String? = null,
     /** 凭证的传递方式。 */
     val authMode: AuthMode = AuthMode.None,
+    /**
+     * 源站自己播放页的路径模板，占位符 `{id}` `{sid}` `{nid}`（线路号 / 第几集）。
+     *
+     * 只有接口型源需要：苹果 CMS 的 `vod_play_url` 里给的可能直接是
+     * 爱奇艺 / 腾讯那种平台播放页（西瓜影院就是这样），影枢拿它没法播。
+     * 但源站自己的播放页能播 —— 它自己的播放器会去把平台页地址换成可播流。
+     * 于是影枢打开这个页面，在旁边接住页面请求的那条流，不去逆向对方的解析与授权。
+     */
+    val playPath: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
-)
+) {
+    /**
+     * 拼出源站自己的播放页地址。
+     *
+     * 没有配置、或缺能填的 id 就返回 null —— 宁可不给这个入口，
+     * 也不要拿一个必然打不开的平台页去骗用户点。
+     */
+    fun playPageFor(mediaId: String?, nid: Int, sid: Int = 1): String? {
+        val tpl = playPath?.takeIf { it.isNotBlank() } ?: return null
+        val id = mediaId?.takeIf { it.isNotBlank() } ?: return null
+        return baseUrl.trimEnd('/') + "/" +
+            tpl.trimStart('/').replace("{id}", id).replace("{sid}", "$sid").replace("{nid}", "$nid")
+    }
+}
 
 @Serializable
 enum class AuthMode {

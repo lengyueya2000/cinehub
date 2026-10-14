@@ -16,8 +16,7 @@ private val Context.dataStore by preferencesDataStore(name = "cinehub")
 /**
  * 播放源持久化。
  *
- * 内置了两个用户给的源作为初始数据（4kvm.net / dongpiandi.ai），
- * 用户可以改、可以删、也可以自己加。
+ * 内置的初始源见 [Seed]，用户可以改、可以删、也可以自己加。
  */
 class SourceRepository(private val context: Context) {
 
@@ -26,9 +25,11 @@ class SourceRepository(private val context: Context) {
 
     val sources: Flow<List<SourceConfig>> = context.dataStore.data.map { p ->
         val raw = p[KEY]
-        if (raw.isNullOrBlank()) Seed.sources
-        else runCatching { json.decodeFromString<List<SourceConfig>>(raw) }
-            .getOrElse { Seed.sources }
+        val stored = if (raw.isNullOrBlank()) null
+        else runCatching { json.decodeFromString<List<SourceConfig>>(raw) }.getOrNull()
+        // 已经撤掉的内置源不能因为「老用户的列表里还留着这一条」就继续冒出来；
+        // 用户自己加的源 id 形如 src_xxx，落不到 retiredIds 里，不受影响。
+        (stored ?: Seed.sources).filterNot { it.id in Seed.retiredIds }
     }
 
     /** 按优先级排序、且已启用的源。 */
@@ -82,38 +83,20 @@ class SourceRepository(private val context: Context) {
 object Seed {
     val sources: List<SourceConfig> = listOf(
         SourceConfig(
-            id = "k4vm",
-            name = "4K影视",
-            baseUrl = "https://4kvm.net",
-            kind = net.cinehub.data.model.SourceKind.Html,
-            priority = 1,
-            tags = listOf("4K HDR", "网页解析"),
-            html = net.cinehub.data.source.DefaultRules.k4,
-        ),
-        SourceConfig(
             id = "luttt",
             name = "北觅影视",
             baseUrl = "https://v.luttt.com",
             kind = net.cinehub.data.model.SourceKind.Html,
-            priority = 2,
+            priority = 1,
             tags = listOf("4K 画质", "直链可播"),
             html = net.cinehub.data.source.DefaultRules.maccms,
-        ),
-        SourceConfig(
-            id = "xiguazx",
-            name = "西瓜影院",
-            baseUrl = "https://xiguazx.cc",
-            kind = net.cinehub.data.model.SourceKind.JsonApi,
-            priority = 3,
-            tags = listOf("10 万+ 片库"),
-            api = net.cinehub.data.model.ApiRules(),
         ),
         SourceConfig(
             id = "dongpiandi",
             name = "懂片帝AI",
             baseUrl = "https://dongpiandi.ai",
             kind = net.cinehub.data.model.SourceKind.AiMovie,
-            priority = 4,
+            priority = 2,
             tags = listOf("1080P", "AI 找片"),
         ),
         SourceConfig(
@@ -121,8 +104,16 @@ object Seed {
             name = "演示源",
             baseUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
             kind = net.cinehub.data.model.SourceKind.M3u,
-            priority = 5,
+            priority = 3,
             tags = listOf("公开测试流", "可验证播放"),
         ),
     )
+
+    /**
+     * 曾经内置、后来撤掉的源。
+     *
+     * 只从 [sources] 里删掉是不够的：老用户列表里那两条是启动时写进去的，会一直留着。
+     * 按 id 清掉它们，用户自己手动加的同类源（id 形如 `src_xxx`）不受影响。
+     */
+    val retiredIds = setOf("k4vm", "xiguazx")
 }

@@ -275,7 +275,7 @@ fun SourceScreen(
         if (showAdd) {
             AddSourceSheet(
                 onDismiss = { showAdd = false },
-                onTest = { name, url, kind, token, cb -> vm.testSource(name, url, kind, token, cb) },
+                onTest = { name, url, kind, token, playPath, cb -> vm.testSource(name, url, kind, token, playPath, cb) },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
                     showAdd = false
@@ -459,12 +459,13 @@ private fun SourceRow(
 @Composable
 private fun AddSourceSheet(
     onDismiss: () -> Unit,
-    onTest: (String, String, SourceKind, String?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
+    onTest: (String, String, SourceKind, String?, String?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
     onSave: (SourceConfig) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
     var token by remember { mutableStateOf("") }
+    var playPath by remember { mutableStateOf("") }
     var kind by remember { mutableStateOf(SourceKind.Html) }
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
@@ -575,6 +576,27 @@ private fun AddSourceSheet(
                 }
             }
 
+            Field("播放页路径", "选填 · 接口只给爱奇艺/腾讯播放页时才需要") {
+                Box(
+                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                        .background(T.Surface2).border(1.dp, T.Border, R.md)
+                        .padding(horizontal = 13.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    if (playPath.isEmpty()) Text(
+                        "如 /index.php/vod/play/id/{id}/sid/{sid}/nid/{nid}.html",
+                        color = T.TextFaint, fontSize = Fs.body2,
+                    )
+                    BasicTextField(
+                        playPath, { playPath = it; invalidate() },
+                        singleLine = true,
+                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                        cursorBrush = SolidColor(T.Src500),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+
             result?.let { (ok, msg) ->
                 Row(
                     Modifier.fillMaxWidth().clip(R.md)
@@ -637,7 +659,7 @@ private fun AddSourceSheet(
                             }
                             busy = true
                             result = null
-                            onTest(name, url, kind, token) { ok, msg, cfg ->
+                            onTest(name, url, kind, token, playPath) { ok, msg, cfg ->
                                 busy = false
                                 result = ok to msg
                                 tested = cfg

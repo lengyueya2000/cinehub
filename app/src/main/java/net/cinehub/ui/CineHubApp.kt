@@ -185,6 +185,7 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                     vm = vm,
                     startUrl = b.startUrl,
                     label = b.label,
+                    referer = b.referer,
                     onClose = { vm.closeSiteBrowser() },
                 )
             }

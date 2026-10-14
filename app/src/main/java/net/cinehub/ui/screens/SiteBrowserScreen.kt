@@ -72,13 +72,19 @@ fun SiteBrowserScreen(
     vm: AppViewModel,
     startUrl: String,
     label: String,
+    referer: String? = null,
     onClose: () -> Unit,
 ) {
     var title by remember { mutableStateOf(label) }
     var progress by remember { mutableIntStateOf(0) }
-    /** 站点页面请求过的媒体地址，按出现顺序留着让用户自己挑。 */
-    var links by remember { mutableStateOf<List<String>>(emptyList()) }
-    val queue = remember { ConcurrentLinkedQueue<String>() }
+    /**
+     * 站点页面请求过的媒体地址，按出现顺序留着让用户自己挑。
+     *
+     * 连它被请求时带的 Referer / Cookie 一起留着：不少解析页给的地址只认
+     * 「就是我这页发出去的那次请求」，只把 URL 交给播放器会拿到 404（实测西瓜影院就是这样）。
+     */
+    var links by remember { mutableStateOf<List<Captured>>(emptyList()) }
+    val queue = remember { ConcurrentLinkedQueue<Captured>() }
     var web by remember { mutableStateOf<WebView?>(null) }
     // 从「站点」入口进来只是为了登录，此时没有正在放的片子，接住的地址无处可交
     val playing by vm.playing.collectAsState()
@@ -90,7 +96,7 @@ fun SiteBrowserScreen(
         while (true) {
             val drained = generateSequence { queue.poll() }.toList()
             if (drained.isNotEmpty()) {
-                links = (links + drained).distinct()
+                links = (links + drained).distinctBy { it.url }
             }
             delay(400)
         }
@@ -165,7 +171,7 @@ fun SiteBrowserScreen(
                             request: WebResourceRequest,
                         ) = run {
                             val u = request.url.toString()
-                            if (StreamUrls.isMediaUrl(u)) queue.add(u)
+                            if (StreamUrls.isMediaUrl(u)) queue.add(capturedOf(u, request))
                             null
                         }
                     }
@@ -179,7 +185,9 @@ fun SiteBrowserScreen(
                         }
                     }
                     web = this
-                    loadUrl(startUrl)
+                    // 源站的解析端按来源域名放行，不带 Referer 会被当成陌生域名拒掉
+                    if (referer.isNullOrBlank()) loadUrl(startUrl)
+                    else loadUrl(startUrl, mapOf("Referer" to referer))
                 }
             },
             modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -198,22 +206,33 @@ fun SiteBrowserScreen(
                     fontSize = Fs.xs,
                     fontWeight = FontWeight.SemiBold,
                 )
-                links.take(3).forEach { u ->
+                links.take(3).forEach { c ->
                     val canHandOff = playing != null
                     Row(
                         Modifier.fillMaxWidth().clip(R.sm).background(T.Surface2)
                             .border(1.dp, T.Border, R.sm)
-                            .clickable(enabled = canHandOff) { vm.useSiteLink(u); onClose() }
+                            .clickable(enabled = canHandOff) { vm.useSiteLink(c.url, c.headers); onClose() }
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            u.substringBefore('?').substringAfterLast('/').take(28),
-                            color = T.Src400,
-                            fontSize = Fs.xs,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Box(Modifier.weight(1f))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                c.url.substringBefore('?').substringAfterLast('/').take(28)
+                                    .ifBlank { c.url.take(28) },
+                                color = T.Src400,
+                                fontSize = Fs.xs,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            // 让人看得出这条地址是哪个站给的 —— 挑的就是这个
+                            Text(
+                                runCatching { java.net.URI(c.url).host }.getOrNull() ?: c.url,
+                                color = T.TextFaint,
+                                fontSize = Fs.tiny,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Spacer8()
                         Text(
                             if (canHandOff) "播放" else "待播放",
                             color = if (canHandOff) T.Text else T.TextFaint,
@@ -225,4 +244,26 @@ fun SiteBrowserScreen(
             }
         }
     }
+}
+
+/** 接住的一条地址，连同它被请求时携带的条件。 */
+private data class Captured(val url: String, val headers: Map<String, String>)
+
+/**
+ * 把这次请求自带的 Referer / Cookie 一起留下。
+ *
+ * 解析页给出的地址常常只认「从我这个页面发出去的那次请求」——
+ * 只把 URL 抄给播放器会拿到 404（实测西瓜影院那条 m3u8 就是这样）。
+ * 这里不伪造任何东西，只是把浏览器本来就要发的头原样交给播放器。
+ */
+private fun capturedOf(url: String, request: WebResourceRequest): Captured {
+    val src = request.requestHeaders.orEmpty()
+    fun pick(name: String): String? =
+        src.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
+    val headers = buildMap {
+        pick("Referer")?.let { put("Referer", it) }
+        (pick("Cookie") ?: CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() })
+            ?.let { put("Cookie", it) }
+    }
+    return Captured(url, headers)
 }
