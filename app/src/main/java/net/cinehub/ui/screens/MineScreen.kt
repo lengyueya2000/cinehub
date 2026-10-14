@@ -47,7 +47,6 @@ import net.cinehub.data.model.SourceConfig
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.PosterCard
 import net.cinehub.ui.components.SectionHead
-import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.StatusDot
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
@@ -95,24 +94,16 @@ fun MineScreen(
 
     LazyColumn(
         Modifier.fillMaxSize().background(T.Bg),
-        contentPadding = PaddingValues(top = Sp.s2, bottom = Sp.s7),
+        // 这一页不再摆标题：底部导航那颗「我的」已经说明人在哪，顶部再来一遍只是占一屏
+        contentPadding = PaddingValues(top = Sp.s5, bottom = Sp.s7),
     ) {
-        item {
-            Column(Modifier.padding(horizontal = Sp.s4, vertical = Sp.s3)) {
-                Text("我的", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
-                Spacer4()
-                // 承载信息的文字一律 TextDim：TextFaint 在纯黑上只有 3.5:1，够不上正文门槛
-                Text("收藏、看过的与存下来的", color = T.TextDim, fontSize = Fs.xxs)
-            }
-        }
-
         // ---------- 收藏 ----------
         item {
             SectionHead(
                 "收藏",
                 trailing = if (favorites.isEmpty()) null else "全部 ›",
                 onTrailing = if (favorites.isEmpty()) null else onOpenFavorites,
-                modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s4, bottom = Sp.s2),
+                modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, bottom = Sp.s2),
             )
         }
         if (favorites.isEmpty()) {
