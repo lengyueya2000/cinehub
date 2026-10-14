@@ -9,12 +9,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -61,12 +63,15 @@ import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.components.ConfirmDialog
+import net.cinehub.ui.components.NumText
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
 import net.cinehub.ui.components.Spacer16
 import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.components.StatusDot
+import net.cinehub.ui.components.TextAction
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
@@ -86,6 +91,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val unreadable by vm.sourcesUnreadable.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
+    // 删源要过一道确认：凭证是用户自己填的，误删一次就得重新找、重新填
+    var pendingDelete by remember { mutableStateOf<SourceConfig?>(null) }
 
     // 界面上的顺序 = 优先级顺序。落盘那份不保证有序，所以这里自己排一次。
     // 必须是 derivedStateOf 而不是 remember(sources) 取到的那份 List：拖拽手势的回调块只在
@@ -345,7 +352,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                                 )
                             },
                             onToggle = { vm.toggleSource(cfg.id, it) },
-                            onDelete = { vm.deleteSource(cfg.id) },
+                            onDelete = { pendingDelete = cfg },
                             onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
                             onUp = if (i == 0) null else {
                                 {
@@ -373,6 +380,17 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     lineHeight = Fs.xxs * 1.7f,
                 )
             }
+        }
+
+        pendingDelete?.let { victim ->
+            ConfirmDialog(
+                title = "删除「${victim.name}」？",
+                body = "这个源的地址、接入方式和你自己填的凭证都会从本机抹掉，"
+                    + "用它的观看记录还在，但要再播得重新添加回来。",
+                confirm = "删除",
+                onConfirm = { vm.deleteSource(victim.id); pendingDelete = null },
+                onDismiss = { pendingDelete = null },
+            )
         }
 
         if (showAdd) {
@@ -445,7 +463,7 @@ private fun SourceRow(
         h == Health.Ok -> T.Src500.copy(alpha = .28f)
         else -> T.Border
     }
-    Row(
+    Column(
         Modifier.fillMaxWidth().clip(R.lg)
             .background(
                 when {
@@ -455,107 +473,93 @@ private fun SourceRow(
                 }
             )
             .border(1.dp, border, R.lg)
-            .padding(Sp.s3),
-        verticalAlignment = Alignment.Top,
+            .padding(end = Sp.s3),
     ) {
-        // 拖拽手柄单独占一格：整行都接手势会和右边的开关、删除抢事件，
-        // 而「按住这里拖」也比「不知道哪能拖」清楚。
-        Box(
-            grip.size(30.dp).clip(R.sm),
-            contentAlignment = Alignment.Center,
+        // ---------- 第一行：这个源能不能用 ----------
+        Row(
+            Modifier.padding(top = Sp.s1),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                Icons.Filled.DragIndicator,
-                "长按拖动排序",
-                tint = if (dragging) T.Src400 else T.TextFaint,
-                modifier = Modifier.size(16.dp),
-            )
-        }
-        Spacer8()
-        Box(
-            Modifier.size(40.dp).clip(RoundedCornerShape(12.dp))
-                .background(
-                    Brush.linearGradient(
-                        when (h) {
-                            Health.Down -> listOf(Color(0xFF64748B), Color(0xFF334155))
-                            Health.Ok -> listOf(Color(0xFF3B82F6), Color(0xFF1E3A8A))
-                            else -> listOf(Color(0xFFF59E0B), Color(0xFFB45309))
-                        }
-                    )
-                ),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                cfg.name.take(2),
-                color = Color.White,
-                fontSize = Fs.body,
-                fontWeight = FontWeight.ExtraBold,
-            )
-        }
-        Spacer12()
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(cfg.name, color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
-                if (cfg.priority == 1) {
-                    Spacer8()
-                    Pill("默认", cyan = true)
-                }
-                if (h == Health.Down) {
-                    Spacer8()
-                    Text(
-                        "连接失败",
-                        color = T.Err,
-                        fontSize = Fs.tiny,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clip(RoundedCornerShape(6.dp))
-                            .background(T.Err.copy(alpha = .10f))
-                            .border(1.dp, T.Err.copy(alpha = .30f), RoundedCornerShape(6.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
-                }
-            }
-            Spacer4()
-            Text(
-                cfg.baseUrl,
-                color = T.TextFaint,
-                fontSize = Fs.xxs,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer8()
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // 拖拽手柄单独占一格，而且给满 44dp：整行都接手势会和右边的开关、删除抢事件，
+            // 而「按住这里拖」也比「不知道哪能拖」清楚。
+            Box(
+                grip.size(44.dp).clip(R.sm),
+                contentAlignment = Alignment.Center,
             ) {
-                Pill(
-                    when (cfg.kind) {
-                        SourceKind.Html -> "网页解析"
-                        SourceKind.JsonApi -> "JSON 接口"
-                        SourceKind.M3u -> "M3U 列表"
-                        SourceKind.AiMovie -> "签名接口"
-                    },
-                    ghost = true,
+                Icon(
+                    Icons.Filled.DragIndicator,
+                    "长按拖动排序",
+                    tint = if (dragging) T.Src400 else T.TextFaint,
+                    modifier = Modifier.size(16.dp),
                 )
-                cfg.tags.take(1).forEach { Pill(it, cyan = true) }
-                if (h == Health.Down && report?.detail != null) {
-                    Text(
-                        report.detail!!.take(18),
-                        color = T.Err,
-                        fontSize = Fs.tiny,
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .weight(1f, fill = false)
-                            .clip(RoundedCornerShape(5.dp))
-                            .background(T.Err.copy(alpha = .08f))
-                            .padding(horizontal = 6.dp, vertical = 3.dp),
-                    )
-                }
             }
-        }
-        Column(horizontalAlignment = Alignment.End) {
+            Box(
+                Modifier.size(34.dp).clip(RoundedCornerShape(10.dp))
+                    .background(
+                        Brush.linearGradient(
+                            when (h) {
+                                Health.Down -> listOf(Color(0xFF64748B), Color(0xFF334155))
+                                Health.Ok -> listOf(Color(0xFF3B82F6), Color(0xFF1E3A8A))
+                                else -> listOf(Color(0xFFF59E0B), Color(0xFFB45309))
+                            }
+                        )
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    cfg.name.take(2),
+                    color = Color.White,
+                    fontSize = Fs.xs,
+                    fontWeight = FontWeight.ExtraBold,
+                )
+            }
+            Spacer(Modifier.width(Sp.s2))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        cfg.name,
+                        color = if (cfg.enabled) T.Text else T.TextDim,
+                        fontSize = Fs.body2,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (cfg.priority == 1 && cfg.enabled) {
+                        Spacer8()
+                        Pill("默认", cyan = true)
+                    }
+                }
+                Text(
+                    cfg.baseUrl,
+                    color = T.TextDim,
+                    fontSize = Fs.tiny,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            Spacer(Modifier.width(Sp.s2))
+            // 状态：圆点 + 字。只给个颜色的点，色弱和强光下等于没说
+            StatusDot(h, 6)
+            Spacer4()
+            NumText(
+                when (h) {
+                    Health.Ok -> "${report?.latencyMs ?: 0}ms"
+                    Health.Slow -> "${report?.latencyMs ?: 0}ms 较慢"
+                    Health.Down -> "不可用"
+                    Health.Unknown -> "未检测"
+                },
+                color = when (h) {
+                    Health.Ok -> T.Ok
+                    Health.Slow -> T.Warn
+                    Health.Down -> T.Err
+                    Health.Unknown -> T.TextDim
+                },
+                fontSize = Fs.xs,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.width(Sp.s2))
             Switch(
                 checked = cfg.enabled,
                 onCheckedChange = onToggle,
@@ -566,58 +570,47 @@ private fun SourceRow(
                     uncheckedTrackColor = T.Surface4,
                 ),
             )
-            Spacer4()
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                StatusDot(h, 5)
-                Spacer4()
-                Text(
-                    when (h) {
-                        Health.Ok -> "${report?.latencyMs ?: "-"}ms"
-                        Health.Slow -> "${report?.latencyMs ?: "-"}ms 较慢"
-                        Health.Down -> "不可用"
-                        Health.Unknown -> "未检测"
-                    },
-                    color = T.TextFaint,
-                    fontSize = Fs.tiny,
-                )
+        }
+        // ---------- 第二行：接入方式 + 这一行的动作 ----------
+        // 动作不做 14dp 的小图标：删源和「站点页取链」都是要点准的，撑到 44dp 才算可点
+        Row(
+            Modifier.padding(start = Sp.s1, top = Sp.s1, bottom = Sp.s1),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Pill(
+                when (cfg.kind) {
+                    SourceKind.Html -> "网页解析"
+                    SourceKind.JsonApi -> "JSON 接口"
+                    SourceKind.M3u -> "M3U 列表"
+                    SourceKind.AiMovie -> "签名接口"
+                },
+                ghost = true,
+            )
+            cfg.tags.take(1).forEach {
+                Spacer(Modifier.width(Sp.s1))
+                Pill(it, cyan = true)
             }
-            Spacer4()
-            Row {
-                // 「站点」= 在影枢里打开对方自己的页面。用户在这里登自己的账号，
-                // 凭证只留在本机 WebView 的 cookie 里 —— 影枢不代收账号密码。
-                Text(
-                    "站点",
-                    color = T.Src400,
-                    fontSize = Fs.tiny,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clip(R.sm)
-                        .border(1.dp, T.Src500.copy(alpha = .40f), R.sm)
-                        .clickable(onClick = onOpenSite)
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                )
-                Spacer8()
-                // 上一档是「↑」而不是刷新图标 —— 图标是「重新检测」那一层已经在用的，
-                // 同一个符号在一行里表示两件事，用户按下去之前猜不出来。
-                // 第一行没有可上的位置，就不摆一个按了没反应的按钮。
-                if (onUp != null) {
-                    Text(
-                        "↑ 上移",
-                        color = T.TextDim,
-                        fontSize = Fs.tiny,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clip(R.sm)
-                            .border(1.dp, T.Border, R.sm)
-                            .clickable(onClick = onUp)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
-                    Spacer8()
-                }
-                Icon(
-                    Icons.Filled.Delete, null,
-                    tint = T.TextFaint,
-                    modifier = Modifier.size(14.dp).clickable(onClick = onDelete),
-                )
+            Box(Modifier.weight(1f))
+            // 「站点」= 在影枢里打开对方自己的页面。用户在这里登自己的账号，
+            // 凭证只留在本机 WebView 的 cookie 里 —— 影枢不代收账号密码。
+            TextAction("站点", color = T.Src400, onClick = onOpenSite)
+            // 上一档是「上移」而不是刷新图标 —— 同一个符号在一行里表示两件事，
+            // 用户按下去之前猜不出来。第一行没有可上的位置，就不摆一个按了没反应的按钮。
+            if (onUp != null) {
+                TextAction("上移", onClick = onUp)
             }
+            TextAction("删除", color = T.Err, onClick = onDelete)
+        }
+        // 不可用的原因整句留在这里，不再截成 18 个字：
+        // 「拒绝访问」和「按地区放行」用户能做的决定不一样，后半句才是有用的那半句。
+        if (h == Health.Down && report?.detail != null) {
+            Text(
+                report.detail,
+                color = T.Err,
+                fontSize = Fs.xxs,
+                lineHeight = Fs.xxs * 1.6f,
+                modifier = Modifier.padding(start = Sp.s1, bottom = Sp.s2),
+            )
         }
     }
 }

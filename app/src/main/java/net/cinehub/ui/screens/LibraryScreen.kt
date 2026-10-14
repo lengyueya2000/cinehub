@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -38,10 +40,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import coil.compose.AsyncImage
 import androidx.compose.ui.unit.dp
 import net.cinehub.data.model.DoubanChart
 import net.cinehub.data.model.DoubanItem
@@ -54,6 +58,15 @@ import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
+import net.cinehub.ui.components.ConfirmDialog
+import net.cinehub.ui.components.EmptyState
+import net.cinehub.ui.components.GroupCard
+import net.cinehub.ui.components.HeaderAction
+import net.cinehub.ui.components.NumText
+import net.cinehub.ui.components.Spacer12
+import net.cinehub.ui.components.SectionLabel
+import net.cinehub.ui.components.SubHeader
+import net.cinehub.ui.components.TextAction
 import net.cinehub.ui.theme.T
 
 /**
@@ -270,57 +283,110 @@ fun DownloadsScreen(vm: AppViewModel) {
     val tasks by vm.downloads.collectAsState()
     val space by vm.downloadSpace.collectAsState()
     val speeds by vm.downloadSpeed.collectAsState()
+    // 删一条 = 连文件一起没，重下要重新解析直链 —— 这一刀得先问一句
+    var pendingDelete by remember { mutableStateOf<DownloadTask?>(null) }
+    var confirmClean by remember { mutableStateOf(false) }
+
+    val done = tasks.filter { it.status == DownloadStatus.Done }
+    val failed = tasks.filter { it.status == DownloadStatus.Failed }
+    val active = tasks.filter {
+        it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued ||
+            it.status == DownloadStatus.Paused
+    }
+    val newestFirst: List<DownloadTask>.() -> List<DownloadTask> = { sortedByDescending { it.createdAt } }
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {
-        Box(Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s3)) {
-            Column {
-                Text("下载", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
-                Spacer4()
-                Text(
-                    if (tasks.isEmpty()) "还没有缓存任何内容"
-                    else "${tasks.count { it.status == DownloadStatus.Done }} / ${tasks.size} 完成 · 共 ${fmtBytes(space)}",
-                    color = T.TextFaint,
-                    fontSize = Fs.xxs,
-                )
-            }
-        }
+        SubHeader(
+            title = "下载",
+            sub = when {
+                tasks.isEmpty() -> "还没有缓存任何内容"
+                done.isEmpty() -> "${active.size + failed.size} 个任务 · 已占 ${fmtBytes(space)}"
+                else -> "${done.size} 集可离线 · 共 ${fmtBytes(space)}"
+            },
+            action = if (done.isNotEmpty()) {
+                { HeaderAction("清理已缓存", danger = true) { confirmClean = true } }
+            } else {
+                null
+            },
+        )
 
         if (tasks.isEmpty()) {
-            Box(
-                Modifier.fillMaxSize().padding(Sp.s6),
-                contentAlignment = androidx.compose.ui.Alignment.Center,
-            ) {
-                Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
-                    Text("没有离线内容", color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
-                    Spacer8()
-                    Text(
-                        "在详情页点「缓存」，或在播放器里点「缓存」，就能把这一集存到本机；" +
-                            "存下来之后不联网也能播。\n" +
-                            "文件放在应用自己的目录里，卸载应用就会一并清掉。",
-                        color = T.TextDim,
-                        fontSize = Fs.xs,
-                        lineHeight = Fs.xs * 1.7f,
-                    )
-                }
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                EmptyState(
+                    title = "没有离线内容",
+                    body = "在详情页点「缓存」，或在播放器里点「缓存」，就能把这一集存到本机；" +
+                        "存下来之后不联网也能播。\n文件放在应用自己的目录里，卸载应用就会一并清掉。",
+                )
             }
-        } else {
-            LazyColumn(
-                Modifier.fillMaxSize().padding(horizontal = Sp.s4),
-                verticalArrangement = Arrangement.spacedBy(Sp.s3),
-                contentPadding = PaddingValues(bottom = Sp.s6),
-            ) {
-                items(tasks.sortedByDescending { it.createdAt }) { t ->
+            return@Column
+        }
+
+        // 分三段而不是按时间混排：「还要等多久」和「已经能看了」是两种完全不同的来意，
+        // 混在一起时用户得逐条读状态才知道有没有能播的。
+        LazyColumn(contentPadding = PaddingValues(bottom = Sp.s7)) {
+            if (active.isNotEmpty()) {
+                item { SectionLabel("进行中") }
+                items(active.newestFirst(), key = { it.id }) { t ->
                     DownloadCard(
-                        task = t,
-                        speed = speeds[t.id] ?: 0L,
+                        task = t, speed = speeds[t.id] ?: 0L,
                         onPlay = { vm.playCached(t) },
                         onPause = { vm.pauseDownload(t.id) },
                         onResume = { vm.resumeDownload(t.id) },
-                        onDelete = { vm.deleteDownload(t.id) },
+                        onDelete = { pendingDelete = t },
+                    )
+                }
+            }
+            if (done.isNotEmpty()) {
+                item { SectionLabel("已缓存 · 不联网也能播") }
+                items(done.newestFirst(), key = { it.id }) { t ->
+                    DownloadCard(
+                        task = t, speed = 0L,
+                        onPlay = { vm.playCached(t) },
+                        onPause = {}, onResume = {},
+                        onDelete = { pendingDelete = t },
+                    )
+                }
+            }
+            if (failed.isNotEmpty()) {
+                item { SectionLabel("失败") }
+                items(failed.newestFirst(), key = { it.id }) { t ->
+                    DownloadCard(
+                        task = t, speed = 0L,
+                        onPlay = {}, onPause = {},
+                        onResume = { vm.resumeDownload(t.id) },
+                        onDelete = { pendingDelete = t },
                     )
                 }
             }
         }
+    }
+
+    pendingDelete?.let { t ->
+        ConfirmDialog(
+            title = "删除「${t.mediaTitle} · ${t.episodeName}」？",
+            body = when (t.status) {
+                DownloadStatus.Done -> "已缓存的文件会一起删掉（${fmtBytes(t.bytesTotal)}），" +
+                    "要再看就得重新缓存一遍。"
+                DownloadStatus.Running, DownloadStatus.Queued, DownloadStatus.Paused ->
+                    "已经下好的 ${fmtBytes(t.bytesDone)} 会一起没掉，重新缓存得从头再取。"
+                else -> "这条记录和它已下载的部分都会删掉。"
+            },
+            confirm = "删除",
+            onConfirm = { vm.deleteDownload(t.id); pendingDelete = null },
+            onDismiss = { pendingDelete = null },
+        )
+    }
+    if (confirmClean) {
+        ConfirmDialog(
+            title = "清理 ${done.size} 集已缓存？",
+            body = "只删已经下完的，进行中的任务不动。清完这一批要再看就得重新缓存。",
+            confirm = "全部清理",
+            onConfirm = {
+                done.forEach { vm.deleteDownload(it.id) }
+                confirmClean = false
+            },
+            onDismiss = { confirmClean = false },
+        )
     }
 }
 
@@ -334,110 +400,105 @@ private fun DownloadCard(
     onDelete: () -> Unit,
 ) {
     val running = task.status == DownloadStatus.Running || task.status == DownloadStatus.Queued
+    val failed = task.status == DownloadStatus.Failed
     Column(
-        Modifier.fillMaxWidth().clip(R.md).background(T.Surface2)
-            .border(1.dp, T.Border, R.md).padding(Sp.s3),
+        Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s1)
+            .clip(R.lg).background(T.Surface2)
+            .border(1.dp, if (failed) T.Err.copy(alpha = .26f) else T.Border, R.lg)
+            .padding(Sp.s3),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "${task.mediaTitle} · ${task.episodeName}",
-                color = T.Text,
-                fontSize = Fs.sm,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
+        Row {
+            // 封面是网络图：离线或源站撤图时加载不出来，留灰底占位，
+            // 不拿空白冒充「这一条没有图」
+            Box(
+                Modifier.width(40.dp).height(56.dp).clip(R.sm).background(T.Surface3),
+            ) {
+                if (!task.mediaCover.isNullOrBlank()) {
+                    AsyncImage(
+                        model = task.mediaCover, contentDescription = null,
+                        contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
             Spacer8()
-            Text(
-                when (task.status) {
-                    DownloadStatus.Done -> "可离线播放"
-                    DownloadStatus.Failed -> "失败"
-                    DownloadStatus.Paused -> "已暂停"
-                    DownloadStatus.Queued -> "排队中"
-                    // 百分比在下面那行和小字一起报，这里只说状态，不重复一个数
-                    DownloadStatus.Running -> "下载中"
-                },
-                color = when (task.status) {
-                    DownloadStatus.Done -> T.Ok
-                    DownloadStatus.Failed -> T.Err
-                    else -> T.Warn
-                },
-                fontSize = Fs.xxs,
-                fontWeight = FontWeight.Bold,
-            )
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${task.mediaTitle} · ${task.episodeName}",
+                        color = T.Text,
+                        fontSize = Fs.body2,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer8()
+                    NumText(
+                        when (task.status) {
+                            DownloadStatus.Done -> "可离线播放"
+                            DownloadStatus.Failed -> "失败"
+                            DownloadStatus.Paused -> "已暂停"
+                            DownloadStatus.Queued -> "排队中"
+                            // 百分比在下面那行报，这里只说状态，不重复一个数
+                            DownloadStatus.Running -> "下载中"
+                        },
+                        color = when (task.status) {
+                            DownloadStatus.Done -> T.Ok
+                            DownloadStatus.Failed -> T.Err
+                            else -> T.Warn
+                        },
+                        fontSize = Fs.xxs,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Spacer4()
+                Text(
+                    when {
+                        task.status != DownloadStatus.Done && task.status != DownloadStatus.Failed ->
+                            "${task.sourceName} · ${downloadStatsLine(task, speed)}"
+                        task.status == DownloadStatus.Done ->
+                            "${task.sourceName} · 实占 ${fmtBytes(task.bytesTotal)}"
+                        else -> task.sourceName
+                    },
+                    color = T.TextDim,
+                    fontSize = Fs.xxs,
+                )
+                if (task.status != DownloadStatus.Done && !failed) {
+                    Spacer4()
+                    Box(
+                        Modifier.fillMaxWidth().height(3.dp).clip(R.full)
+                            .background(Color.White.copy(alpha = .12f)),
+                    ) {
+                        Box(
+                            Modifier.fillMaxWidth(task.progress).fillMaxHeight().clip(R.full)
+                                .background(Brush.horizontalGradient(listOf(T.Play400, T.Play500))),
+                        )
+                    }
+                }
+                // 失败原因整句留着：它决定用户是「换一条线路」还是「换个源」
+                task.error?.let {
+                    Spacer4()
+                    Text(
+                        it,
+                        color = T.Err,
+                        fontSize = Fs.xxs,
+                        lineHeight = Fs.xxs * 1.6f,
+                    )
+                }
+            }
         }
         Spacer4()
-        Text(
-            task.sourceName,
-            color = T.TextFaint,
-            fontSize = Fs.tiny,
-        )
-
-        if (task.status != DownloadStatus.Done && task.status != DownloadStatus.Failed) {
-            Spacer8()
-            Box(
-                Modifier.fillMaxWidth().height(4.dp).clip(R.full)
-                    .background(Color.White.copy(alpha = .12f)),
-            ) {
-                Box(
-                    Modifier.fillMaxWidth(task.progress).fillMaxHeight().clip(R.full)
-                        .background(Brush.horizontalGradient(listOf(T.Play400, T.Play500))),
-                )
-            }
-            Spacer4()
-            // 报的是「下了多少 / 一共多大 / 现在多快」。分片个数不显示 ——
-            // 用户要判断的是还要等多久，字节和速度够回答，分片数只是实现细节。
-            Text(
-                downloadStatsLine(task, speed),
-                color = T.TextFaint,
-                fontSize = Fs.tiny,
-            )
-        }
-
-        // 下完了也把实际落盘的大小留着：删不删之前总得知道它占了多少
-        if (task.status == DownloadStatus.Done && task.bytesTotal > 0) {
-            Spacer4()
-            Text("已缓存 ${fmtBytes(task.bytesTotal)}", color = T.TextFaint, fontSize = Fs.tiny)
-        }
-
-        task.error?.let {
-            Spacer8()
-            Text(
-                it,
-                color = T.Err,
-                fontSize = Fs.xxs,
-                lineHeight = Fs.xxs * 1.6f,
-            )
-        }
-
-        Spacer8()
-        Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
             if (task.status == DownloadStatus.Done) {
-                DownloadAction("播放", T.Play400, onPlay)
+                TextAction("播放", color = T.Play400, filled = true, onClick = onPlay)
             }
-            if (running) DownloadAction("暂停", T.TextDim, onPause)
-            if (task.status == DownloadStatus.Paused || task.status == DownloadStatus.Failed) {
-                DownloadAction("继续", T.Play400, onResume)
+            if (running) TextAction("暂停", onClick = onPause)
+            if (task.status == DownloadStatus.Paused || failed) {
+                TextAction(if (failed) "重试" else "继续", color = T.Play400, onClick = onResume)
             }
-            Box(Modifier.weight(1f))
-            DownloadAction("删除", T.TextFaint, onDelete)
+            TextAction("删除", color = T.Err, onClick = onDelete)
         }
     }
-}
-
-@Composable
-private fun DownloadAction(label: String, color: Color, onClick: () -> Unit) {
-    Text(
-        label,
-        color = color,
-        fontSize = Fs.xs,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier.clip(R.sm)
-            .border(1.dp, color.copy(alpha = .35f), R.sm)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 5.dp),
-    )
 }
 
 /**
@@ -475,6 +536,9 @@ private fun fmtBytes(b: Long): String {
  *
  * 并发数单独放一页而不是塞在下载页顶部：它说的是「接下来怎么下」，
  * 和某一条任务的操作不是一回事，混在一起会看不清改了它到底影响谁。
+ *
+ * 之前这一页是三段散文配四个圆片，读起来像说明书。改成分组列表后
+ * 每个设置一行：标题说要调什么，helper 说代价，选择器就在下面。
  */
 @Composable
 fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
@@ -484,63 +548,109 @@ fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
     val inFlight = tasks.count { it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued }
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s2),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                Modifier.size(28.dp).clip(CircleShape).clickable(onClick = onBack),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Filled.ArrowBack, "返回", tint = T.Text, modifier = Modifier.size(19.dp))
-            }
-            Spacer8()
-            Column(Modifier.weight(1f)) {
-                Text("下载设置", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
+        SubHeader("下载设置", "只影响下一个开始的任务", onBack)
+
+        SectionLabel("速度")
+        GroupCard {
+            Column(Modifier.padding(Sp.s4)) {
+                Text("同时取几个分片", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
                 Spacer4()
-                Text("${tasks.size} 个任务 · 共占 ${fmtBytes(space)}", color = T.TextFaint, fontSize = Fs.xxs)
+                Text(
+                    "缓存一集时会同时开几条连接去取它切片。越多越快，" +
+                        "但片源的 CDN 也可能把高频请求当成爬虫拦掉。",
+                    color = T.TextDim,
+                    fontSize = Fs.xs,
+                    lineHeight = Fs.xs * 1.7f,
+                )
+                Spacer12()
+                // 这个数字得说全：一档是「每一集」各开这么多，不是全局共用。
+                // 用户按 8 路想的是「总共 8 条连接」，实际会看到 24 条 —— 说错方向
+                // 就等于把这页劝退的话（「容易被拦」）指到了不存在的地方。
+                Segmented(
+                    options = listOf(1, 2, 4, 8),
+                    selected = parallel,
+                    label = { "$it 路" },
+                    onSelect = { vm.setSegParallel(it) },
+                )
+                Spacer8()
+                Text(
+                    "最多同时缓存 3 集，所以这一档是每集各开：调到 8 路时总共会有 24 条连接在飞。",
+                    color = T.TextDim,
+                    fontSize = Fs.xs,
+                    lineHeight = Fs.xs * 1.7f,
+                )
             }
         }
 
-        Spacer8()
-        Column(Modifier.padding(horizontal = Sp.s4)) {
-            Text("同时取几个分片", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
-            Spacer4()
-            Text(
-                "缓存一集时会同时开几条连接去取它切片。越多越快，" +
-                    "但片源的 CDN 也可能把高频请求当成爬虫拦掉。",
-                color = T.TextDim,
-                fontSize = Fs.xs,
-                lineHeight = Fs.xs * 1.7f,
-            )
-            Spacer4()
-            // 这个数字得说全：一档是「每一集」各开这么多，不是全局共用。
-            // 用户按 8 路想的是「总共 8 条连接」，实际会看到 24 条 —— 说错方向
-            // 就等于把这页劝退的话（「容易被拦」）指到了不存在的地方。
-            Text(
-                "最多同时缓存 3 集，所以这一档是每集各开：调到 8 路时总共会有 24 条连接在飞。",
-                color = T.TextFaint,
-                fontSize = Fs.xs,
-                lineHeight = Fs.xs * 1.7f,
-            )
-
-            Spacer8()
-            Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                listOf(1, 2, 4, 8).forEach { n ->
-                    Chip("$n 路", parallel == n) { vm.setSegParallel(n) }
+        SectionLabel("本机内容")
+        GroupCard {
+            Row(
+                Modifier.fillMaxWidth().padding(Sp.s4),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("已占用", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "${tasks.size} 个任务 · 文件在应用自己的目录里，卸载应用会一并清掉",
+                        color = T.TextDim,
+                        fontSize = Fs.xs,
+                        lineHeight = Fs.xs * 1.6f,
+                        modifier = Modifier.padding(top = 3.dp),
+                    )
                 }
+                Spacer8()
+                NumText(fmtBytes(space), color = T.TextDim, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
             }
-            Spacer8()
-            Text(
-                when {
-                    inFlight > 0 -> "现在正有 $inFlight 个任务在下：改动不会作用到它们身上，" +
-                        "要等这条结束后新开始的才会按 $parallel 路取。"
-                    else -> "改动从下一个开始的任务生效，正在下的不受影响。"
-                } + if (parallel == 8) " 8 路是最快的一档，也最容易被片源拒绝。" else "",
-                color = T.TextFaint,
-                fontSize = Fs.xs,
-                lineHeight = Fs.xs * 1.7f,
-            )
+        }
+
+        Text(
+            when {
+                inFlight > 0 -> "现在正有 $inFlight 个任务在下：改动不会作用到它们身上，" +
+                    "要等这条结束后新开始的才会按 $parallel 路取。"
+                else -> "改动从下一个开始的任务生效，正在下的不受影响。"
+            } + if (parallel == 8) " 8 路是最快的一档，也最容易被片源拒绝。" else "",
+            color = T.TextDim,
+            fontSize = Fs.xs,
+            lineHeight = Fs.xs * 1.7f,
+            modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s4),
+        )
+    }
+}
+
+/** 一排互斥选项。整块高度 44dp，不是只有那行字能点。 */
+@Composable
+private fun Segmented(
+    options: List<Int>,
+    selected: Int,
+    label: (Int) -> String,
+    onSelect: (Int) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(R.md)
+            .background(Color.White.copy(alpha = .05f))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        options.forEach { n ->
+            val on = n == selected
+            Box(
+                Modifier.weight(1f).heightIn(min = 44.dp)
+                    .clip(R.sm)
+                    .background(
+                        if (on) Brush.verticalGradient(listOf(T.Play400, T.Play500))
+                        else Brush.verticalGradient(listOf(Color.Transparent, Color.Transparent))
+                    )
+                    .clickable { onSelect(n) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label(n),
+                    color = if (on) Color.White else T.TextDim,
+                    fontSize = Fs.xs,
+                    fontWeight = if (on) FontWeight.Bold else FontWeight.Normal,
+                )
+            }
         }
     }
 }

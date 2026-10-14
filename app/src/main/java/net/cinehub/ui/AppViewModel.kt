@@ -883,7 +883,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val now = System.currentTimeMillis()
         if (now - lastRecordAt >= 10_000L) {
             lastRecordAt = now
-            recordWatch(sec, dur)
+            // 写 lastDurationSec 而不是这一次上报的 dur：换集刚起播那几秒 Media3 常常
+            // 只有位置、还没有时长（TIME_UNSET 归 0），拿 dur 写就等于把记录里已经存好的
+            // 时长冲成 0 —— 而「看完没看完」「还剩多少」全是拿时长算的。
+            recordWatch(sec, lastDurationSec)
         }
     }
 
