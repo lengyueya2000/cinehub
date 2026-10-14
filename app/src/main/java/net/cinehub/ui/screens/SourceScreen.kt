@@ -374,8 +374,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                 Spacer16()
                 Text(
                     "关于「重渲染」：影枢不套用源站页面，而是把抓取到的内容归一化成自己的数据模型，" +
-                        "由本机播放器渲染画面。源的直链如果需要你本人的站点账号，请在添加源时填入你自己的凭证 —— " +
-                        "影枢只转发凭证，不代为登录。",
+                        "由本机播放器渲染画面。源的直链如果需要你本人的站点账号，" +
+                        "请在添加源时填入你自己的凭证，影枢带着它去请求。",
                     color = T.TextFaint,
                     fontSize = Fs.xxs,
                     lineHeight = Fs.xxs * 1.7f,

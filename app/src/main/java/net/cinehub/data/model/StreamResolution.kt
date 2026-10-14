@@ -47,8 +47,8 @@ fun StreamResolution.userNote(): String? = when (this) {
             "影枢就能打开源站那一页、在旁边接住它请求的流。"
 
     is StreamResolution.NeedsSession ->
-        "直链只对登录用户开放，影枢不代为登录。" +
-            "可以在「播放源管理」里填入你自己的站点凭证，让影枢只做转发。"
+        "直链只对登录用户开放。" +
+            "可以在「播放源管理」里填入你自己的站点凭证（Cookie / token），影枢带着它去请求。"
 
     is StreamResolution.NeedsClientScript ->
         "直链地址由源站页面里的脚本现算（带签名），不执行它的脚本就构造不出请求。" +

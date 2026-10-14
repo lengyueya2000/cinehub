@@ -101,7 +101,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
         }
     }
 
-    /** 建匿名会话：站点自己的未登录访客流程，影枢不代为登录任何人的账号。 */
+    /** 建匿名会话：站点自己的未登录访客流程，用的是站点发给本机的这一份会话。 */
     private suspend fun ensureSession() {
         if (sessionCookie != null) return
         quietly {

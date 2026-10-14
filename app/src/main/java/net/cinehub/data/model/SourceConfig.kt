@@ -135,8 +135,8 @@ data class HtmlRules(
         /**
          * 直链只对登录用户开放。
          *
-         * 影枢不代为登录，但会提示用户可以在源配置里填**自己的**站点凭证
-         * （`authToken` + `authMode`），凭证只做转发。
+         * 界面上提示用户可以在源配置里填**自己的**站点凭证（`authToken` + `authMode`），
+         * 请求时带着它走。
          */
         const val MODE_SESSION = "session"
     }

@@ -30,10 +30,9 @@ object Http {
             "Chrome/120.0.0.0 Mobile Safari/537.36"
 
     /**
-     * 按源配置生成鉴权头。
+     * 按源配置生成鉴权头：把用户在源配置里填的那份凭证带上。
      *
-     * 影枢只转发用户自己填的凭证，不代替用户登录 ——
-     * 能看什么取决于用户在该站自己拥有的权限。
+     * 能看什么取决于这份凭证在该站有什么权限。
      */
     fun authHeaders(cfg: net.cinehub.data.model.SourceConfig): Map<String, String> {
         val token = cfg.authToken?.takeIf { it.isNotBlank() } ?: return emptyMap()
