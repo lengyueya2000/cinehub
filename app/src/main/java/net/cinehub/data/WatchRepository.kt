@@ -128,14 +128,19 @@ class WatchRepository(private val context: Context) {
         }
     }
 
+    /**
+     * 落一次盘。
+     *
+     * 和 [DownloadRepository.saveNow] 同一个坑：内存那份要在 `edit` 的变换里取。
+     * 启动写之前抓快照，两次写的落地顺序没有保证，后落地的可能正是那一份**旧的** ——
+     * 用户刚点的收藏、刚续的那一集就被盖回去了。
+     */
     private fun snapshot() {
-        val fav = _favorites.value
-        val his = _history.value
         scope.launch {
             runCatching {
                 context.watchStore.edit {
-                    it[KEY_FAV] = json.encodeToString(fav)
-                    it[KEY_HIS] = json.encodeToString(his)
+                    it[KEY_FAV] = json.encodeToString(_favorites.value)
+                    it[KEY_HIS] = json.encodeToString(_history.value)
                 }
             }
         }

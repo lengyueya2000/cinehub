@@ -91,6 +91,7 @@ import kotlinx.coroutines.delay
 import net.cinehub.data.model.DownloadStatus
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Health
+import net.cinehub.playback.PlayerBuffering
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.Spacer8
@@ -136,9 +137,12 @@ fun PlayerScreen(
 ) {
     val ctx = LocalContext.current
     val playing by vm.playing.collectAsState()
-    val siblings by vm.siblings.collectAsState()
+    // 播放器读的是起播时快照的那两份：vm.detail / vm.siblings 是「详情页当前那一部」的状态，
+    // 从继续观看、搜索结果、缓存列表直接进播放器时它们可能还停在上一部 ——
+    // 于是选集、线路、换源三处列的都是别的片的东西。
+    val siblings by vm.playingSiblings.collectAsState()
     val health by vm.health.collectAsState()
-    val detail by vm.detail.collectAsState()
+    val detail by vm.playingDetail.collectAsState()
     val resumeFrom by vm.resumePosition.collectAsState()
     val resolving by vm.resolving.collectAsState()
 
@@ -170,39 +174,50 @@ fun PlayerScreen(
     // NaN = 用户还没碰过亮度，一次都不会去改窗口亮度
     var brightness by remember { mutableFloatStateOf(Float.NaN) }
 
+    // 带宽估计器：起始那一档保守一点（见 PlayerBuffering）。
+    // 它必须同时挂在播放器和数据源上 —— 只挂一边等于 ABR 永远停在初始值。
+    val bandwidth = remember { PlayerBuffering.bandwidthMeter(ctx) }
+
     val player = remember {
-        ExoPlayer.Builder(ctx).build().apply {
-            playWhenReady = true
-            addListener(object : Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    // BUFFERING / READY / ENDED —— 首帧渲染前 UI 要说清「在缓冲」，
-                    // 否则用户看到的就是一个不动的黑屏，像是点了没反应。
-                    buffering = state == Player.STATE_BUFFERING
-                }
+        // 缓冲的几档阈值集中在 PlayerBuffering，不在这里散着写
+        ExoPlayer.Builder(ctx)
+            .setLoadControl(PlayerBuffering.loadControl())
+            .setBandwidthMeter(bandwidth)
+            .build().apply {
+                playWhenReady = true
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        // BUFFERING / READY / ENDED —— 首帧渲染前 UI 要说清「在缓冲」，
+                        // 否则用户看到的就是一个不动的黑屏，像是点了没反应。
+                        buffering = state == Player.STATE_BUFFERING
+                    }
 
-                override fun onPlayWhenReadyChanged(
-                    playWhenReady: Boolean,
-                    reason: Int,
-                ) {
-                    // 自动暂停（缓冲上限、失去音频焦点）也会走到这里，比在点击回调里手动翻状态可靠
-                    wantsPlay = playWhenReady
-                }
+                    override fun onPlayWhenReadyChanged(
+                        playWhenReady: Boolean,
+                        reason: Int,
+                    ) {
+                        // 自动暂停（缓冲上限、失去音频焦点）也会走到这里，比在点击回调里手动翻状态可靠
+                        wantsPlay = playWhenReady
+                    }
 
-                override fun onPlayerError(e: PlaybackException) {
-                    errText = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
-                }
-            })
-        }
+                    override fun onPlayerError(e: PlaybackException) {
+                        errText = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
+                    }
+                })
+            }
     }
 
     // 换源 / 换集时重建媒体源；用 resumeFrom 保证进度接续
     LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
         val url = playing?.streamUrl
-        player.stop()
-        player.clearMediaItems()
         errText = null
         buffering = true
-        if (url.isNullOrBlank()) return@LaunchedEffect
+        if (url.isNullOrBlank()) {
+            // 没有地址可播（解析失败、还在解析）—— 这时候才真的停
+            player.stop()
+            player.clearMediaItems()
+            return@LaunchedEffect
+        }
 
         // 站点的 CDN 会校验 Referer/Origin，段地址常常只在带 Referer 时才给内容。
         // 从站点页面接住的地址优先按它被请求时那套条件发 —— 再叠一层源站根地址的
@@ -225,6 +240,9 @@ fun PlayerScreen(
             .setDefaultRequestProperties(props)
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
+            // 另一半 wiring：测量是从这里流进带宽估计器的，漏掉这一行
+            // 播放器看到的就永远是那个初始值，码率再也不会跟着网络动
+            .setTransferListener(bandwidth)
 
         // 缓存好的片子是 file:// 地址，只挂 HTTP 数据源会读不到 —— 按 scheme 分派一层
         val data = androidx.media3.datasource.DefaultDataSource.Factory(
@@ -233,7 +251,7 @@ fun PlayerScreen(
         )
 
         val item = MediaItem.fromUri(url)
-        val source = if (url.contains(".m3u8", true)) {
+        val source = if (PlayerBuffering.isHlsUrl(url)) {
             // chunkless：不必先把整份 1 小时的分段列表拉完才起播
             HlsMediaSource.Factory(data)
                 .setAllowChunklessPreparation(true)
@@ -242,10 +260,13 @@ fun PlayerScreen(
             androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(data)
                 .createMediaSource(item)
         }
+        // 换集 / 换源走 setMediaSource，不走 stop()：stop 会把带宽估计一起清零，
+        // 于是每换一集都要从第一档重新试一遍码率 —— 用户看到的正是「每集开头都要卡几秒」。
+        // 估计留着，起播就直接落到上一集已经量出来的那一档。
         player.setMediaSource(source)
         player.prepare()
-        // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 上面 player.stop() 之后
-        // 轮询会把那个活值写成 0，这里再读就等于放弃续播。
+        // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 轮询会把那个活值写成 0，
+        // 这里再读就等于放弃续播。
         val from = playing?.resumeFrom ?: 0L
         if (from > 0) player.seekTo(from * 1000)
         player.play()
@@ -273,9 +294,12 @@ fun PlayerScreen(
     LaunchedEffect(speed) { player.setPlaybackSpeed(speed) }
 
     LaunchedEffect(maxVideoHeight) {
-        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .setMaxVideoSize(Int.MAX_VALUE, if (maxVideoHeight > 0) maxVideoHeight else Int.MAX_VALUE)
-            .build()
+        // 走 PlayerBuffering 那一份，别在这里另写一套 setMaxVideoSize ——
+        // 两处各改各的，早晚会有一处把用户手选的画质档冲掉
+        player.trackSelectionParameters = PlayerBuffering.clampToUserChoice(
+            player.trackSelectionParameters,
+            maxVideoHeight,
+        )
     }
 
     LaunchedEffect(hint) {
@@ -387,6 +411,12 @@ fun PlayerScreen(
             episodeUrl = e.playUrl,
             resumeFrom = keepPos,
             mediaId = p.mediaId,
+            // 这几样必须跟着换集一起传下去：观看记录是按 mediaKey 写的，
+            // 少传就等于「从第二集开始，看到哪儿都不再记」—— 换完集退出再进来，
+            // 进度还停在第一集，而且一点报错都没有。
+            mediaKey = p.mediaKey,
+            mediaYear = p.mediaYear,
+            mediaCover = p.mediaCover,
         )
     }
 
@@ -404,9 +434,15 @@ fun PlayerScreen(
         controls = true; lastUi = System.currentTimeMillis()
     }
 
-    // 系统返回键：浮层开着先关浮层，其次退全屏，最后离开播放器
-    BackHandler(enabled = panel != null) { panel = null }
-    BackHandler(enabled = fullscreen && panel == null) { fullscreen = false }
+    // 系统返回键与左上角那颗箭头走同一个判断，见 goBack()
+    fun goBack() {
+        when {
+            panel != null -> panel = null
+            fullscreen -> fullscreen = false
+            else -> onBack()
+        }
+    }
+    BackHandler { goBack() }
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -497,7 +533,8 @@ fun PlayerScreen(
                 ) {
                     Box(
                         Modifier.size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = .42f))
-                            .clickable(onClick = onBack),
+                            // 和系统返回键同一套判断：全屏 + 面板开着时，这颗不该直接把人甩出播放器
+                            .clickable { goBack() },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(Icons.Filled.ArrowBack, null, tint = Color.White, modifier = Modifier.size(17.dp))

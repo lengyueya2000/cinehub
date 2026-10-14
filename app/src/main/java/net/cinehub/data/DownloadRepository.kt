@@ -1021,10 +1021,21 @@ class DownloadRepository(
         }
     }
 
+    /**
+     * 整份覆盖写。
+     *
+     * 内存那份必须在 `edit` 的变换里取，不能在启动这次写之前抓：
+     * 两次写谁先落地是不一定的，抓在手里的旧快照后落地，就会把中间那笔刚写好的盖掉 ——
+     * 表现是进度条明明涨上去了，过一会儿又掉回前一个数。
+     * 内存是唯一事实来源（`patch` 同步改它），事务里读到的自然是当下这一份。
+     */
     private fun saveNow() {
         lastSaveAt = System.currentTimeMillis()
-        val snapshot = _tasks.value
-        scope.launch { runCatching { context.downloadStore.edit { it[KEY] = json.encodeToString(snapshot) } } }
+        scope.launch {
+            runCatching {
+                context.downloadStore.edit { it[KEY] = json.encodeToString(_tasks.value) }
+            }
+        }
     }
 
     private suspend fun load() {

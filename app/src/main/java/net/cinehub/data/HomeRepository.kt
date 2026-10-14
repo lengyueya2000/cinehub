@@ -102,7 +102,7 @@ class HomeRepository(private val context: Context) {
     }
 
     init {
-        scope.launch { runCatching { load() } }
+        scope.launch { load() }
     }
 
     suspend fun save(items: List<Media>, sourceId: String, fingerprint: String) {
@@ -118,12 +118,23 @@ class HomeRepository(private val context: Context) {
         runCatching { context.homeStore.edit { it[KEY] = text } }
     }
 
+    /**
+     * 读盘上那份。
+     *
+     * 整条路都允许失败（DataStore 读不动、那份是半个 JSON、版本对不上），
+     * 但 [_ready] 必须在 finally 里翻转：调用方是「等读完再决定要不要联网」，
+     * 而读失败时「没有快照」正是它要的那个答案 —— 闩锁卡住，首页就永远停在空白，
+     * 连一个「点一下重试」的入口都出不来。
+     */
     private suspend fun load() {
-        val raw = context.homeStore.data.map { it[KEY] }.first()
-        if (!raw.isNullOrBlank()) {
-            cached = runCatching { json.decodeFromString<Snapshot>(raw) }.getOrNull()
+        try {
+            val raw = runCatching { context.homeStore.data.map { it[KEY] }.first() }.getOrNull()
+            if (!raw.isNullOrBlank()) {
+                cached = runCatching { json.decodeFromString<Snapshot>(raw) }.getOrNull()
+            }
+        } finally {
+            _ready.value = true
         }
-        _ready.value = true
     }
 
     companion object {

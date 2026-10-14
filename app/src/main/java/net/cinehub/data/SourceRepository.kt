@@ -40,12 +40,16 @@ class SourceRepository(private val context: Context) {
     private val _unreadable = MutableStateFlow(false)
     val unreadable: StateFlow<Boolean> = _unreadable.asStateFlow()
 
+    /** 盘上那份解出来的列表；第二个成员是「有内容但这一版解不通」。 */
+    private fun decode(raw: String?): Pair<List<SourceConfig>?, Boolean> {
+        if (raw.isNullOrBlank()) return null to false
+        val list = runCatching { json.decodeFromString<List<SourceConfig>>(raw) }.getOrNull()
+        return list to (list == null)
+    }
+
     val sources: Flow<List<SourceConfig>> = context.dataStore.data.map { p ->
-        val raw = p[KEY]
-        val stored = raw?.takeIf { it.isNotBlank() }?.let {
-            runCatching { json.decodeFromString<List<SourceConfig>>(it) }.getOrNull()
-        }
-        _unreadable.value = raw.isNullOrBlank().not() && stored == null
+        val (stored, unreadable) = decode(p[KEY])
+        _unreadable.value = unreadable
         // 已经撤掉的内置源不能因为「老用户的列表里还留着这一条」就继续冒出来；
         // 用户自己加的源 id 形如 src_xxx，落不到 retiredIds 里，不受影响。
         val list = (stored ?: lastGood ?: Seed.sources).filterNot { it.id in Seed.retiredIds }
@@ -59,24 +63,46 @@ class SourceRepository(private val context: Context) {
 
     suspend fun all(): List<SourceConfig> = sources.first().sortedBy { it.priority }
 
-    suspend fun upsert(cfg: SourceConfig) {
-        val cur = sources.first().toMutableList()
+    /**
+     * 读—改—写整套放进 DataStore 的事务里。
+     *
+     * 以前是「先 `sources.first()` 读一份 → 在内存里改 → 整份覆盖写回去」，
+     * 三步之间没有任何东西挡着：连着拨两个开关、删除撞上拖拽排序、补回内置源撞上存新源，
+     * 后落地的那一笔都会带着它自己那份**旧**快照，把前一笔刚写进去的结果整个盖掉。
+     * 界面上就是「我明明删了它还在」「排好的顺序过一会儿自己变回去」，
+     * 而盘上确实被旧数据覆盖了 —— 不是显示没刷新。
+     *
+     * `edit { }` 里的变换由 DataStore 串行执行，读和写看到的是同一份，
+     * 所以改的起点是事务里那份，不是调用方手里那份。
+     */
+    private suspend fun mutate(f: (List<SourceConfig>) -> List<SourceConfig>) {
+        context.dataStore.edit { p ->
+            val raw = p[KEY]
+            val (stored, unreadable) = decode(raw)
+            val prev = stored ?: lastGood ?: Seed.sources
+            val next = f(prev.filterNot { it.id in Seed.retiredIds }).sortedBy { it.priority }
+            // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
+            // 而不是被「看起来正常」的新列表就地替换掉。
+            if (unreadable && !raw.isNullOrBlank()) p[BACKUP_KEY] = raw
+            p[KEY] = json.encodeToString(next)
+            lastGood = next
+        }
+    }
+
+    suspend fun upsert(cfg: SourceConfig) = mutate { cur ->
         val i = cur.indexOfFirst { it.id == cfg.id }
-        if (i >= 0) cur[i] = cfg else cur += cfg
-        write(cur)
+        if (i >= 0) cur.toMutableList().also { it[i] = cfg } else cur + cfg
     }
 
-    suspend fun delete(id: String) {
-        write(sources.first().filterNot { it.id == id })
+    suspend fun delete(id: String) = mutate { it.filterNot { s -> s.id == id } }
+
+    suspend fun setEnabled(id: String, enabled: Boolean) = mutate { l ->
+        l.map { if (it.id == id) it.copy(enabled = enabled) else it }
     }
 
-    suspend fun setEnabled(id: String, enabled: Boolean) {
-        write(sources.first().map { if (it.id == id) it.copy(enabled = enabled) else it })
-    }
-
-    suspend fun reorder(ids: List<String>) {
-        val cur = sources.first().associateBy { it.id }
-        write(ids.mapIndexedNotNull { i, id -> cur[id]?.copy(priority = i + 1) })
+    suspend fun reorder(ids: List<String>) = mutate { cur ->
+        val byId = cur.associateBy { it.id }
+        ids.mapIndexedNotNull { i, id -> byId[id]?.copy(priority = i + 1) }
     }
 
     /**
@@ -87,25 +113,14 @@ class SourceRepository(private val context: Context) {
      * 返回补回了几个，交给 UI 说清楚发生了什么。
      */
     suspend fun restoreDefaults(): Int {
-        val cur = sources.first().toMutableList()
-        val have = cur.map { it.id }.toSet()
-        val missing = Seed.sources.filter { it.id !in have }
-        write(cur + missing)
-        return missing.size
-    }
-
-    private suspend fun write(list: List<SourceConfig>) {
-        val sorted = list.sortedBy { it.priority }
-        val encoded = json.encodeToString(sorted)
-        context.dataStore.edit { p ->
-            val prev = p[KEY]
-            // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
-            // 而不是被「看起来正常」的新列表就地替换掉。
-            if (!prev.isNullOrBlank() && runCatching { json.decodeFromString<List<SourceConfig>>(prev) }
-                    .isFailure
-            ) p[BACKUP_KEY] = prev
-            p[KEY] = encoded
+        var added = 0
+        mutate { cur ->
+            val have = cur.map { it.id }.toSet()
+            val missing = Seed.sources.filter { it.id !in have }
+            added = missing.size
+            cur + missing
         }
+        return added
     }
 }
 
