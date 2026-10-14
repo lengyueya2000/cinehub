@@ -286,6 +286,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 详情页的「重新检测」。
+     *
+     * 不能只刷全局健康表：那一栏渲染的是打开详情那一刻定格的**本片跨源快照**，
+     * 每个芯片的毫秒数取的是快照里已经烤好的那份（siblingsOf 里 latencyMs 直接
+     * 从健康缓存抄走）。只刷健康表的话，探测真的跑了、表也真的变了，屏幕上一个字
+     * 都不动 —— 用户看到的就是「这个按钮没反应」。所以刷完健康表，紧接着把这部片
+     * 的跨源比对重跑一遍。
+     */
+    fun rescanDetail() {
+        val d = _detail.value
+        if (d == null) {
+            refreshHealth(true)
+            return
+        }
+        val mine = ++detailGen
+        detailJob?.cancel()
+        detailJob = viewModelScope.launch {
+            try {
+                _checking.value = true
+                _health.value = mediaRepo.healthAll(force = true)
+                if (mine != detailGen) return@launch
+                val s = mediaRepo.siblingsOf(d.media)
+                if (mine != detailGen) return@launch
+                _siblingFailures.value = s.failures
+                // 当前这个源仍排第一：那一栏的次序就是「你正在用哪个源」的次序
+                val act = _activeSourceId.value
+                _siblings.value = s.items.sortedByDescending { it.sourceId == act }
+                _siblingsOf = d.media.key
+            } finally {
+                _checking.value = false
+            }
+        }
+    }
+
     fun toggleSource(id: String, enabled: Boolean) = viewModelScope.launch {
         sourceRepo.setEnabled(id, enabled)
     }

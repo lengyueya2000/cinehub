@@ -96,6 +96,7 @@ fun DetailScreen(
     val siblingFailures by vm.siblingFailures.collectAsState()
     val activeSourceId by vm.activeSourceId.collectAsState()
     val health by vm.health.collectAsState()
+    val checking by vm.checking.collectAsState()
     val downloads by vm.downloads.collectAsState()
     val favorites by vm.favorites.collectAsState()
 
@@ -233,7 +234,8 @@ fun DetailScreen(
                         // 所以「没换成」这件事只能在这一行里说 —— 否则点下去毫无动静。
                         switchError = error,
                         health = health,
-                        onRescan = { vm.refreshHealth(true) },
+                        checking = checking,
+                        onRescan = { vm.rescanDetail() },
                         onPick = { av ->
                             vm.switchDetailSource(av)
                             lineIdx = 0
@@ -577,6 +579,7 @@ private fun SourcePanel(
     failures: List<SearchOutcome.Failure>,
     switchError: String?,
     health: Map<String, net.cinehub.data.model.HealthReport>,
+    checking: Boolean,
     onRescan: () -> Unit,
     onPick: (SourceAvailability) -> Unit,
 ) {
@@ -587,13 +590,21 @@ private fun SourcePanel(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("播放源", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
             Box(Modifier.weight(1f))
+            // 探测要跑好几秒，不给动静的话这按钮看着就是坏的
             Row(
-                Modifier.clickable(onClick = onRescan),
+                Modifier.clickable(enabled = !checking, onClick = onRescan)
+                    .padding(horizontal = Sp.s2, vertical = Sp.s1),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.Filled.Refresh, null, tint = T.Src500, modifier = Modifier.size(12.dp))
+                Icon(Icons.Filled.Refresh, null, tint = if (checking) T.TextDim else T.Src500,
+                    modifier = Modifier.size(12.dp))
                 Spacer4()
-                Text("重新检测", color = T.Src500, fontSize = Fs.xxs, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (checking) "检测中…" else "重新检测",
+                    color = if (checking) T.TextDim else T.Src500,
+                    fontSize = Fs.xxs,
+                    fontWeight = FontWeight.SemiBold,
+                )
             }
         }
         Spacer12()
