@@ -32,7 +32,7 @@ private val Context.doubanStore by preferencesDataStore(name = "cinehub_douban")
 /**
  * 豆瓣榜单：只读它公开的几个列表接口。
  *
- * 边界跟别处一致 —— 不登录、不带任何 Cookie 或凭证、不逆它的校验。
+ * 边界跟别处一致 —— 不登录、不带任何 Cookie 或凭证。
  * 带的就是一个浏览器访客本来就会带的那点东西（UA + Referer），
  * 因为豆瓣对裸 UA 的请求直接拒。哪天它把这些接口收紧了，这里就如实抛错，
  * 界面会写「拉不到 + 原因」，不会装成「这个榜没片」。

@@ -39,7 +39,7 @@ data class SourceConfig(
      * 只有接口型源需要：苹果 CMS 的 `vod_play_url` 里给的可能直接是
      * 爱奇艺 / 腾讯那种平台播放页（西瓜影院就是这样），影枢拿它没法播。
      * 但源站自己的播放页能播 —— 它自己的播放器会去把平台页地址换成可播流。
-     * 于是影枢打开这个页面，在旁边接住页面请求的那条流，不去逆向对方的解析与授权。
+     * 于是影枢打开这个页面，在旁边接住页面已经请求出来的那条流 —— 换流是源站自己的播放器做的。
      */
     val playPath: String? = null,
     val createdAt: Long = System.currentTimeMillis(),

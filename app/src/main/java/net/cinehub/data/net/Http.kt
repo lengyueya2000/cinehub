@@ -32,7 +32,7 @@ object Http {
     /**
      * 按源配置生成鉴权头。
      *
-     * 影枢只转发用户自己填的凭证，不代替用户登录、也不去猜对方的校验算法 ——
+     * 影枢只转发用户自己填的凭证，不代替用户登录 ——
      * 能看什么取决于用户在该站自己拥有的权限。
      */
     fun authHeaders(cfg: net.cinehub.data.model.SourceConfig): Map<String, String> {
