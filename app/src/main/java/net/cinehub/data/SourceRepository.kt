@@ -122,11 +122,20 @@ object Seed {
             html = net.cinehub.data.source.DefaultRules.maccms,
         ),
         SourceConfig(
+            id = "k4ku",
+            name = "4kku",
+            baseUrl = "https://www.4kku.com",
+            kind = net.cinehub.data.model.SourceKind.Html,
+            priority = 2,
+            tags = listOf("4K 画质", "三条线路"),
+            html = net.cinehub.data.source.DefaultRules.tailwind,
+        ),
+        SourceConfig(
             id = "dongpiandi",
             name = "懂片帝AI",
             baseUrl = "https://dongpiandi.ai",
             kind = net.cinehub.data.model.SourceKind.AiMovie,
-            priority = 2,
+            priority = 3,
             tags = listOf("1080P", "AI 找片"),
         ),
         SourceConfig(
@@ -134,7 +143,7 @@ object Seed {
             name = "演示源",
             baseUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
             kind = net.cinehub.data.model.SourceKind.M3u,
-            priority = 3,
+            priority = 4,
             tags = listOf("公开测试流", "可验证播放"),
         ),
     )

@@ -20,7 +20,18 @@ import okhttp3.Response
 class CineHubApplication : Application(), ImageLoaderFactory {
 
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
-        .okHttpClient { OkHttpClient.Builder().addInterceptor(DoubanImageHeaders()).build() }
+        .okHttpClient {
+            // 裸客户端的读超时是 10 秒。实测 4kku 的封面挂在 img.lzipic.com 上，
+            // 从这台模拟器的代理路径取一张 23 KB 的图要 25 秒 —— 浏览器能等到，
+            // Coil 等不到，界面上就是一片空白，看着像「这个源没图 / 这个源坏了」。
+            // 图片不是关键路径，多给十秒换掉一整屏的空海报。
+            OkHttpClient.Builder()
+                .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+                .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .addInterceptor(DoubanImageHeaders())
+                .build()
+        }
         .build()
 
     private class DoubanImageHeaders : Interceptor {

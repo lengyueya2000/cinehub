@@ -14,6 +14,7 @@ import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.net.Http
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 /**
  * 通用「网页解析」适配器。
@@ -26,9 +27,13 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
     private val rules = config.html ?: DefaultRules.generic
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    private fun abs(path: String): String =
-        if (path.startsWith("http")) path
-        else config.baseUrl.trimEnd('/') + "/" + path.trimStart('/')
+    private fun abs(path: String): String = when {
+        path.startsWith("http") -> path
+        // 协议相对地址（`//host/x.jpg`）不能拼到 baseUrl 后面 —— 拼出来是
+        // `https://site//host/x.jpg`，图必然取不到
+        path.startsWith("//") -> "https:" + path
+        else -> config.baseUrl.trimEnd('/') + "/" + path.trimStart('/')
+    }
 
     private suspend fun fetch(path: String, page: Int): Document {
         val url = abs(path.replace("{q}", "").replace("{page}", "$page"))
@@ -58,8 +63,14 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         )
 
         val title = doc.detailTitle() ?: id
-        val cover = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
-            ?: doc.coverFromLazy()
+        // 详情页的封面同样有给相对地址的（4kku 的网格页就是 `/upload/vod/…`），
+        // 不 abs 就是拿一个 `/upload/...` 去让图片库加载 —— 结果是海报位空白，
+        // 而片名、年份都在，看着像「这个源没图」。占位图（load.svg）也不算封面。
+        val cover = (
+            doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+                ?: doc.coverFromLazy()
+            )?.takeIf { it.isNotBlank() && !it.contains("/load.") && !it.endsWith(".svg") }
+            ?.let { abs(it) }
         val intro = doc.selectFirst("meta[name=description]")?.attr("content")
             ?: doc.selectFirst(".desc,.introduction,.detail-content,.hl-content-text")?.text()
 
@@ -77,7 +88,7 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
 
         // 分集：同一部剧的多个线路会各有自己的分集锚点
         val epAnchors = doc.select(rules.episodeSelector)
-        val byLine = epAnchors.groupBy { it.attr("data-line").ifBlank { "1" } }
+        val byLine = epAnchors.groupBy { it.attr("data-line").ifBlank { it.playLine() ?: "1" } }
         val lines = if (byLine.isEmpty()) {
             listOf(PlayLine("默认线路", listOf(Episode("正片", 1, url))))
         } else {
@@ -87,7 +98,10 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
                     episodes = anchors.mapIndexed { i, a ->
                         Episode(
                             name = a.text().trim().ifBlank { "第 ${i + 1} 集" },
-                            index = a.attr("data-episode").toIntOrNull() ?: (i + 1),
+                            // 集数写在地址尾段里（44869-3-2 → 第 2 集），
+                            // 取不到才按出现顺序数 —— 顺序数在倒序排的模板上会把集号排反
+                            index = a.attr("data-episode").ifBlank { a.attr("data-idx") }
+                                .toIntOrNull() ?: a.playIndex() ?: (i + 1),
                             playUrl = abs(a.attr(rules.episodeUrlAttr).ifBlank { a.attr("href") }),
                         )
                     },
@@ -95,6 +109,32 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
             }
         }
         return MediaDetail(media = media, lines = lines, intro = media.intro)
+    }
+
+    /**
+     * 这条分集属于哪条线路。
+     *
+     * 苹果 CMS 的播放地址写作 `/vodplay/{片id}-{线路号}-{集号}.html`，线路号本来就在名字里，
+     * 但模板站常常不给锚点标 `data-line` —— 少这一步就会把几条线路并进同一个「线路 1」、
+     * 集号一路顺排（实测北觅两条线路、4kku 三条线路都是这样，界面上看着像 24 集的剧
+     * 其实每条各 12 集）。所以没有 `data-line` 时按地址尾段拆。
+     *
+     * 地址不是这个形状的（第三方平台页、自定义路径）返回 null，交回原来的「全归线路 1」，
+     * 不做任何猜测。
+     */
+    private fun Element.playLine(): String? = playTail()?.groupValues?.get(1)
+
+    /** 见 [playLine]：尾段的第二个数字就是集号。 */
+    private fun Element.playIndex(): Int? =
+        playTail()?.groupValues?.get(2)?.toIntOrNull()
+
+    private fun Element.playTail(): MatchResult? {
+        val last = attr(rules.episodeUrlAttr)
+            .ifBlank { attr("href") }
+            .substringBefore('?').substringBefore('#').trimEnd('/')
+            .substringAfterLast('/')
+            .substringBefore('.')
+        return PLAY_TAIL.find(last)
     }
 
     /**
@@ -149,6 +189,25 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         return url.takeIf { it.startsWith("http") }
     }
 
+    /**
+     * 列表项的封面与年份常在标题的上一级 —— 横排卡片就是图在左、字在右，
+     * 两边各一个 `a`，选择器命中的是文字那个。
+     *
+     * 原来只往命中元素自己身上找 img，找不到就把整条丢掉（界面表现为「这个源一条没有」）。
+     * 这里往上走最多三层，认**恰好含一张 img** 的那一层：多张说明已经数到列表容器了，
+     * 从那一层取年份会把邻居卡片的年份认到自己头上，宁可不取。
+     */
+    private fun Element.itemScope(): Element {
+        if (selectFirst("img") != null) return this
+        var p = parent()
+        repeat(3) {
+            val cur = p ?: return this
+            if (cur.select("img").size == 1) return cur
+            p = cur.parent()
+        }
+        return this
+    }
+
     private fun parseList(doc: Document): List<Media> {
         val seen = HashSet<String>()
         return doc.select(rules.itemSelector).mapNotNull { a ->
@@ -156,30 +215,37 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
             val id = href.substringAfterLast('/').substringBefore('?').substringBefore('.')
             if (id.isBlank() || !seen.add(id)) return@mapNotNull null
 
-            val img = a.selectFirst("img")
+            val scope = a.itemScope()
+            val img = scope.selectFirst("img")
             val title = a.attr("title").takeIf { it.isNotBlank() }
                 ?: img?.attr("alt")?.takeIf { it.isNotBlank() }
                 ?: a.selectFirst("[class*=title],h3,h4")?.text()?.takeIf { it.isNotBlank() }
                 ?: a.attr("data-title").takeIf { it.isNotBlank() }
+                // 这套皮把片名就写在锚点的文字里。长度限制是防住把整段简介当片名 ——
+                // 「更多」「立即播放」这类导航锚点也长 a[href*=…] 这样。
+                ?: a.text().trim().takeIf { it.isNotBlank() && it.length <= 30 && !NAV_WORDS.contains(it) }
                 ?: return@mapNotNull null
 
             // 年份与画质都取「整段就是年份 / 就是画质」的小标签，
             // 而不是扫整块文本 —— 简介里出现的年份会把条目年份带偏。
-            val badges = a.select("div,span,p,em,li").map { it.text().trim() }.filter { it.length <= 12 }
+            val badges = scope.select("div,span,p,em,li").map { it.text().trim() }.filter { it.length <= 12 }
 
             Media(
                 id = id,
                 title = title.trim(),
-                cover = img?.let {
-                    it.attr("data-src").ifBlank { it.attr("data-original") }.ifBlank { it.attr("src") }
-                }?.takeIf { it.isNotBlank() }
-                    ?: a.attr("data-original").takeIf { it.isNotBlank() },
+                cover = (
+                    img?.let {
+                        it.attr("data-src").ifBlank { it.attr("data-original") }.ifBlank { it.attr("src") }
+                    } ?: scope.attr("data-original").takeIf { it.isNotBlank() }
+                    ?: a.attr("data-original").takeIf { it.isNotBlank() }
+                    )?.takeIf { it.isNotBlank() && !it.contains("/load.") && !it.endsWith(".svg") }
+                    ?.let { abs(it) },
                 year = badges.firstOrNull { it.matches(YEAR_ONLY) }
                     ?: YEAR.find(title)?.value,
-                remark = a.selectFirst("[class*=remarks],[class*=pic-text]")?.text()?.trim()
+                remark = scope.selectFirst("[class*=remarks],[class*=pic-text]")?.text()?.trim()
                     ?.takeIf { it.isNotBlank() }
-                    ?: badges.firstOrNull { it.matches(QUALITY_ONLY) },
-                score = a.selectFirst("[class*=score]")?.text()?.trim()?.takeIf { it.isNotBlank() },
+                    ?: badges.firstOrNull { it.matches(QUALITY_ONLY) || it.matches(REMARK_ONLY) },
+                score = scope.selectFirst("[class*=score]")?.text()?.trim()?.takeIf { it.isNotBlank() },
                 sourceId = config.id,
             )
         }.distinctBy { it.id }
@@ -207,12 +273,34 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
 
     /** 线路名：优先取线路标签，取不到就退回「线路 N」。 */
     private fun Document.lineName(line: String): String =
-        selectFirst(".hl-plays-from a[alt],a[alt]")?.attr("alt")?.takeIf { it.isNotBlank() }
+        // 这套皮的线路名写在 #source-tabs 的按钮上（data-source="3" → 「TT线路」），
+        // 用 ownText 是为了不把图标元素那些空文本一起带进来
+        selectFirst("[data-source=$line],[data-sid=$line]")?.ownText()?.trim()
+            ?.takeIf { it.isNotBlank() && it.length <= 12 }
+            ?: selectFirst(".hl-plays-from a[alt],a[alt]")?.attr("alt")?.takeIf { it.isNotBlank() }
             ?: "线路 $line"
 
     private companion object {
+        /** 播放地址尾段的「-线路-集号」；前面那段是站点自己的片 id，不参与。 */
+        val PLAY_TAIL = Regex("""-(\d+)-(\d+)$""")
+
         val YEAR = Regex("(19|20)\\d{2}")
         val YEAR_ONLY = Regex("^(19|20)\\d{2}$")
+
+        /** 「更新至第12集」「更新至09期」这类连载标记，界面上当画质位一样显示。 */
+        val REMARK_ONLY = Regex("^(更新至.+|已完结|全\\d+期|正片|预告|预告片)$")
+
+        /**
+         * 锚点文字是这些词时不当片名。
+         *
+         * 片名改成从锚点文字取之后，「更多」「立即播放」这类导航锚点也长得一样，
+         * 不排掉就是往列表里塞几行「更多」。
+         */
+        val NAV_WORDS = setOf(
+            "更多", "查看更多", "立即播放", "播放", "继续播放", "下一页", "上一页",
+            "首页", "全部", "展开", "收起", "更新", "请求更新",
+        )
+
         val QUALITY_ONLY = Regex(
             "^(4k|hdr|hd|蓝光|超清|高清|抢先版|正片|完结|全\\d+集|\\d{3,4}p)$",
             RegexOption.IGNORE_CASE,
@@ -265,6 +353,27 @@ object DefaultRules {
         itemSelector = "a[href*=/vod/detail/id/]",
         detailPath = "/index.php/vod/detail/id/{id}.html",
         episodeSelector = ".stui-content__playlist a, a[href*=/vod/play/]",
+        resolveMode = HtmlRules.MODE_MACCMS_PLAYER,
+    )
+
+    /**
+     * 苹果 CMS 的**地址规则**配一套 Tailwind 皮（如 www.4kku.com）。
+     *
+     * 路径和北觅那套完全一样（`/vodsearch/`、`/vodshow/`、`/voddetail/`，直链在播放页的
+     * `player_aaaa` 里），不一样的是卡片和分集的类名：没有 `hl-item-thumb`，分集按线路
+     * 切成 `#episodes-1..3` 三个容器，锚点上也没有 `data-line`（集号写在地址尾段里）。
+     *
+     * 这条皮和上面两条的区别只在选择器，所以规则留着可配 —— 用户自己加同类站改这几行就行，
+     * 不用等应用发版，也不用为它写一个适配器。
+     */
+    val tailwind = HtmlRules(
+        listPath = "/vodsearch/{q}-------------.html",
+        browsePath = "/vodshow/1--------{page}---.html",
+        itemSelector = "a[href*=/voddetail/]",
+        detailPath = "/voddetail/{id}.html",
+        // 分集锚点的三种写法并起来：海链模板的 #hl-plays-list、这套皮的 #episodes-N、
+        // 以及两者都带过的 a.episode-link。jsoup 的并集按文档顺序去重，不会重复计同一集
+        episodeSelector = "#hl-plays-list a, [id^=episodes-] a, a.episode-link, a[data-episode]",
         resolveMode = HtmlRules.MODE_MACCMS_PLAYER,
     )
 }
