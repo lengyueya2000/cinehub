@@ -1,6 +1,7 @@
 package net.cinehub.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -52,6 +54,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import net.cinehub.data.model.HistoryEntry
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.PosterCard
@@ -80,6 +83,7 @@ fun HomeScreen(
     val error by vm.homeError.collectAsState()
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
+    val history by vm.watchHistory.collectAsState()
     var cat by remember { mutableIntStateOf(0) }
 
     val hero = home.firstOrNull()
@@ -170,6 +174,33 @@ fun HomeScreen(
                         sourceHealth = health[hero.sourceId]?.health,
                         onPlay = { onOpenDetail(hero.sourceId, hero.id) },
                     )
+                }
+            }
+        }
+
+        // 继续观看：打开应用最想干的事就是接上上次那一集，所以放在 hero 正下面。
+        // 只列没看完的 —— 看完的那一部不该再「继续」一次，它留在「我的 · 最近观看」里。
+        // 一条都没有时整段不出现，不留一个空壳。
+        val resume = history.filter { it.resumable }
+        if (resume.isNotEmpty()) {
+            item {
+                Column(Modifier.padding(top = Sp.s4)) {
+                    Text(
+                        "继续观看",
+                        color = T.Text,
+                        fontSize = Fs.body,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = Sp.s4),
+                    )
+                    Spacer8()
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = Sp.s4),
+                        horizontalArrangement = Arrangement.spacedBy(Sp.s3),
+                    ) {
+                        items(resume) { e ->
+                            ResumeCard(e) { vm.resumeFromHistory(e) }
+                        }
+                    }
                 }
             }
         }
@@ -353,5 +384,65 @@ private fun HeroCard(
                 }
             }
         }
+    }
+}
+
+/** 「继续观看」的一格：封面 + 片名 + 看到哪一集、第几分钟。 */
+@Composable
+private fun ResumeCard(e: HistoryEntry, onClick: () -> Unit) {
+    Column(
+        Modifier.width(108.dp).clip(R.md).background(T.Surface2)
+            .border(1.dp, T.Border, R.md).clickable(onClick = onClick),
+    ) {
+        Box(
+            Modifier.fillMaxWidth().aspectRatio(3f / 4f).background(T.Surface3),
+        ) {
+            if (!e.cover.isNullOrBlank()) {
+                AsyncImage(
+                    model = e.cover,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    e.title.take(2),
+                    color = T.TextFaint,
+                    fontSize = Fs.sec,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+            }
+            // 这条片看到哪儿了，用一截进度条说，比只写数字快
+            if (e.durationSec > 0) {
+                Box(
+                    Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                        .height(3.dp).background(Color.Black.copy(alpha = .55f)),
+                ) {
+                    Box(
+                        Modifier.fillMaxWidth(
+                            (e.positionSec.toFloat() / e.durationSec).coerceIn(0f, 1f),
+                        ).fillMaxHeight().background(T.Play500),
+                    )
+                }
+            }
+        }
+        Spacer4()
+        Text(
+            e.title,
+            color = T.Text,
+            fontSize = Fs.xs,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 6.dp),
+        )
+        Spacer4()
+        Text(
+            e.where,
+            color = T.TextFaint,
+            fontSize = Fs.tiny,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 6.dp).padding(bottom = 7.dp),
+        )
     }
 }

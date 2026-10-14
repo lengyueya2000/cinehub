@@ -33,6 +33,9 @@ import java.io.FileOutputStream
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 private val Context.downloadStore by preferencesDataStore(name = "cinehub_downloads")
 
@@ -93,6 +96,9 @@ class DownloadRepository(
             id = id,
             mediaId = m.id,
             mediaTitle = m.title,
+            mediaKey = m.key,
+            mediaYear = m.year,
+            mediaCover = m.cover,
             sourceId = cfg.id,
             sourceName = cfg.name,
             episodeName = ep.name,
@@ -215,8 +221,20 @@ class DownloadRepository(
             dir.deleteRecursively()
         }
         dir.mkdirs()
-        if (pathExt(direct, "").equals(".m3u8", true)) downloadHls(id, dir, direct, cfg)
+        if (isHls(direct)) downloadHls(id, dir, direct, cfg)
         else downloadSingle(id, dir, direct, cfg)
+    }
+
+    /**
+     * 只看后缀名会漏：列表地址也可能长成 `/m3u8/xxxxx`，末尾没有 `.m3u8`。
+     * 那种地址落到单文件分支，存下来的就是 playlist 正文冒充的 video.mp4 ——
+     * 进度走到 100%、标着「可离线播放」，点开是坏的，看起来正是「缓存没起作用」。
+     */
+    private fun isHls(url: String): Boolean {
+        val path = url.substringBefore('?').substringBefore('#')
+        return pathExt(url, "").equals(".m3u8", true) ||
+            path.substringAfterLast('/', path).contains("m3u8", true) ||
+            path.contains("/m3u8/", true)
     }
 
     private suspend fun downloadSingle(id: String, dir: File, url: String, cfg: SourceConfig) {
@@ -258,47 +276,68 @@ class DownloadRepository(
     }
 
     private suspend fun downloadHls(id: String, dir: File, url: String, cfg: SourceConfig) {
-        var playlist = Http.get(url, referer = referer(cfg))
+        // 分片地址是相对**它自己那份列表**的。主列表和变体常常不在同一个目录
+        // （实测 mux 的测试流：变体在 url_8/，分片又在 url_8/url_590/），
+        // 用主列表的地址去拼就会 404 —— 播放器自己能播、这里缓存不了，就是这么来的。
+        var listUrl = url
+        // 分片用的是 newCall（带源站给的鉴权头），列表这两次拉取也得带上，
+        // 否则要登录的源会在这里 401/403 —— 在线能播、缓存却起不来。
+        val auth = Http.authHeaders(cfg)
+        var playlist = Http.get(url, referer(cfg), auth)
         if (playlist.contains("#EXT-X-STREAM-INF")) {
             val best = bestVariant(playlist, url) ?: error("这份 m3u8 里只有主列表，没有可下载的分片")
-            playlist = Http.get(best, referer = referer(cfg))
+            listUrl = best
+            playlist = Http.get(best, referer(cfg), auth)
         }
-        // 加密流要拿站点给的密钥、按它的方案解密才成文件。
-        // 影枢不做这件事 —— 那是绕过对方的内容保护，不是缓存。
-        if (playlist.contains("#EXT-X-KEY")) {
-            error("这条线路是加密 HLS（EXT-X-KEY），影枢不解站点的内容加密，缓存不了。换一条不加密的线路试试。")
-        }
+        // 加密流：站点把密钥连同列表一起发给它自己的播放器，取钥解密就是标准 HLS 客户端
+        // 要做的那一步，影枢照做。但它只用自己的会话去取 —— 站点不给的密钥不去换、不猜。
+        // SAMPLE-AES / 私有 METHOD 属于 DRM 那一类（要还原对方的解密方案才成文件），不碰。
+        requirePlainOrAes128(playlist)
 
-        val segs = parseSegments(playlist, url)
+        val segs = parseSegments(playlist, listUrl)
         if (segs.isEmpty()) error("这份 m3u8 里没有分片")
-        val init = initMap(playlist, url)
+        val init = initMap(playlist, listUrl)
+
+        // (密钥字节, IV)。同一条流通常全程一把，按地址缓存起来只取一次。
+        val keys = HashMap<String, ByteArray>()
+        suspend fun keyOf(c: Crypt?): Pair<ByteArray, ByteArray>? = c?.let {
+            keys.getOrPut(it.uri) { fetchKey(it.uri, cfg, auth) } to it.iv
+        }
 
         patch(id) { it.copy(segmentsTotal = segs.size, segmentsDone = 0) }
 
         var n = 0
+        var initName: String? = null
         if (init != null) {
-            val f = File(dir, "init" + pathExt(init, ".mp4"))
-            if (!f.isFile || f.length() == 0L) fetchBytes(init, cfg, f)
+            val (initUrl, initCrypt) = init
+            val f = File(dir, "init" + pathExt(initUrl, ".mp4"))
+            initName = f.name
+            if (!f.isFile || f.length() == 0L) fetchBytes(initUrl, cfg, f, keyOf(initCrypt))
         }
-        segs.forEachIndexed { i, seg ->
+        segs.forEach { seg ->
             val f = File(dir, seg.name)
-            if (!f.isFile || f.length() == 0L) fetchBytes(seg.url, cfg, f)
+            if (!f.isFile || f.length() == 0L) fetchBytes(seg.url, cfg, f, keyOf(seg.crypt))
             n++
             val d = n
             patch(id) { it.copy(segmentsDone = d) }
         }
 
-        File(dir, "index.m3u8").writeText(localPlaylist(segs, init != null))
+        File(dir, "index.m3u8").writeText(localPlaylist(segs, initName))
         patch(id, persist = true) { it.copy(fileName = "index.m3u8", segmentsDone = segs.size) }
     }
 
-    private suspend fun fetchBytes(url: String, cfg: SourceConfig, into: File) {
+    private suspend fun fetchBytes(
+        url: String,
+        cfg: SourceConfig,
+        into: File,
+        key: Pair<ByteArray, ByteArray>? = null,
+    ) {
         withContext(Dispatchers.IO) {
             val call = newCall(url, cfg, rangeFrom = null)
             call.execute().use { r ->
                 if (!r.isSuccessful) error(Http.failureReason(r.code))
                 val bytes = r.body?.bytes() ?: error("空响应")
-                into.writeBytes(bytes)
+                into.writeBytes(if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second))
             }
         }
     }
@@ -320,7 +359,83 @@ class DownloadRepository(
 
     // ---------- m3u8 ----------
 
-    private data class Segment(val dur: Double, val url: String, val name: String)
+    private data class Segment(val dur: Double, val url: String, val name: String, val crypt: Crypt?)
+
+    /** 一把密钥：地址 + 这一段的 IV。 */
+    private data class Crypt(val uri: String, val iv: ByteArray)
+
+    /**
+     * 只放行「不加密」和 AES-128。
+     *
+     * AES-128 的密钥是站点随列表一起发给任何播放器的，取来解密就是 HLS 客户端的标准动作。
+     * SAMPLE-AES 那类要把对方的条件解密方案复刻一遍才成文件 —— 那是 DRM，不是缓存。
+     */
+    private fun requirePlainOrAes128(playlist: String) {
+        val bad = playlist.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("#EXT-X-KEY") }
+            .map { it.substringAfter("METHOD=", "").substringBefore(',').trim() }
+            .firstOrNull { it.isNotEmpty() && it != "NONE" && it != "AES-128" }
+        if (bad != null) {
+            error(
+                if (bad == "AES-256") "这条线路用的是 AES-256，本机 Android 版本不支持解密。换一条线路试试。"
+                else "这条线路是 $bad 加密（DRM 那一类），影枢不还原对方的解密方案，缓存不了。换一条不加密的线路试试。"
+            )
+        }
+    }
+
+    /**
+     * 从一行 `#EXT-X-KEY` 读出 (密钥地址, 显式 IV)。
+     *
+     * METHOD=NONE 或没有 URI 时给 null，表示这一段不加密。IV 可能是 null ——
+     * 协议规定此时用分片序号当 IV，由调用方补。
+     */
+    private fun parseKey(line: String, base: String): Pair<String, ByteArray?>? {
+        val method = line.attr("METHOD") ?: return null
+        if (method == "NONE") return null
+        val uri = line.attr("URI")?.let { resolve(base, it) } ?: return null
+        val iv = line.attr("IV")?.removePrefix("0x")?.removePrefix("0X")
+            ?.chunked(2)?.mapNotNull { it.toIntOrNull(16)?.toByte() }?.toByteArray()
+        return uri to iv?.takeIf { it.size == 16 }
+    }
+
+    private fun String.attr(name: String): String? =
+        // 引号形式要先试：密钥地址里可能带逗号，那时不引号的写法会在逗号处截断
+        Regex("$name=\"([^\"]*)\"").find(this)?.groupValues?.get(1)
+            ?: Regex("$name=([^,]+)").find(this)?.groupValues?.get(1)?.trim()
+
+    /** 没写 IV 时按协议用分片序号当 IV（128 位大端）。 */
+    private fun seqIv(seq: Long): ByteArray {
+        val iv = ByteArray(16)
+        for (i in 0..7) iv[15 - i] = (seq shr (8 * i) and 0xFF).toByte()
+        return iv
+    }
+
+    private suspend fun fetchKey(uri: String, cfg: SourceConfig, auth: Map<String, String>): ByteArray =
+        withContext(Dispatchers.IO) {
+            val call = Request.Builder().url(uri)
+                .header("User-Agent", Http.UA)
+                .header("Referer", referer(cfg))
+                .apply { auth.forEach { (k, v) -> header(k, v) } }
+                .build()
+            Http.client.newCall(call).execute().use { r ->
+                if (!r.isSuccessful)
+                    error(Http.failureReason(r.code) + " —— 站点不给这把密钥，这一条缓存不了")
+                val b = r.body?.bytes() ?: error("密钥是空的")
+                if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
+                b
+            }
+        }
+
+    /** AES-128-CBC。末字节是填充长度；对不上就原样留着（有的打包器不填）。 */
+    private fun aesCbcDecrypt(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
+        val c = Cipher.getInstance("AES/CBC/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        val out = c.doFinal(data)
+        val pad = out.lastOrNull()?.toInt()?.and(0xFF) ?: 0
+        return if (pad in 1..16 && pad <= out.size && out.takeLast(pad).all { (it.toInt() and 0xFF) == pad })
+            out.copyOf(out.size - pad) else out
+    }
 
     private fun bestVariant(playlist: String, base: String): String? {
         val lines = playlist.lines()
@@ -337,39 +452,76 @@ class DownloadRepository(
         return best
     }
 
+    /**
+     * 逐行扫分片，同时把「这一段用哪把密钥」记下来。
+     *
+     * HLS 的写法是 `#EXT-X-KEY` 从它那一行起对后续分片生效，中途可以换钥；
+     * 没给 IV 的分片按协议拿自己的序号当 IV，所以序号也要一路数着。
+     */
     private fun parseSegments(playlist: String, base: String): List<Segment> {
         val out = mutableListOf<Segment>()
         var dur = 0.0
+        var key: Pair<String, ByteArray?>? = null
+        var seq = 0L
         playlist.lineSequence().forEach { raw ->
             val l = raw.trim()
             when {
+                l.startsWith("#EXT-X-MEDIA-SEQUENCE") ->
+                    seq = l.substringAfter(':').trim().toLongOrNull() ?: 0L
+
                 l.startsWith("#EXTINF") ->
                     dur = l.substringAfter(':').substringBefore(',').trim().toDoubleOrNull() ?: 0.0
+
+                l.startsWith("#EXT-X-KEY") -> key = parseKey(l, base)
 
                 l.isEmpty() || l.startsWith("#") -> Unit
                 else -> {
                     val idx = out.size
                     val abs = resolve(base, l) ?: return@forEach
-                    out += Segment(dur, abs, "seg_%05d%s".format(idx, pathExt(abs, ".ts")))
+                    out += Segment(
+                        dur, abs, "seg_%05d%s".format(idx, pathExt(abs, ".ts")),
+                        key?.let { Crypt(it.first, it.second ?: seqIv(seq + idx)) },
+                    )
                 }
             }
         }
         return out
     }
 
-    private fun initMap(playlist: String, base: String): String? {
-        val line = playlist.lineSequence().firstOrNull { it.trim().startsWith("#EXT-X-MAP") } ?: return null
-        val uri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1) ?: return null
-        return resolve(base, uri)
+    /** 头段（fMP4 的 init）。它跟着列表里当时那把密钥走。 */
+    private fun initMap(playlist: String, base: String): Pair<String, Crypt?>? {
+        var key: Pair<String, ByteArray?>? = null
+        var seq = 0L
+        for (raw in playlist.lines()) {
+            val l = raw.trim()
+            when {
+                l.startsWith("#EXT-X-MEDIA-SEQUENCE") ->
+                    seq = l.substringAfter(':').trim().toLongOrNull() ?: 0L
+
+                l.startsWith("#EXT-X-KEY") -> key = parseKey(l, base)
+
+                l.startsWith("#EXT-X-MAP") -> {
+                    val uri = l.attr("URI")?.let { resolve(base, it) } ?: return null
+                    return uri to key?.let { Crypt(it.first, it.second ?: seqIv(seq)) }
+                }
+
+                else -> Unit
+            }
+        }
+        return null
     }
 
-    private fun localPlaylist(segs: List<Segment>, hasInit: Boolean): String = buildString {
+    /**
+     * 本地 playlist。init 段写的是它**实际落盘的文件名** ——
+     * 对方给的是 `.m4s` 时硬写 `init.mp4` 会让离线播放找不到头段。
+     */
+    private fun localPlaylist(segs: List<Segment>, initName: String?): String = buildString {
         append("#EXTM3U\n")
         append("#EXT-X-VERSION:4\n")
         val max = segs.maxOf { it.dur }.coerceAtLeast(1.0)
         append("#EXT-X-TARGETDURATION:").append(max.toLong() + 1).append('\n')
         append("#EXT-X-PLAYLIST-TYPE:VOD\n")
-        if (hasInit) append("#EXT-X-MAP:URI=\"init.mp4\"\n")
+        initName?.let { append("#EXT-X-MAP:URI=\"").append(it).append("\"\n") }
         segs.forEach {
             append("#EXTINF:").append(it.dur).append(",\n")
             append(it.name).append('\n')

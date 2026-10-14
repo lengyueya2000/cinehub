@@ -49,6 +49,8 @@ import net.cinehub.ui.screens.LibraryScreen
 import net.cinehub.ui.screens.PlayerScreen
 import net.cinehub.ui.screens.SearchScreen
 import net.cinehub.ui.screens.SiteBrowserScreen
+import net.cinehub.ui.screens.FavoritesScreen
+import net.cinehub.ui.screens.HistoryScreen
 import net.cinehub.ui.screens.SourceScreen
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.Sp
@@ -62,6 +64,8 @@ private sealed interface Route {
     data object Library : Route
     data object Sources : Route
     data object Downloads : Route
+    data object Favorites : Route
+    data object History : Route
 }
 
 private val TABS = listOf(
@@ -91,6 +95,8 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
             is Route.Library -> Route.Home
             is Route.Downloads -> Route.Home
             is Route.Detail -> Route.Home
+            is Route.Favorites -> Route.Home
+            is Route.History -> Route.Home
             is Route.Player -> {
                 vm.stopPlaying()
                 val d = vm.detail.value
@@ -130,8 +136,19 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                     is Route.Detail -> DetailScreen(
                         vm = vm,
                         onBack = { route = Route.Home },
-                        onPlay = { sourceId, mediaId, title, ep ->
-                            vm.play(sourceId, title, ep.name, ep.index, ep.playUrl, resumeFrom = 0, mediaId = mediaId)
+                        onPlay = { sourceId, m, ep ->
+                            // 不传 resumeFrom —— 让仓库按（这部片，这一集）决定从哪续
+                            vm.play(
+                                sourceId = sourceId,
+                                mediaTitle = m.title,
+                                episodeName = ep.name,
+                                episodeIndex = ep.index,
+                                episodeUrl = ep.playUrl,
+                                mediaId = m.id,
+                                mediaKey = m.key,
+                                mediaYear = m.year,
+                                mediaCover = m.cover,
+                            )
                         },
                     )
 
@@ -154,7 +171,24 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
-                    is Route.Sources -> SourceScreen(vm = vm, onBack = { route = Route.Home })
+                    is Route.Sources -> SourceScreen(
+                        vm = vm,
+                        onBack = { route = Route.Home },
+                        onOpenFavorites = { route = Route.Favorites },
+                        onOpenHistory = { route = Route.History },
+                    )
+
+                    is Route.Favorites -> FavoritesScreen(
+                        vm = vm,
+                        onBack = { route = Route.Sources },
+                        onOpenDetail = { s, m -> openDetail(s, m) },
+                    )
+
+                    is Route.History -> HistoryScreen(
+                        vm = vm,
+                        onBack = { route = Route.Sources },
+                        onResume = { e -> vm.resumeFromHistory(e) },
+                    )
                 }
             }
 

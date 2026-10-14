@@ -12,11 +12,14 @@ import kotlinx.coroutines.withContext
 import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
+import net.cinehub.data.WatchRepository
 import net.cinehub.data.model.AggregatedMedia
 import net.cinehub.data.model.DownloadTask
 import net.cinehub.data.model.Episode
+import net.cinehub.data.model.Favorite
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
+import net.cinehub.data.model.HistoryEntry
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.SourceAvailability
@@ -31,9 +34,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val sourceRepo = SourceRepository(app)
     private val mediaRepo = MediaRepository(sourceRepo)
+    private val watchRepo = WatchRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
     val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
+
+    /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
+    val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
+    val watchHistory: StateFlow<List<HistoryEntry>> = watchRepo.history
 
     // ---------- 播放源 ----------
     private val _sources = MutableStateFlow<List<SourceConfig>>(emptyList())
@@ -117,6 +125,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val streamHeaders: Map<String, String> = emptyMap(),
         /** 缓存这一集时要写进任务的键；本地回放也带着它，切回在线源才对得上。 */
         val mediaId: String? = null,
+        /**
+         * 这部片的归并键与卡片字段。
+         *
+         * 观看记录要按 [Media.key] 存，而位置是播放器每 10 秒报上来的 ——
+         * 那一刻手上只有 Playing，所以起播时就把这几样带在身上。
+         */
+        val mediaKey: String? = null,
+        val mediaYear: String? = null,
+        val mediaCover: String? = null,
+        /** 播的是本机缓存时，这部片原本属于哪个源 —— [sourceId] 那时是 "local"。 */
+        val originSourceId: String? = null,
     )
 
     /** 正在解析直链 —— 播放器靠它显示「已收到你的点击」，而不是一个不动的黑屏。 */
@@ -357,8 +376,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         episodeName: String,
         episodeIndex: Int,
         episodeUrl: String?,
-        resumeFrom: Long = _resumePosition.value,
+        /** -1 表示「让仓库按（这部片，这一集）决定从哪续」。 */
+        resumeFrom: Long = -1L,
         mediaId: String? = null,
+        mediaKey: String? = null,
+        mediaYear: String? = null,
+        mediaCover: String? = null,
     ) {
         viewModelScope.launch {
             val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
@@ -369,8 +392,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 mediaTitle, episodeName, episodeIndex, name, sourceId, null, episodeUrl,
                 sourceBaseUrl = cfg?.baseUrl?.trimEnd('/'),
                 mediaId = mediaId,
+                mediaKey = mediaKey,
+                mediaYear = mediaYear,
+                mediaCover = mediaCover,
             )
-            _resumePosition.value = resumeFrom
+            _resumePosition.value =
+                if (resumeFrom >= 0L) resumeFrom
+                else mediaKey?.let { watchRepo.resumeAt(it, episodeIndex) } ?: 0L
+            // 上一部的时长不能跟到这一部上：「看不看完」是拿它算的
+            lastDurationSec = 0L
 
             if (cfg == null) {
                 _playing.value = _playing.value?.copy(note = "播放源已不存在，可能在「播放源管理」里被删掉了")
@@ -394,23 +424,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 「在站点页面里解析」该打开哪一页。
+     * 这一集在**源站自己**的页面上是哪个地址；给不出就 null。
      *
-     * 只有这一页属于**源站自己**才有意义：打开它，源站的播放器会去把流取回来，
+     * 只有这一页属于源站才有意义：打开它，源站的播放器会去把流取回来，
      * 影枢在旁边接住那条请求（4K影视 与西瓜影院走的都是这一条）。
      * 接口型源给的是爱奇艺那类平台页 —— 那种页面面对内嵌 WebView 只会弹
-     * 「APP内打开」，拿它当入口等于骗用户点，所以宁可不给这个按钮。
+     * 「APP内打开」，拿它当入口等于骗用户点，所以宁可不给。
+     *
+     * 分享也用这一个判断：能拿出去给别人点的，就是这同一个地址。
      */
-    private fun sitePageFor(
+    fun sitePageFor(
         cfg: SourceConfig?,
         mediaId: String?,
         episodeIndex: Int,
         episodeUrl: String?,
     ): String? {
         cfg?.playPageFor(mediaId, episodeIndex)?.let { return it }
-        val url = episodeUrl?.takeIf { it.isNotBlank() } ?: return null
+        // 只有 http(s) 才可能是个「页」。懂片帝AI 那类源的 episodeUrl 是内部取流凭据
+        // （aiep:av_xxx|av_yyy），拿它当分享链接既打不开，又把凭据白印到别人脸上。
+        val url = episodeUrl?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+            ?: return null
         return if (VideoPlatforms.platformOf(url) == null) url else null
     }
+
+    /** 按源 id 走一遍 [sitePageFor]，界面那边不必自己去查配置。 */
+    fun sitePageOf(
+        sourceId: String,
+        mediaId: String?,
+        episodeIndex: Int,
+        episodeUrl: String?,
+    ): String? = sitePageFor(
+        _sources.value.firstOrNull { it.id == sourceId }, mediaId, episodeIndex, episodeUrl,
+    )
 
     /** 重试解析：用户在播放器里点「重试」时走这里，不换集也不换源。 */
     fun retryPlay() {
@@ -423,6 +468,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             episodeUrl = p.episodeUrl,
             resumeFrom = _resumePosition.value,
             mediaId = p.mediaId,
+            mediaKey = p.mediaKey,
+            mediaYear = p.mediaYear,
+            mediaCover = p.mediaCover,
         )
     }
 
@@ -450,6 +498,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 episodeUrl = ep?.playUrl,
                 resumeFrom = pos,
                 mediaId = av.item.id,
+                mediaKey = av.item.key,
+                mediaYear = av.item.year,
+                mediaCover = av.item.cover,
             )
         }
     }
@@ -496,7 +547,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 直接播已缓存好的文件，不再碰网络。 */
     fun playCached(task: DownloadTask) {
         val uri = downloadRepo.localUri(task.id) ?: return
-        _resumePosition.value = 0
+        _resumePosition.value = watchRepo.resumeAt(task.mediaKey, task.episodeIndex)
+        lastDurationSec = 0L
         _playing.value = Playing(
             mediaTitle = task.mediaTitle,
             episodeName = task.episodeName,
@@ -505,14 +557,122 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sourceId = "local",
             streamUrl = uri,
             mediaId = task.mediaId,
+            mediaKey = task.mediaKey.takeIf { it.isNotBlank() },
+            mediaYear = task.mediaYear,
+            mediaCover = task.mediaCover,
+            // 记录里要写「哪个源的这部片」—— 写 local 的话，
+            // 下次从「继续观看」点进去会找不到源。
+            originSourceId = task.sourceId,
         )
     }
 
-    fun updatePosition(sec: Long) { _resumePosition.value = sec }
+    /**
+     * 播放器报上来的当前位置。
+     *
+     * 每 10 秒才落一次盘：DataStore 是写文件的，一秒一次是在磨盘。
+     * 退出播放（[stopPlaying]）时再补一次，所以最多丢 10 秒。
+     */
+    fun updatePosition(sec: Long, durationSec: Long = 0L) {
+        _resumePosition.value = sec
+        if (durationSec > 0L) lastDurationSec = durationSec
+        if (sec <= 0L) return
+        val now = System.currentTimeMillis()
+        if (now - lastRecordAt >= 10_000L) {
+            lastRecordAt = now
+            recordWatch(sec, durationSec)
+        }
+    }
+
+    private var lastRecordAt = 0L
+
+    /**
+     * 最后一次听到的真实时长。
+     *
+     * 退出播放时那一次补写只有位置、没有时长 —— 直接写 0 会把记录里已有的时长冲掉，
+     * 而「看不看完」正是拿时长算的，冲成 0 就等于把一条看完的记录改成没看完。
+     */
+    private var lastDurationSec = 0L
+
+    /** 把当前这一集的位置写进观看记录。没有归并键的（老任务）不记，别留条对不上的。 */
+    private fun recordWatch(sec: Long, durationSec: Long) {
+        val p = _playing.value ?: return
+        val key = p.mediaKey ?: return
+        watchRepo.record(
+            HistoryEntry(
+                key = key,
+                sourceId = p.originSourceId ?: p.sourceId,
+                mediaId = p.mediaId ?: return,
+                title = p.mediaTitle,
+                year = p.mediaYear,
+                cover = p.mediaCover,
+                episodeIndex = p.episodeIndex,
+                episodeName = p.episodeName,
+                positionSec = sec,
+                durationSec = durationSec,
+            ),
+        )
+    }
 
     fun stopPlaying() {
+        // 离开前把位置补上，不然最后那不到 10 秒白看
+        if (_resumePosition.value > 0L) recordWatch(_resumePosition.value, lastDurationSec)
         _playing.value = null
         _resolving.value = false
+    }
+
+    // ---------- 收藏与观看记录 ----------
+
+    /** 收藏/取消当前详情页这部片，返回切换后是不是「已收藏」。 */
+    fun toggleFavorite(sourceId: String, m: Media): Boolean =
+        watchRepo.toggleFavorite(
+            Favorite(
+                key = m.key,
+                sourceId = sourceId,
+                mediaId = m.id,
+                title = m.title,
+                year = m.year,
+                category = m.category,
+                cover = m.cover,
+            ),
+        )
+
+    fun removeFavorite(key: String) = watchRepo.removeFavorite(key)
+
+    fun historyOf(key: String?): HistoryEntry? = key?.let { watchRepo.historyOf(it) }
+
+    fun removeHistory(key: String) = watchRepo.removeHistory(key)
+
+    fun clearHistory() = watchRepo.clearHistory()
+
+    /**
+     * 从记录里直接续播。
+     *
+     * 记录存的是（源、片、集），但地址得重新解析 —— 直链普遍带时效，
+     * 存下来那条早作废了，这和缓存续传时重新解析是同一个道理。
+     */
+    fun resumeFromHistory(e: HistoryEntry) {
+        viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == e.sourceId } ?: return@launch
+            val d = runCatching { mediaRepo.detail(cfg, e.mediaId) }.getOrNull()
+            val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == e.episodeIndex }
+            if (ep == null || ep.playUrl.isNullOrBlank()) {
+                // 源改版或这一集没了：把记录去掉，别让它一直躺在「继续观看」里点不动
+                watchRepo.removeHistory(e.key)
+                return@launch
+            }
+            play(
+                sourceId = e.sourceId,
+                mediaTitle = d?.media?.title ?: e.title,
+                episodeName = ep.name,
+                episodeIndex = ep.index,
+                episodeUrl = ep.playUrl,
+                resumeFrom = e.positionSec,
+                mediaId = e.mediaId,
+                mediaKey = e.key,
+                mediaYear = d?.media?.year ?: e.year,
+                mediaCover = d?.media?.cover ?: e.cover,
+            )
+        }
     }
 
     private fun qualityOf(m: Media): String? {

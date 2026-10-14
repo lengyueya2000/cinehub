@@ -1,5 +1,8 @@
 package net.cinehub.ui.screens
 
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -33,15 +36,16 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,6 +55,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -59,9 +64,11 @@ import net.cinehub.data.model.DownloadStatus
 import net.cinehub.data.model.DownloadTask
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Health
+import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
 import net.cinehub.data.model.SourceAvailability
+import net.cinehub.data.model.clock
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
@@ -79,7 +86,7 @@ import net.cinehub.ui.theme.T
 fun DetailScreen(
     vm: AppViewModel,
     onBack: () -> Unit,
-    onPlay: (sourceId: String, mediaId: String, title: String, ep: Episode) -> Unit,
+    onPlay: (sourceId: String, media: Media, ep: Episode) -> Unit,
 ) {
     val detail by vm.detail.collectAsState()
     val loading by vm.detailLoading.collectAsState()
@@ -88,10 +95,10 @@ fun DetailScreen(
     val activeSourceId by vm.activeSourceId.collectAsState()
     val health by vm.health.collectAsState()
     val downloads by vm.downloads.collectAsState()
+    val favorites by vm.favorites.collectAsState()
 
     var lineIdx by remember { mutableIntStateOf(0) }
     var epIdx by remember { mutableIntStateOf(0) }
-    var fav by remember { mutableStateOf(false) }
 
     val d = detail
     if (d == null) {
@@ -119,6 +126,56 @@ fun DetailScreen(
     val eps = line?.episodes.orEmpty()
     val curEp = eps.getOrNull(epIdx.coerceIn(0, (eps.size - 1).coerceAtLeast(0)))
     val sid = activeSourceId ?: d.media.sourceId
+    val fav = favorites.any { it.key == d.media.key }
+    /** 这部片上次看到哪；只有正播到这一集时才提示续播。 */
+    val seen = vm.historyOf(d.media.key)
+    val resumeEp = seen?.takeIf { it.resumable }
+
+    // 打开一部看过的片，选集默认落在上次那一集，而不是永远从第一集开始
+    LaunchedEffect(d.media.id, eps.size) {
+        val at = seen?.let { s -> eps.indexOfFirst { it.index == s.episodeIndex } } ?: -1
+        if (at > 0) epIdx = at
+    }
+
+    val ctx = LocalContext.current
+
+    /**
+     * 分享出去的那段话。
+     *
+     * 影枢自己没有网址，能被别人点开的只有源站那一页 —— 给不出页面地址的源
+     * （比如 M3U 直链源）就只发文字，不摆一条打不开的地址。
+     */
+    fun shareText(): String {
+        val m = d.media
+        val head = buildString {
+            append('《').append(m.title).append('》')
+            listOfNotNull(m.year?.take(4), m.area, m.category).joinToString(" · ")
+                .takeIf { it.isNotBlank() }?.let { append('\n').append(it) }
+        }
+        val page = vm.sitePageOf(sid, d.media.id, curEp?.index ?: 1, curEp?.playUrl)
+        return if (page == null) "$head\n（来自影枢）" else "$head\n来自影枢 · $page"
+    }
+
+    fun doShare() {
+        val i = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, d.media.title)
+            putExtra(Intent.EXTRA_TEXT, shareText())
+        }
+        ctx.startActivity(Intent.createChooser(i, "分享 ${d.media.title}"))
+    }
+
+    /** 跳豆瓣看评分：手上只有标题和年份，所以打开的是豆瓣的影视搜索而不是评分页。 */
+    fun openDouban() {
+        val q = listOfNotNull(d.media.title, d.media.year?.take(4)).joinToString(" ")
+        val url = "https://search.douban.com/movie/subject_search?search_text=" +
+            Uri.encode(q)
+        runCatching {
+            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        }.onFailure {
+            Toast.makeText(ctx, "没找到能打开豆瓣的应用", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     fun taskFor(ep: Episode) = downloads.firstOrNull {
         it.sourceId == sid && it.mediaId == d.media.id && it.episodeIndex == ep.index
@@ -131,14 +188,19 @@ fun DetailScreen(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 96.dp),
         ) {
-            item { Backdrop(d, fav, onBack) { fav = !fav } }
+            item { Backdrop(d, fav, onBack, { vm.toggleFavorite(sid, d.media) }, { openDouban() }) }
 
             item {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s4),
                     horizontalArrangement = Arrangement.spacedBy(Sp.s2),
                 ) {
-                    ActionTile("已收藏", Icons.Filled.Favorite, fav, Modifier.weight(1f)) { fav = !fav }
+                    ActionTile(
+                        if (fav) "已收藏" else "收藏",
+                        if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                        fav,
+                        Modifier.weight(1f),
+                    ) { vm.toggleFavorite(sid, d.media) }
                     curEp?.let { ep ->
                         val t = taskFor(ep)
                         ActionTile(
@@ -153,8 +215,8 @@ fun DetailScreen(
                             }
                         }
                     } ?: ActionTile("缓存", Icons.Outlined.Download, false, Modifier.weight(1f)) {}
-                    ActionTile("分享", Icons.Outlined.Share, false, Modifier.weight(1f)) {}
-                    ActionTile("更多", Icons.Filled.MoreVert, false, Modifier.weight(1f)) {}
+                    ActionTile("分享", Icons.Outlined.Share, false, Modifier.weight(1f)) { doShare() }
+                    ActionTile("在豆瓣看评分", Icons.Filled.MoreVert, false, Modifier.weight(1f)) { openDouban() }
                 }
             }
 
@@ -261,6 +323,13 @@ fun DetailScreen(
                                         modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
                                     )
                                 }
+                                // 上次停在哪一集：右下角一个点，不跟右上角的缓存标记打架
+                                if (seen?.episodeIndex == e.index) {
+                                    Box(
+                                        Modifier.align(Alignment.BottomEnd).padding(4.dp)
+                                            .size(5.dp).clip(CircleShape).background(T.Play400),
+                                    )
+                                }
                             }
                         }
                     }
@@ -279,7 +348,7 @@ fun DetailScreen(
                     Text("简介", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
                     Spacer8()
                     Text(
-                        d.intro ?: d.media.intro ?: "暂无简介",
+                        cleanIntro(d.intro ?: d.media.intro) ?: "暂无简介",
                         color = T.TextDim,
                         fontSize = Fs.sm,
                         lineHeight = Fs.sm * 1.78f,
@@ -327,14 +396,17 @@ fun DetailScreen(
             Row(
                 Modifier.weight(1f).height(46.dp).clip(R.md)
                     .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
-                    .clickable { curEp?.let { onPlay(sid, d.media.id, d.media.title, it) } },
+                    .clickable { curEp?.let { onPlay(sid, d.media, it) } },
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(18.dp))
                 Spacer8()
                 Text(
-                    "播放 ${curEp?.name ?: "第 1 集"}",
+                    // 上次没看完这一集就把话头递回去，看完了就正常「播放 第N集」
+                    if (resumeEp != null && curEp != null && resumeEp.episodeIndex == curEp.index)
+                        "继续播放 ${curEp.name} · ${clock(resumeEp.positionSec)}"
+                    else "播放 ${curEp?.name ?: "第 1 集"}",
                     color = Color.White,
                     fontSize = Fs.body,
                     fontWeight = FontWeight.Bold,
@@ -345,7 +417,13 @@ fun DetailScreen(
 }
 
 @Composable
-private fun Backdrop(d: MediaDetail, fav: Boolean, onBack: () -> Unit, onFav: () -> Unit) {
+private fun Backdrop(
+    d: MediaDetail,
+    fav: Boolean,
+    onBack: () -> Unit,
+    onFav: () -> Unit,
+    onDouban: () -> Unit,
+) {
     Box(Modifier.fillMaxWidth().height(240.dp)) {
         if (!d.media.cover.isNullOrBlank()) {
             AsyncImage(
@@ -371,7 +449,7 @@ private fun Backdrop(d: MediaDetail, fav: Boolean, onBack: () -> Unit, onFav: ()
             CircleIcon(Icons.Filled.ArrowBack, onBack)
             Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                 CircleIcon(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, onFav)
-                CircleIcon(Icons.Filled.MoreVert, {})
+                CircleIcon(Icons.Filled.Star, onDouban)
             }
         }
         Row(
@@ -558,4 +636,37 @@ private fun SourcePanel(
             }
         }
     }
+}
+
+/** 源站简介里常见的 HTML 实体。`&amp;` 不在表里 —— 它要最后单独解，否则会二次解码。 */
+private val ENTITIES = mapOf(
+    "&nbsp;" to " ", "&ensp;" to " ", "&emsp;" to " ", "&thinsp;" to " ",
+    "&quot;" to "\u0022", "&apos;" to "\u0027", "&lt;" to "<", "&gt;" to ">",
+    "&ldquo;" to "\u201c", "&rdquo;" to "\u201d",
+    "&lsquo;" to "\u2018", "&rsquo;" to "\u2019",
+    "&hellip;" to "\u2026", "&mdash;" to "\u2014", "&ndash;" to "\u2013",
+    "&middot;" to "\u00b7", "&copy;" to "\u00a9", "&reg;" to "\u00ae",
+    "&times;" to "\u00d7", "&divide;" to "\u00f7", "&deg;" to "\u00b0",
+    "&bull;" to "\u2022", "&rarr;" to "\u2192", "&larr;" to "\u2190",
+)
+
+private val NUMERIC = Regex("&#(x?)([0-9a-fA-F]+);")
+private val TAG = Regex("<[^>]{0,300}>")
+private val BR = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
+
+/**
+ * 源站的简介是 HTML：实体和 `<br/>` 都混在正文里。
+ * 不处理就会显示成「…10号房是一个特别的存在&nbsp;，别看…」，那是把转义当内容给用户看。
+ */
+private fun cleanIntro(raw: String?): String? {
+    val s = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    var t = s.replace(BR, "\n").replace(TAG, "")
+    ENTITIES.forEach { (k, v) -> t = t.replace(k, v) }
+    t = t.replace("&amp;", "&")
+    t = NUMERIC.replace(t) { m ->
+        val hex = m.groupValues[1] == "x"
+        val n = if (hex) m.groupValues[2].toLongOrNull(16) else m.groupValues[2].toLongOrNull()
+        if (n != null && n in 1..0x10FFFFL) String(Character.toChars(n.toInt())) else ""
+    }
+    return t.replace(Regex("[ \t]+\n"), "\n").trim().takeIf { it.isNotEmpty() }
 }

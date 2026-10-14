@@ -16,6 +16,10 @@ data class DownloadTask(
     val id: String,
     val mediaId: String,
     val mediaTitle: String,
+    /** [Media.key] —— 本机回放时要把进度写回同一部片的观看记录，光靠标题对不上。 */
+    val mediaKey: String = "",
+    val mediaYear: String? = null,
+    val mediaCover: String? = null,
     val sourceId: String,
     val sourceName: String,
     val episodeName: String,

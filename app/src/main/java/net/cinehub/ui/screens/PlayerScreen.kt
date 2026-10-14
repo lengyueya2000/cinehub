@@ -241,7 +241,7 @@ fun PlayerScreen(
             pos = (player.currentPosition / 1000).coerceAtLeast(0)
             dur = (player.duration / 1000).coerceAtLeast(0)
             wantsPlay = player.playWhenReady
-            vm.updatePosition(pos)
+            vm.updatePosition(pos, dur)
             val hs: List<Int> = runCatching {
                 player.currentTracks.groups
                     .filter { it.type == C.TRACK_TYPE_VIDEO }

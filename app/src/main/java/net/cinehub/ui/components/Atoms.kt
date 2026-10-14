@@ -3,6 +3,8 @@ package net.cinehub.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -159,7 +161,10 @@ fun SectionHead(
  * 海报卡。
  *
  * [progress] 非空时在底部画进度条（继续观看场景）。
+ * [onLongClick] 给了就用长按承载「对这个条目做的破坏性动作」（取消收藏等），
+ * 和详情页「长按某一集 = 只缓存它」保持同一套手感。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun PosterCard(
     title: String,
@@ -169,9 +174,15 @@ fun PosterCard(
     rank: Int? = null,
     badge: String? = null,
     progress: Float? = null,
+    onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
-    Column(modifier = modifier.clickable(onClick = onClick)) {
+    Column(
+        modifier.then(
+            if (onLongClick == null) Modifier.clickable(onClick = onClick)
+            else Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        ),
+    ) {
         Box(
             Modifier
                 .fillMaxWidth()
