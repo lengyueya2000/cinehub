@@ -122,6 +122,14 @@ class DownloadRepository(
      */
     val speed: StateFlow<Map<String, Long>> = _speed.asStateFlow()
 
+    /**
+     * 上一次数目录是什么时候。
+     *
+     * 顶部那句「共 x MB」要把整棵目录树点一遍才数得出来，不能跟着每次进度报都刷；
+     * 但一集要下十几分钟，只在结束时刷一次的话，那句话会比进度条还旧。
+     */
+    private val lastSpaceAt = java.util.concurrent.atomic.AtomicLong(0L)
+
     /** 任务 id → 最近的速度样本 (时刻, 累计字节)。 */
     private val speedWin = ConcurrentHashMap<String, ArrayDeque<Pair<Long, Long>>>()
 
@@ -397,7 +405,15 @@ class DownloadRepository(
             path.contains("/m3u8/", true)
     }
 
+    /**
+     * 单文件缓存。整块套在 [withRetry] 里：这一条本来就从 .part 的末尾按 Range 续，
+     * 重试进来会重新读那个偏移，所以断了再试不会白下已经落盘的那部分。
+     */
     private suspend fun downloadSingle(id: String, dir: File, url: String, cfg: SourceConfig) {
+        withRetry("视频") { downloadSingleOnce(id, dir, url, cfg) }
+    }
+
+    private suspend fun downloadSingleOnce(id: String, dir: File, url: String, cfg: SourceConfig) {
         withContext(Dispatchers.IO) {
             // 写入落在 .part 上，只有整条走完了才换成正式文件名：
             // 「文件在而且非空」从此等于「这一条是完整的」，本地播放不会去点一个半截的视频。
@@ -409,7 +425,11 @@ class DownloadRepository(
             val call = newCall(id, url, cfg, rangeFrom = have.takeIf { it > 0 })
             try {
                 call.await().use { r ->
-                    if (!r.isSuccessful) error(Http.failureReason(r.code, Http.errorSnippet(r)))
+                    if (!r.isSuccessful) {
+                        val why = Http.failureReason(r.code, Http.errorSnippet(r))
+                        if (r.code in 500..599 || r.code == 429) throw Transient(why)
+                        error(why)
+                    }
                     val resumed = have > 0 && r.code == 206
                     var done = if (resumed) have else 0L
                     if (!resumed) { out.delete(); done = 0L }
@@ -438,7 +458,11 @@ class DownloadRepository(
                             }
                         }
                     }
-                    if (total > 0 && done < total) error("下到 ${done * 100 / total}% 时断了，再点继续")
+                    // 对方把连接收走了但没抛异常：正文比 Content-Length 短就是没下完。
+                    // 报成 Transient 让它重试，而不是第一次没接满就判整条失败
+                    if (total > 0 && done < total) throw Transient(
+                        "下到 ${done * 100 / total}% 时连接断了 —— 已经落盘的部分还在，点继续接着来。",
+                    )
                     val d = done
                     reportBytes(id, d)
                     promote(out, target)
@@ -528,11 +552,18 @@ class DownloadRepository(
          * 在那儿排队等一个个 RTT。这里开 N 个 worker 从同一个 Channel 领活：
          * 领走即出队，所以一片不会被两个 worker 重复取。
          *
-         * 完成数和字节数用原子量累加，每 4 片才往状态里写一次 ——
-         * 每片都写的话下载页每片抖一下，而那一行数字本来就读不出名堂。
+         * 完成数和字节数用原子量累加，进度按「凑满 4 片」或「隔了 1 秒」先到先报 ——
+         * 每片都写的话下载页每片抖一下，而只按片数写的话慢线上十几秒才动一次。
          */
         val doneN = AtomicInteger(0)
-        val bytesN = AtomicLong(initBytes)
+        // 盘上已有的分片先算进起点：不种这个值的话，续传一开始进度会从实际位置掉回 0，
+        // 再随着「跳过缓存分片」一路冲回来 —— 用户看到的就是进度倒退。
+        val alreadyOnDisk = segs.sumOf { seg -> File(dir, seg.name).let { if (it.isFile) it.length() else 0L } }
+        val bytesN = AtomicLong(initBytes + alreadyOnDisk)
+        // 速度只统计真正从网上取下来的字节。续传开头那几百片是从盘上读的，把它们算进
+        // 速度窗口就会报出几十 MB/s 的假数字 —— 那比干脆没有数字更糟。
+        val netN = AtomicLong(0L)
+        val lastTick = AtomicLong(0L)
         val workers = _segParallel.value.coerceIn(1, MAX_SEG_PARALLEL)
         coroutineScope {
             val ch = Channel<Segment>(capacity = Channel.UNLIMITED)
@@ -546,13 +577,27 @@ class DownloadRepository(
                         // 那一行加进度，速度曲线也跟着爬。
                         coroutineContext.ensureActive()
                         val f = File(dir, seg.name)
-                        val wrote = if (f.isFile && f.length() > 0L) f.length()
+                        val cached = f.isFile && f.length() > 0L
+                        val wrote = if (cached) f.length()
                         else fetchBytes(id, seg.url, cfg, f, keyOf(seg.crypt))
                         val d = doneN.incrementAndGet()
-                        val b = bytesN.addAndGet(wrote)
-                        if (d % 4 == 0 || d == segs.size) {
+                        // 命中缓存的那些片已经在 alreadyOnDisk 里数过一遍，不能再加
+                        val b = if (cached) bytesN.get() else bytesN.addAndGet(wrote)
+                        if (!cached) netN.addAndGet(wrote)
+                        // 除了「凑满 4 片」，还要按时间报：慢线上一片要好几秒，只按片数的话
+                        // 十几秒才动一次，速度刚算出来又卡着不更新。两边取先到的那个。
+                        val now = System.currentTimeMillis()
+                        if (d % 4 == 0 || d == segs.size || now - lastTick.get() >= REPORT_TICK_MS) {
+                            lastTick.set(now)
                             coroutineContext.ensureActive()
-                            reportBytes(id, b)
+                            reportBytes(id, netN.get())
+                            // 顶部那句「共 x MB」是数目录数出来的，原来只在任务结束时刷一次 ——
+                            // 一集下十几分钟，那句话就一直停在开始时的数上，比进度条还旧。
+                            // 跟着报进度一起刷，但隔 15 秒一次就够：那是整棵树的遍历。
+                            if (now - lastSpaceAt.get() > SPACE_REFRESH_MS) {
+                                lastSpaceAt.set(now)
+                                refreshSpace()
+                            }
                             patch(id) {
                                 it.copy(
                                     segmentsDone = d,
@@ -595,29 +640,71 @@ class DownloadRepository(
     private fun estimateTotal(bytesDone: Long, segsDone: Int, segsTotal: Int): Long =
         if (segsDone > 0) bytesDone * segsTotal / segsDone else 0L
 
+    /**
+     * 取一段（或一把密钥），瞬时故障自动再试。
+     *
+     * 原来一次都不重试：一集上千片，任何一片撞上「连接中途被掐 / TLS 断在半路 /
+     * 对方 5xx」就把整集判失败 —— 用户看到的就是缓存经常中断，而且每次都得自己
+     * 点继续。实测同一条 4kku 的线连跑三次，分别断在 163 MB、263 MB、571 MB，
+     * 每次都是单个请求级别的抖动，本来不该惊动用户。
+     *
+     * 只重试值得重试的：连接级异常和 5xx / 429。403、404 是对方明确不给，
+     * 站点不给的密钥不去换、不猜，重试三次只是多敲人家三下。
+     */
+    private suspend fun <T> withRetry(label: String, block: suspend () -> T): T {
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                return block()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                val transient = e is Transient || e is java.io.IOException
+                if (!transient || attempt >= SEG_ATTEMPTS) {
+                    // Transient 里带的是已经翻译好的原话（如「站点异常 503」），
+                    // 别让它落到 reasonOf 的 IOException 分支变成一句「连接被对方切断」
+                    if (e is Transient) error(e.message ?: "$label 取不到")
+                    throw e
+                }
+                delay(RETRY_BACKOFF_MS[attempt - 1])
+            }
+        }
+    }
+
+    /** 值得再试一次的失败：里面装的是已经能直接给用户看的那句话。 */
+    private class Transient(override val message: String) : Exception(message)
+
     private suspend fun fetchBytes(
         id: String,
         url: String,
         cfg: SourceConfig,
         into: File,
         key: Pair<ByteArray, ByteArray>? = null,
-    ): Long = withContext(Dispatchers.IO) {
-        ensureActive()
-        val call = newCall(id, url, cfg, rangeFrom = null)
-        try {
-            call.await().use { r ->
-                if (!r.isSuccessful) error(Http.failureReason(r.code, Http.errorSnippet(r)))
-                val bytes = r.body?.bytes() ?: error("空响应")
-                val plain = if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second)
-                // 先落到 .part 再改名：这一段的完成判据是「正式名字的文件的字节非空」，
-                // 直接写进正式名字，就是让一段半截的分片冒充一片完整的。
-                val part = File(into.parentFile, into.name + ".part")
-                part.writeBytes(plain)
-                promote(part, into)
-                plain.size.toLong()
+    ): Long = withRetry("分片") {
+        withContext(Dispatchers.IO) {
+            ensureActive()
+            val call = newCall(id, url, cfg, rangeFrom = null)
+            try {
+                call.await().use { r ->
+                    if (!r.isSuccessful) {
+                        val why = Http.failureReason(r.code, Http.errorSnippet(r))
+                        // 5xx 与限流是「现在不行」，403/404 是「不行就是不行」—— 前者才重试
+                        if (r.code in 500..599 || r.code == 429) throw Transient(why)
+                        error(why)
+                    }
+                    val bytes = r.body?.bytes() ?: error("空响应")
+                    val plain = if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second)
+                    // 先落到 .part 再改名：这一段的完成判据是「正式名字的文件的字节非空」，
+                    // 直接写进正式名字，就是让一段半截的分片冒充一片完整的。
+                    val part = File(into.parentFile, into.name + ".part")
+                    part.writeBytes(plain)
+                    promote(part, into)
+                    plain.size.toLong()
+                }
+            } finally {
+                untrackCall(id, call)
             }
-        } finally {
-            untrackCall(id, call)
         }
     }
 
@@ -666,15 +753,21 @@ class DownloadRepository(
     /**
      * 报一次累计字节，顺带算速度。
      *
-     * 取最近 3 秒那个窗口：更长的窗口会把「刚连上时的慢」平均进来，显示出一个永远在爬的假速度；
-     * 更短则抖得没法读。窗口里样本太少（不到半秒）时保留上一个值，不显示 0。
+     * 取最近 [SPEED_WINDOW_MS] 的样本，但**至少留两个**：原来剪到「只剩窗口内的样本」，
+     * 于是两次报告一旦隔得比窗口还长，队里就只剩刚进来那一个，span 恒为 0，
+     * `span >= 500` 永远不成立 —— 速度这一栏整个不会出现。慢线上这是常态：分片下载
+     * 每凑满 4 片才报一次，而 4 片在慢线上要十几秒（实测 4kku 一条 0.4 MB/s 的线，
+     * 进度从 163 MB 走到 263 MB，界面上一个速度字都没有）。
+     *
+     * 留一个窗口外的基准点后，跨度可能比 3 秒长，报出来的是这段平均 —— 慢线上本来
+     * 就只能给平均值，比「没有数字」诚实。
      */
     private fun reportBytes(id: String, totalBytes: Long) {
         val now = System.currentTimeMillis()
         val dq = speedWin.getOrPut(id) { ArrayDeque() }
         synchronized(dq) {
             dq.addLast(now to totalBytes)
-            while (dq.size > 1 && now - dq.first().first > SPEED_WINDOW_MS) dq.removeFirst()
+            while (dq.size > 2 && now - dq[1].first > SPEED_WINDOW_MS) dq.removeFirst()
             val span = now - dq.first().first
             if (span >= 500L) {
                 val perSec = ((totalBytes - dq.first().second) * 1000 / span).coerceAtLeast(0L)
@@ -752,18 +845,24 @@ class DownloadRepository(
     }
 
     private suspend fun fetchKey(uri: String, cfg: SourceConfig, auth: Map<String, String>): ByteArray =
-        withContext(Dispatchers.IO) {
-            val call = Request.Builder().url(uri)
-                .header("User-Agent", Http.UA)
-                .header("Referer", referer(cfg))
-                .apply { auth.forEach { (k, v) -> header(k, v) } }
-                .build()
-            Http.client.newCall(call).await().use { r ->
-                if (!r.isSuccessful)
-                    error(Http.failureReason(r.code, Http.errorSnippet(r)) + " —— 站点不给这把密钥，这一条缓存不了")
-                val b = r.body?.bytes() ?: error("密钥是空的")
-                if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
-                b
+        withRetry("密钥") {
+            withContext(Dispatchers.IO) {
+                val call = Request.Builder().url(uri)
+                    .header("User-Agent", Http.UA)
+                    .header("Referer", referer(cfg))
+                    .apply { auth.forEach { (k, v) -> header(k, v) } }
+                    .build()
+                Http.client.newCall(call).await().use { r ->
+                    if (!r.isSuccessful) {
+                        val why = Http.failureReason(r.code, Http.errorSnippet(r)) +
+                            " —— 站点不给这把密钥，这一条缓存不了"
+                        if (r.code in 500..599 || r.code == 429) throw Transient(why)
+                        error(why)
+                    }
+                    val b = r.body?.bytes() ?: error("密钥是空的")
+                    if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
+                    b
+                }
             }
         }
 
@@ -988,6 +1087,21 @@ class DownloadRepository(
 
         /** 速度取多长的窗口：太长会把刚连上时的慢平均进来，太短抖得读不出。 */
         const val SPEED_WINDOW_MS = 3_000L
+
+        /** 分片下载最快多久报一次进度：慢线上四片可能要十几秒，不能只按片数报。 */
+        const val REPORT_TICK_MS = 1_000L
+
+        /**
+         * 一个分片最多试几次。
+         *
+         * 三次够盖住绝大多数抖动，又不至于在对方真挂了的时候把一千个分片都拖成
+         * 三千个请求 —— 那是在拿别人的 CDN 试我们的耐心。
+         */
+        const val SEG_ATTEMPTS = 3
+        val RETRY_BACKOFF_MS = longArrayOf(400L, 1_200L)
+
+        /** 长下载过程中刷新「共 x MB」的最小间隔：那是一次整树遍历。 */
+        const val SPACE_REFRESH_MS = 15_000L
 
         /**
          * 目录名的长度上限。
