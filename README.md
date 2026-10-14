@@ -106,31 +106,38 @@ APK「下载完了但装不上」在三件事上，按概率从高到低排：
 app/src/main/java/net/cinehub/
 ├─ MainActivity.kt              单 Activity，edge-to-edge
 ├─ data/
-│  ├─ SourceRepository.kt       播放源持久化（DataStore Preferences）+ 五个内置源
+│  ├─ SourceRepository.kt       播放源持久化（DataStore Preferences）+ 内置源种子
 │  ├─ MediaRepository.kt        跨源聚合、健康检测、直链解析
+│  ├─ WatchRepository.kt        收藏 + 观看记录（同一份 DataStore，按 Media.key）
+│  ├─ DownloadRepository.kt     离线缓存：HLS 分片、AES-128 解密、断点续传
+│  ├─ DoubanRepository.kt       豆瓣公开榜单抓取 + 按榜落盘缓存
 │  ├─ model/
-│  │  ├─ Models.kt              Media / Episode / PlayLine / AggregatedMedia / Health
+│  │  ├─ Models.kt              Media / Episode / PlayLine / AggregatedMedia / Health + normalizeTitle
 │  │  ├─ StreamResolution.kt    直链解析结果 + VideoPlatforms + StreamUrls
-│  │  └─ SourceConfig.kt        SourceConfig / SourceKind / HtmlRules / ApiRules
+│  │  ├─ SourceConfig.kt        SourceConfig / SourceKind / HtmlRules / ApiRules
+│  │  ├─ Watch.kt               Favorite / HistoryEntry（含「看不看完」的判据）
+│  │  └─ Douban.kt              DoubanItem + 手写的榜单表（DoubanChart）
 │  ├─ net/Http.kt               共用 OkHttp 客户端、UA、鉴权头、失败原因中文化
 │  └─ source/
 │     ├─ SourceAdapter.kt       适配器接口 + 工厂
 │     ├─ M3uAdapter.kt          m3u / m3u8 播放列表
 │     ├─ MaccmsAdapter.kt       苹果 CMS JSON 接口（vod_* 字段）
-│     └─ HtmlAdapter.kt         网页解析 + DefaultRules + player_aaaa 直链解析
+│     ├─ HtmlAdapter.kt         网页解析 + DefaultRules + player_aaaa 直链解析
+│     └─ AiMovieAdapter.kt      带签名鉴权的前端应用（懂片帝AI）
 └─ ui/
-   ├─ AppViewModel.kt           全部状态（源 / 首页 / 搜索 / 详情 / 播放）
+   ├─ AppViewModel.kt           全部状态（源 / 首页 / 搜索 / 详情 / 播放 / 收藏 / 榜单）
    ├─ CineHubApp.kt             路由 + 底部 Tab + 系统返回键逐级回退
    ├─ components/Atoms.kt       Pill / StatusDot / PosterCard / SectionHead
    ├─ theme/                    Tokens（T）/ Dimens（Sp、R、Fs）/ Theme
-   └─ screens/                  Home / Search / Detail / Player / Source
+   └─ screens/                  Home / Search / Detail / Player / Mine / Source
+                                Library（豆瓣榜单）/ Downloads / Favorites / History
 ```
 
 技术栈：Kotlin 2.0.21 · AGP 8.7.3 · Jetpack Compose（BOM 2024.10.01）· Material3 · Media3/ExoPlayer 1.4.1（HLS + OkHttp datasource）· OkHttp 4.12.0 · jsoup 1.18.1 · Coil 2.7.0 · DataStore Preferences 1.1.7 · kotlinx-serialization-json 1.6.3。`compileSdk 35` / `minSdk 24`，namespace 与 applicationId 均为 `net.cinehub`。
 
 两点实现取舍，避免看依赖清单时产生误会：
 
-- 路由是 `CineHubApp.kt` 里一个手写的 `sealed interface Route`（Home / Search / Detail / Player / Sources），配 `BackHandler` 做逐级回退。`navigation-compose` 在依赖里但没被用到 —— 只有五个屏、状态又都在一个 ViewModel 里，手写路由比引一套 NavHost 更直接。
+- 路由是 `CineHubApp.kt` 里一个手写的 `sealed interface Route`（Home / Search / Detail / Player / Library / Sources / SourceManage / Downloads / Favorites / History），配 `BackHandler` 做逐级回退。`navigation-compose` 在依赖里但没被用到 —— 十来个屏、状态又都在一个 ViewModel 里，手写路由比引一套 NavHost 更直接。
 - 播放器用的是 `DefaultHttpDataSource`（`PlayerScreen.kt`），不是 OkHttp 那个 datasource。抓取页面走 OkHttp，播放流走 Media3 自带实现，两者互不干扰。
 
 
@@ -256,6 +263,13 @@ v1.0.4 之前它按「网页解析」接入，但它是带签名鉴权的前端�
   但只拿会话本来就能拿到的密钥，站点不给的不换也不猜。
   `SAMPLE-AES` 那类是 DRM：要把对方的条件解密方案复刻一遍才成文件，影枢不做，如实说缓存不了。
 
+- **豆瓣只读公开榜单，不碰它的账号。**
+  片库那一屏是豆瓣的榜单（`j/search_subjects` 与 `j/chart/top_list`）—— 不登录、不带任何 Cookie 或凭证，
+  带的就是一个浏览器访客本来就会带的那点东西（UA + Referer，豆瓣对裸 UA 直接拒）。
+  豆瓣**不给播放地址**，所以点一条之后是影枢拿片名去用户自己接的源里搜；
+  搜不到就明说「豆瓣有这部，接的源里没搜到同名」，并把去豆瓣的路递过去，不拿一部名字相近的片糊上去。
+  它哪天收紧这些接口，界面就如实写原因，不会装成「这个榜没片」。
+
 应用本身不托管、不存储、不分发任何视频内容，也不内置任何资源站：仓库里带的三个源地址都是用户提供的公开站点，或公开测试流（`test-streams.mux.dev`）。加什么源、看什么内容，由使用者自己决定。
 
 ---
@@ -269,6 +283,12 @@ v1.0.4 之前它按「网页解析」接入，但它是带签名鉴权的前端�
   （实测「功夫女足」：西瓜给 2026、北觅不给），而 `HtmlAdapter.detail()` 连年份都不解析。
   用整键相等去筛就会出现「搜索卡片挂三个源、点进去只剩另外两个」。只有两边都写了年份且不同，才算另一部片。
 - **切源不丢进度**：播放位置存在 `AppViewModel._resumePosition` 里，详情页和播放器里换源时带过去。播放器底栏写着「播放进度已跨源同步 / 切换源不丢进度」。
+- **收藏与观看记录都挂在 `Media.key` 上**，不是挂在某个源的 id 上 —— 同一部片从另一个源进来，收藏还是那一条，进度也还是那一条。
+  位置每 10 秒落一次盘、退出播放时补一次，所以最多丢 10 秒；「看不看完」取 `min(30 秒, 时长的 10%)` 且不低于 5 秒 ——
+  固定 30 秒会把一条 30 秒的预览在第 5 秒就判成看完，续播提示永远出不来。首页「继续观看」只列没看完的。
+- **片库 = 豆瓣榜单，点一条走的是影枢自己的跨源搜索**。豆瓣只给片名、评分、封面和条目页，不给播放地址，
+  所以这一步是拿片名去搜、**只认归一化后完全同名**的那一条：差一点就猜进去，用户看到的是另一部片，比说搜不到更糟。
+  没命中就把「去豆瓣看」递到手上。
 
 ---
 

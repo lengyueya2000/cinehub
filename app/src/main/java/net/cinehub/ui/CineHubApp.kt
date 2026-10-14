@@ -1,5 +1,8 @@
 package net.cinehub.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -39,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -46,6 +50,7 @@ import net.cinehub.ui.screens.DetailScreen
 import net.cinehub.ui.screens.DownloadsScreen
 import net.cinehub.ui.screens.HomeScreen
 import net.cinehub.ui.screens.LibraryScreen
+import net.cinehub.ui.screens.MineScreen
 import net.cinehub.ui.screens.PlayerScreen
 import net.cinehub.ui.screens.SearchScreen
 import net.cinehub.ui.screens.SiteBrowserScreen
@@ -63,6 +68,7 @@ private sealed interface Route {
     data object Player : Route
     data object Library : Route
     data object Sources : Route
+    data object SourceManage : Route
     data object Downloads : Route
     data object Favorites : Route
     data object History : Route
@@ -80,10 +86,17 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     val playing by vm.playing.collectAsState()
     val browser by vm.browser.collectAsState()
+    val ctx = LocalContext.current
 
     fun openDetail(sourceId: String, mediaId: String) {
         vm.openDetail(sourceId, mediaId)
         route = Route.Detail(sourceId, mediaId)
+    }
+
+    /** 交给系统浏览器 —— 影枢不去替豆瓣渲染页面，那已经是它自己的地盘。 */
+    fun openExternal(url: String) {
+        runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { Toast.makeText(ctx, "手机上没有能打开链接的应用", Toast.LENGTH_SHORT).show() }
     }
 
     // 系统返回键逐级回退，而不是直接退出应用
@@ -95,8 +108,10 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
             is Route.Library -> Route.Home
             is Route.Downloads -> Route.Home
             is Route.Detail -> Route.Home
-            is Route.Favorites -> Route.Home
-            is Route.History -> Route.Home
+            // 这三页都是从「我的」进来的，返回就该回到「我的」，不该弹回首页
+            is Route.SourceManage -> Route.Sources
+            is Route.Favorites -> Route.Sources
+            is Route.History -> Route.Sources
             is Route.Player -> {
                 vm.stopPlaying()
                 val d = vm.detail.value
@@ -155,6 +170,7 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                     is Route.Library -> LibraryScreen(
                         vm = vm,
                         onOpenDetail = { s, m -> openDetail(s, m) },
+                        onOpenDoubanPage = { url -> openExternal(url) },
                     )
 
                     is Route.Downloads -> DownloadsScreen(vm)
@@ -171,11 +187,16 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
-                    is Route.Sources -> SourceScreen(
+                    is Route.Sources -> MineScreen(
                         vm = vm,
-                        onBack = { route = Route.Home },
+                        onOpenSourceManage = { route = Route.SourceManage },
                         onOpenFavorites = { route = Route.Favorites },
                         onOpenHistory = { route = Route.History },
+                    )
+
+                    is Route.SourceManage -> SourceScreen(
+                        vm = vm,
+                        onBack = { route = Route.Sources },
                     )
 
                     is Route.Favorites -> FavoritesScreen(

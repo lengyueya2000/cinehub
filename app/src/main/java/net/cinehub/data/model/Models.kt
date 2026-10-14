@@ -24,18 +24,24 @@ data class Media(
      */
     val key: String
         get() = buildString {
-            append(title.filterNot { it.isWhitespace() || it in PUNCT })
+            append(normalizeTitle(title))
             year?.take(4)?.let { append('|').append(it) }
         }
-
-    private companion object {
-        /** 归并时忽略的标点：全半角括号、冒号、破折号、顿号等。 */
-        val PUNCT = setOf(
-            '(', ')', '（', '）', '[', ']', '【', '】', ':', '：', '·', '.', '。',
-            '-', '_', '—', '～', '~', '、', '，', ',', '!', '！', '?', '？', '"', '\'',
-        )
-    }
 }
+
+/**
+ * 标题归一化：去掉空白与标点。
+ *
+ * 同一个片名在各源的写法差别很大（「暗影蜘蛛侠 黑白版」/「暗影蜘蛛侠（黑白版）」/
+ * 「暗影蜘蛛侠：黑白版」），跨源比对、以及拿豆瓣的片名去源里搜，都得先走这一步。
+ */
+fun normalizeTitle(s: String): String = s.filterNot { it.isWhitespace() || it in TITLE_PUNCT }
+
+/** 归并时忽略的标点：全半角括号、冒号、破折号、顿号等。 */
+private val TITLE_PUNCT = setOf(
+    '(', ')', '（', '）', '[', ']', '【', '】', ':', '：', '·', '.', '。',
+    '-', '_', '—', '～', '~', '、', '，', ',', '!', '！', '?', '？', '"', '\'',
+)
 
 /** 一个可播放的剧集 / 分集。 */
 data class Episode(

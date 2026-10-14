@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -44,12 +43,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.SourceConfig
@@ -73,17 +70,10 @@ import net.cinehub.ui.theme.T
  * 健康状态、延迟、优先级、启停，一屏之内全部可见。
  */
 @Composable
-fun SourceScreen(
-    vm: AppViewModel,
-    onBack: () -> Unit,
-    onOpenFavorites: () -> Unit,
-    onOpenHistory: () -> Unit,
-) {
+fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val checking by vm.checking.collectAsState()
-    val favorites by vm.favorites.collectAsState()
-    val history by vm.watchHistory.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
 
@@ -128,29 +118,6 @@ fun SourceScreen(
                         Spacer4()
                         Text("添加", color = Color.White, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
                     }
-                }
-            }
-
-            // 收藏与最近观看。两者都是「用户自己的东西」，放在这一页顶部；
-            // 一条都没有时整块不出现，别用空壳占地方。
-            if (favorites.isNotEmpty()) {
-                item {
-                    ShelfRow(
-                        title = "收藏",
-                        count = favorites.size,
-                        covers = favorites.take(6).mapNotNull { it.cover },
-                        onClick = onOpenFavorites,
-                    )
-                }
-            }
-            if (history.isNotEmpty()) {
-                item {
-                    ShelfRow(
-                        title = "最近观看",
-                        count = history.size,
-                        covers = history.take(6).mapNotNull { it.cover },
-                        onClick = onOpenHistory,
-                    )
                 }
             }
 
@@ -755,54 +722,5 @@ private fun KindTile(
         )
         Spacer4()
         Text(sub, color = T.TextFaint, fontSize = Fs.tiny)
-    }
-}
-
-/**
- * 「我的」顶部的一格入口：标题 + 数量 + 几张封面打头 + 箭头。
- *
- * 封面只是给个「都是哪些片」的视觉线索，点进去才看全 ——
- * 所以这里不铺满，一排小图就够，不跟下面的源列表抢注意力。
- */
-@Composable
-internal fun ShelfRow(
-    title: String,
-    count: Int,
-    covers: List<String?>,
-    onClick: () -> Unit,
-) {
-    Row(
-        Modifier.fillMaxWidth().padding(top = Sp.s3)
-            .clip(R.lg).background(T.Surface2)
-            .border(1.dp, T.Border, R.lg)
-            .clickable(onClick = onClick)
-            .padding(horizontal = Sp.s4, vertical = Sp.s3),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(title, color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
-                Spacer8()
-                Text("$count", color = T.Src500, fontSize = Fs.body2, fontWeight = FontWeight.ExtraBold)
-            }
-            Spacer4()
-            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                covers.forEach { c ->
-                    Box(
-                        Modifier.width(26.dp).height(36.dp).clip(R.sm).background(T.Surface3),
-                    ) {
-                        if (!c.isNullOrBlank()) {
-                            AsyncImage(
-                                model = c,
-                                contentDescription = null,
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize(),
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        Icon(Icons.Filled.ChevronRight, null, tint = T.TextFaint, modifier = Modifier.size(20.dp))
     }
 }

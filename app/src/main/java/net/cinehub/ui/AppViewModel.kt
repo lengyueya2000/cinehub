@@ -9,11 +9,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
 import net.cinehub.data.model.AggregatedMedia
+import net.cinehub.data.model.DoubanChart
+import net.cinehub.data.model.DoubanItem
 import net.cinehub.data.model.DownloadTask
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Favorite
@@ -27,6 +30,7 @@ import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.VideoPlatforms
+import net.cinehub.data.model.normalizeTitle
 import net.cinehub.data.model.userNote
 import net.cinehub.data.source.SourceAdapters
 
@@ -35,6 +39,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val sourceRepo = SourceRepository(app)
     private val mediaRepo = MediaRepository(sourceRepo)
     private val watchRepo = WatchRepository(app)
+    private val doubanRepo = DoubanRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
     val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
@@ -42,6 +47,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
     val watchHistory: StateFlow<List<HistoryEntry>> = watchRepo.history
+
+    // ---------- 豆瓣榜单 ----------
+
+    private val _doubanChart = MutableStateFlow(DoubanChart.MOVIE.first())
+    val doubanChart: StateFlow<DoubanChart> = _doubanChart.asStateFlow()
+
+    private val _doubanItems = MutableStateFlow<List<DoubanItem>>(emptyList())
+    val doubanItems: StateFlow<List<DoubanItem>> = _doubanItems.asStateFlow()
+
+    private val _doubanLoading = MutableStateFlow(false)
+    val doubanLoading: StateFlow<Boolean> = _doubanLoading.asStateFlow()
+
+    /** 拉取失败的原因。列表还在的时候它是一条附注，不是把列表换掉。 */
+    private val _doubanError = MutableStateFlow<String?>(null)
+    val doubanError: StateFlow<String?> = _doubanError.asStateFlow()
+
+    /** 当前这份列表是什么时候取回来的；0 = 还没成功过。 */
+    private val _doubanAt = MutableStateFlow(0L)
+    val doubanAt: StateFlow<Long> = _doubanAt.asStateFlow()
+
+    /** 正在按片名去源里找的那一条的 id，用来在卡片上给个反馈。 */
+    private val _doubanResolving = MutableStateFlow<String?>(null)
+    val doubanResolving: StateFlow<String?> = _doubanResolving.asStateFlow()
 
     // ---------- 播放源 ----------
     private val _sources = MutableStateFlow<List<SourceConfig>>(emptyList())
@@ -672,6 +700,80 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 mediaYear = d?.media?.year ?: e.year,
                 mediaCover = d?.media?.cover ?: e.cover,
             )
+        }
+    }
+
+    // ---------- 豆瓣榜单 ----------
+
+    /**
+     * 豆瓣的一条 → 影枢接的源里到底有没有这部。
+     *
+     * 豆瓣不给播放地址，所以只能拿片名去搜。这里**只认归一化后完全同名**的：
+     * 差一点就「猜」进去，用户看到的是另一部片，比说搜不到更糟。
+     *
+     * 命中与否都交回调用方处理 —— 导航是界面那边的事（ ViewModel 里那个
+     * `openDetail` 只把详情取回来，不改路由）。
+     */
+    fun openFromDouban(
+        item: DoubanItem,
+        onHit: (Media) -> Unit,
+        onMiss: (DoubanItem) -> Unit,
+    ) {
+        viewModelScope.launch {
+            _doubanResolving.value = item.id
+            val hits = runCatching { mediaRepo.search(item.title) }.getOrDefault(emptyList())
+            _doubanResolving.value = null
+            val want = normalizeTitle(item.title)
+            val match = hits.firstOrNull { normalizeTitle(it.media.title) == want }
+            if (match == null) onMiss(item) else onHit(match.media)
+        }
+    }
+
+    /**
+     * 进片库时调一次：先把落盘那份放上去，再后台刷新。
+     *
+     * 不在应用启动时拉 —— 用户可能根本不点片库，没必要一开屏就去敲豆瓣的门。
+     */
+    fun ensureDouban() {
+        if (_doubanItems.value.isEmpty()) doubanRepo.cached(_doubanChart.value.id)?.let {
+            _doubanItems.value = it.items
+            _doubanAt.value = it.at
+        }
+        if (!_doubanLoading.value) refreshDouban()
+    }
+
+    /** 切榜：先把上次那份缓存放上去，再后台刷新。 */
+    fun selectDoubanChart(chart: DoubanChart) {
+        if (chart.id == _doubanChart.value.id) return
+        _doubanChart.value = chart
+        val snap = doubanRepo.cached(chart.id)
+        _doubanItems.value = snap?.items ?: emptyList()
+        _doubanAt.value = snap?.at ?: 0L
+        _doubanError.value = null
+        refreshDouban()
+    }
+
+    fun refreshDouban() {
+        val chart = _doubanChart.value
+        _doubanLoading.value = true
+        viewModelScope.launch {
+            val res = runCatching { doubanRepo.fetch(chart) }
+            // 拉回来这段时间里用户可能已经切走了，别把结果泼到新的榜上
+            if (chart.id != _doubanChart.value.id) {
+                _doubanLoading.value = false
+                return@launch
+            }
+            res.onSuccess { items ->
+                doubanRepo.put(chart, items)
+                _doubanItems.value = items
+                _doubanAt.value = System.currentTimeMillis()
+                _doubanError.value = null
+            }.onFailure {
+                // 有旧数据就留着旧数据，只把原因写在旁边：
+                // 一次网络抖动不该把一整屏片清空。
+                _doubanError.value = it.message ?: "拉取失败"
+            }
+            _doubanLoading.value = false
         }
     }
 
