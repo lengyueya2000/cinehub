@@ -1,13 +1,19 @@
 package net.cinehub.data.net
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * 所有源共用的 HTTP 客户端。
@@ -56,9 +62,10 @@ object Http {
         referer?.let { b.header("Referer", it) }
         headers.forEach { (k, v) -> b.header(k, v) }
         client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
-            .newCall(b.build()).execute().use { r ->
-                if (!r.isSuccessful) error(failureReason(r.code))
-                r.body?.string() ?: error("空响应")
+            .newCall(b.build()).await().use { r ->
+                val body = r.body?.string()
+                if (!r.isSuccessful) error(failureReason(r.code, body.orEmpty()))
+                body ?: error("空响应")
             }
     }
 
@@ -79,10 +86,11 @@ object Http {
         referer?.let { b.header("Referer", it) }
         headers.forEach { (k, v) -> b.header(k, v) }
         client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
-            .newCall(b.build()).execute().use { r ->
-                if (!r.isSuccessful) error(failureReason(r.code))
+            .newCall(b.build()).await().use { r ->
+                val body = r.body?.string()
+                if (!r.isSuccessful) error(failureReason(r.code, body.orEmpty()))
                 ResponseBody(
-                    body = r.body?.string() ?: error("空响应"),
+                    body = body ?: error("空响应"),
                     setCookie = r.headers("Set-Cookie").joinToString("; ") {
                         it.substringBefore(';')
                     }.takeIf { it.isNotBlank() },
@@ -101,7 +109,7 @@ object Http {
         val b = Request.Builder().url(url).header("User-Agent", UA).post(json.toRequestBody(mediaType))
         headers.forEach { (k, v) -> b.header(k, v) }
         client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
-            .newCall(b.build()).execute().use { r ->
+            .newCall(b.build()).await().use { r ->
                 ResponseBody(
                     body = r.body?.string().orEmpty(),
                     status = r.code,
@@ -131,8 +139,10 @@ object Http {
             .readTimeout(8, TimeUnit.SECONDS)
             .connectTimeout(8, TimeUnit.SECONDS)
             .build()
-            .newCall(b.build()).execute().use { r: Response ->
-                if (!r.isSuccessful) error(failureReason(r.code))
+            .newCall(b.build()).await().use { r: Response ->
+                // 「测试连接」这句结论要能自证 —— 拒答页正文里写着真正的原因，
+                // 不读它就只能猜。成功路径不读整页，白省一次下行。
+                if (!r.isSuccessful) error(failureReason(r.code, errorSnippet(r)))
                 System.currentTimeMillis() - t0
             }
     }
@@ -140,26 +150,99 @@ object Http {
     /**
      * 把状态码翻译成用户能理解的原因。
      *
-     * 567 是腾讯 EdgeOne 的安全拦截码，直接显示「HTTP 567」对用户毫无意义 ——
-     * 它真正传达的是「这个站在你所在的网络环境下拒绝访问」。
-     * 403 同理：这些聚合站的直链多数挂在第三方 CDN 上，实测拒因是来源校验或
-     * 访问地区（正文里就写着 The region has been denied），都不是重试能解决的。
+     * 光看状态码翻译不准，同一个 403 后面可能是两件完全不同的事，而给错的下一步
+     * 会把人支使得更久：实测 4kcz 拒的是雷池（SafeLine）的浏览器验证 —— 同一台机器、
+     * 同一个中国出口 IP，模拟器里的 Chrome 打得开，带齐 Chrome 请求头、甚至把它下发的
+     * sl-session 原样带回去重放，OkHttp 这边照样是 403。这时候说「换一条线路」是错的，
+     * 换网络不会有任何变化，真正的答案是「这个源接不进来」。
+     * 另一类 403 才是地区的：dytt 系直链的 CDN 正文里明写 The region has been denied，
+     * 那种确实是换网络能解决的。
+     *
+     * 所以正文要传进来。没有正文时（比如探测延迟那种不读体的调用）退回按状态码说，
+     * 并且不再断言原因。
      */
-    fun failureReason(code: Int): String = when (code) {
-        567 -> "安全策略拦截"
-        403 -> "拒绝访问 —— 对方按来源或访问地区放行，换一条线路或换一个源"
-        404 -> "地址不存在"
-        429 -> "请求过于频繁"
-        in 500..599 -> "站点异常 $code"
+    fun failureReason(code: Int, body: String = ""): String = when {
+        code == 403 || code == 451 || code == 567 -> when {
+            body.hasMarker(browserMarkers) ->
+                "对方要求浏览器验证（这类站在访问前摆了一道反爬的题，只有真的浏览器答得上来）—— " +
+                    "这个源接不进搜索和首页，影枢也不去替程序答那道题。用「站点页取链」打开它，或者换一个源"
+
+            body.hasMarker(regionMarkers) ->
+                "拒绝来自访问地区 —— 换一条线路，或者换一个源"
+
+            else -> "拒绝访问 —— 可能按来源、地区或客户端放行。换一条线路，或换一个源；" +
+                "「站点页取链」是按浏览器的方式打开，有时能取到"
+        }
+
+        code == 404 -> "地址不存在"
+        code == 429 -> "请求过于频繁"
+        code in 500..599 -> "站点异常 $code"
         else -> "HTTP $code"
     }
+
+    /** 拦下访问时用来判定的字样：浏览器验证那一类。 */
+    private val browserMarkers = listOf(
+        "safeline", "雷池", "chaitin", "access forbidden", "访问已被拦截",
+        "just a moment", "attention required", "cf-chl", "cloudflare",
+        "captcha", "验证码", "人机验证", "滑块",
+    )
+
+    /** 另一类：明写按地区拒绝的。 */
+    private val regionMarkers = listOf(
+        "region has been denied", "region denied", "not available in your region",
+        "地区", "仅限中国大陆",
+    )
+
+    private fun String.hasMarker(markers: List<String>): Boolean {
+        if (isEmpty()) return false
+        val low = lowercase()
+        return markers.any { low.contains(it) }
+    }
+
+    /**
+     * 取错误响应的正文前若干字节，供 [failureReason] 判定。
+     *
+     * 只在失败这一条路上调，所以正文本来也没别用。拦下访问的页面都很小（实测十几 KB），
+     * 截断到 8 KB 够把字样看到了。
+     */
+    fun errorSnippet(r: Response): String =
+        runCatching { r.body?.string() }.getOrNull()?.take(8_000).orEmpty()
 
     /** 解析站点 baseUrl 是否可用，返回最终生效的 baseUrl（可能被重定向）。 */
     suspend fun resolveBase(base: String): String = withContext(Dispatchers.IO) {
         val b = Request.Builder().url(base).header("User-Agent", UA)
-        client.newCall(b.build()).execute().use { r ->
-            if (!r.isSuccessful) error("HTTP ${r.code}")
+        client.newCall(b.build()).await().use { r ->
+            if (!r.isSuccessful) error(failureReason(r.code, errorSnippet(r)))
             r.request.url.toString().trimEnd('/')
         }
     }
+}
+
+/**
+ * 把一次请求挂到协程上。
+ *
+ * 原来这几处都是 `withContext(Dispatchers.IO) { call.execute() }` —— 那个 `execute()`
+ * 卡住的是线程，不是协程。取消只能等它自己回来，所以用户退出搜索页、换源、切集之后，
+ * 那一串请求还在跑：慢站 20 秒超时，连着点几次就是几十个连接同时压着同一个站点，
+ * 而它们的结果早就没人要了。走 enqueue + cancel 才是真的能掐断。
+ *
+ * 响应体交给调用方 `use`：这里不读，读是阻塞的，得留在 IO 线程上。
+ * 缓存那边也用它 —— 暂停要的是「这一片立刻停」，不是「等这一片下完再说」。
+ */
+suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
+    cont.invokeOnCancellation { runCatching { cancel() } }
+    enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            if (!cont.isCancelled) cont.resumeWithException(e)
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            if (cont.isCancelled) {
+                // 协程已经走了，没人接手这个响应 —— 不 close 就是漏一个连接
+                runCatching { response.close() }
+            } else {
+                cont.resume(response)
+            }
+        }
+    })
 }

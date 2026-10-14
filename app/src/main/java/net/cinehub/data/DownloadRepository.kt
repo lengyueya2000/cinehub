@@ -32,6 +32,7 @@ import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.userNote
 import net.cinehub.data.net.Http
+import net.cinehub.data.net.await
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
@@ -297,7 +298,7 @@ class DownloadRepository(
             // 这一笔已经被摘走（暂停、删除、重下时被新的接管）就别写状态：
             // 被 cancel 的 OkHttp 抛的是 IOException，照原样记会写成一条假的「连接被切断」
             if (id in pausedByUser || jobs[id] !== self) return
-            patch(id, persist = true) { it.copy(status = DownloadStatus.Failed, error = reasonOf(e)) }
+            patch(id, persist = true) { it.copy(status = DownloadStatus.Failed, error = reasonOf(e, it)) }
         } finally {
             synchronized(queueLock) {
                 // 只摘自己这一笔：重开同一集时 map 里已经换成新的壳了，按 id 盲删会把
@@ -332,6 +333,30 @@ class DownloadRepository(
         e is java.io.IOException ->
             "连接被对方切断 —— 这条线路对你当前的网络不开放，或地址已失效。换一条线路，或换一个源再缓存。"
         else -> e.message ?: "下载失败"
+    }
+
+    /**
+     * 带进度的那一版判词。
+     *
+     * 上面那句「这条线路对你当前的网络不开放」只在**一个字节都没拿到**时才成立。
+     * 实测缓存 4kku 的一集，先稳稳存下 163 MB，然后中途断开 —— 界面照样写着
+     * 「线路对你不开放，换一个源」。那是把方向指错：线路是开着的，它已经给了 163 MB，
+     * 用户照这句话去换源，反而把已经存下的那半集丢了。
+     */
+    private fun reasonOf(e: Exception, t: DownloadTask): String {
+        val got = t.bytesDone
+        if (got > 0L && e is java.io.IOException) {
+            val pct = if (t.bytesTotal > 0) "，约 ${(got * 100 / t.bytesTotal).coerceAtMost(99)}%" else ""
+            return "存下 ${fmtSize(got)}$pct 之后连接断了 —— 已经落盘的那些分片还在，" +
+                "点继续会从没下完的分片接着来，不用整集重下。"
+        }
+        return reasonOf(e)
+    }
+
+    private fun fmtSize(b: Long): String = when {
+        b >= 1_073_741_824 -> "%.1f GB".format(b / 1_073_741_824.0)
+        b >= 1_048_576 -> "%.1f MB".format(b / 1_048_576.0)
+        else -> "%.0f KB".format(b / 1024.0)
     }
 
     private suspend fun download(id: String) {
@@ -383,8 +408,8 @@ class DownloadRepository(
             // 失败模式多、收益小 —— 界面上一句「按字节续传」说的就是这一条。
             val call = newCall(id, url, cfg, rangeFrom = have.takeIf { it > 0 })
             try {
-                call.execute().use { r ->
-                    if (!r.isSuccessful) error(Http.failureReason(r.code))
+                call.await().use { r ->
+                    if (!r.isSuccessful) error(Http.failureReason(r.code, Http.errorSnippet(r)))
                     val resumed = have > 0 && r.code == 206
                     var done = if (resumed) have else 0L
                     if (!resumed) { out.delete(); done = 0L }
@@ -580,8 +605,8 @@ class DownloadRepository(
         ensureActive()
         val call = newCall(id, url, cfg, rangeFrom = null)
         try {
-            call.execute().use { r ->
-                if (!r.isSuccessful) error(Http.failureReason(r.code))
+            call.await().use { r ->
+                if (!r.isSuccessful) error(Http.failureReason(r.code, Http.errorSnippet(r)))
                 val bytes = r.body?.bytes() ?: error("空响应")
                 val plain = if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second)
                 // 先落到 .part 再改名：这一段的完成判据是「正式名字的文件的字节非空」，
@@ -733,9 +758,9 @@ class DownloadRepository(
                 .header("Referer", referer(cfg))
                 .apply { auth.forEach { (k, v) -> header(k, v) } }
                 .build()
-            Http.client.newCall(call).execute().use { r ->
+            Http.client.newCall(call).await().use { r ->
                 if (!r.isSuccessful)
-                    error(Http.failureReason(r.code) + " —— 站点不给这把密钥，这一条缓存不了")
+                    error(Http.failureReason(r.code, Http.errorSnippet(r)) + " —— 站点不给这把密钥，这一条缓存不了")
                 val b = r.body?.bytes() ?: error("密钥是空的")
                 if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
                 b
