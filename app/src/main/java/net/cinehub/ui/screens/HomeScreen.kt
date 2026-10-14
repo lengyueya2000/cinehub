@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -83,21 +84,41 @@ fun HomeScreen(
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val history by vm.watchHistory.collectAsState()
-    // 选中的类型是本页的临时状态：退出首页就消失，不写进 ViewModel、不落盘。
+    val homeAt by vm.homeAt.collectAsState()
+    val homeSource by vm.homeSource.collectAsState()
+
+    // 首页什么时候该重新拉：快照过满 12 小时，或者「取回这一页时那套源的顺序」变了。
+    // 每次回到首页都会检查一次，但指纹没变时 loadHome 比完字符串就返回，不会去敲站点的门 ——
+    // 用户要的不是「别检查」，是「别每次进来都重拉」。
+    val homeFingerprint = sources.filter { it.enabled }.sortedBy { it.priority }
+        .joinToString("|") { "${it.id}:${it.priority}" }
+    LaunchedEffect(homeFingerprint) { vm.loadHome() }
+    // 三排筛选都是本页的临时状态：退出首页就消失，不写进 ViewModel、不落盘。
     // 键在 home 上 —— 换了一页内容就是另一批条目，旧筛选不该继续作用在它上面。
     var cat by remember(home) { mutableStateOf<String?>(null) }
+    var area by remember(home) { mutableStateOf<String?>(null) }
+    var year by remember(home) { mutableStateOf<String?>(null) }
 
     val hero = home.firstOrNull()
     // 下面的列表从第二条起列（hero 已经是这一页的第一条），否则同一部片会在屏幕上出现两次。
     val rest = home.drop(1)
     val enabledSources = sources.count { it.enabled }
 
-    // 芯片只列这一页里真出现过的类型（写死一串名字就会造出点了没反应的假芯片）。
-    // 一个可信的类型都取不到时整排不渲染，而不是留一排骗人的按钮。
-    val chips = remember(rest) { categoryChips(rest) }
-    // 不给类型的条目在选中某类型时被排除 —— 这是筛选的定义，不是列表坏了，
+    // 芯片只列这一页里真出现过的值（写死一串名字就会造出点了没反应的假芯片）。
+    // 一个可信的值都取不到时那一排不渲染，而不是留一排骗人的按钮。
+    val catChips = remember(rest) { categoryChips(rest) }
+    val areaList = remember(rest) { areaChips(rest) }
+    val yearList = remember(rest) { yearChips(rest) }
+    // 不给类型/地区/年份的条目在选中该条件时被排除 —— 这是筛选的定义，不是列表坏了，
     // 所以筛空了要专门说一句，并留一个清掉筛选的动作。
-    val shown = if (cat == null) rest else rest.filter { it.category?.trim() == cat }
+    val shown = rest.filter { m ->
+        (cat == null || m.category?.trim() == cat) &&
+            (area == null || m.area?.trim() == area) &&
+            (year == null || m.year?.trim() == year)
+    }
+    // 三个条件是「且」的关系，所以「清除筛选」只要有一个挂着就该出现
+    val activeFilters = listOfNotNull(cat?.let { "类型「$it」" }, area?.let { "地区「$it」" }, year?.let { "年份「$it」" })
+    val clearFilters = { cat = null; area = null; year = null }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -143,6 +164,20 @@ fun HomeScreen(
                 Box(Modifier.fillMaxWidth().height(222.dp).padding(horizontal = Sp.s4), contentAlignment = Alignment.Center) {
                     Text("正在从 $enabledSources 个播放源获取内容…", color = T.TextDim, fontSize = Fs.sm)
                 }
+            }
+        }
+
+        // 刷新没成但旧内容还在屏上：这句必须说，否则用户会以为下面这一页就是刚取回来的。
+        // 上面那块「没有可用的播放源」只在首页全空时出现，管不到这一种情况。
+        if (error != null && home.isNotEmpty()) {
+            item {
+                Text(
+                    error!!,
+                    color = T.Warn,
+                    fontSize = Fs.xs,
+                    lineHeight = Fs.xs * 1.6f,
+                    modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s2),
+                )
             }
         }
 
@@ -214,34 +249,55 @@ fun HomeScreen(
             }
         }
 
-        if (chips.isNotEmpty()) {
+        if (catChips.isNotEmpty()) {
             item {
-                LazyRow(
-                    Modifier.padding(top = Sp.s4),
-                    contentPadding = PaddingValues(horizontal = Sp.s4),
-                    horizontalArrangement = Arrangement.spacedBy(Sp.s2),
-                ) {
-                    item {
-                        CatChip("全部", on = cat == null) { cat = null }
-                    }
-                    items(chips) { (name, count) ->
-                        // 再点一次已选中的芯片等于取消，回到不过滤的原样
-                        CatChip("$name $count", on = cat == name) {
-                            cat = if (cat == name) null else name
-                        }
-                    }
-                }
+                ChipRow("全部类型", catChips, cat) { c -> cat = if (cat == c) null else c }
+            }
+        }
+        if (areaList.isNotEmpty()) {
+            item {
+                ChipRow("全部地区", areaList, area) { a -> area = if (area == a) null else a }
+            }
+        }
+        if (yearList.isNotEmpty()) {
+            item {
+                ChipRow("全部年份", yearList, year) { y -> year = if (year == y) null else y }
             }
         }
 
         if (rest.isNotEmpty()) {
             item {
-                SectionHead(
-                    homeSectionTitle(rest, sources),
-                    trailing = if (cat != null) "清除筛选" else null,
-                    onTrailing = if (cat != null) ({ cat = null }) else null,
-                    modifier = Modifier.padding(horizontal = Sp.s4, vertical = Sp.s4),
-                )
+                Column(Modifier.padding(horizontal = Sp.s4)) {
+                    SectionHead(
+                        homeSectionTitle(rest, sources, homeSource),
+                        trailing = if (activeFilters.isNotEmpty()) "清除筛选" else null,
+                        onTrailing = if (activeFilters.isNotEmpty()) clearFilters else null,
+                        modifier = Modifier.padding(top = Sp.s4, bottom = Sp.s1),
+                    )
+                    // 这一页是缓存下来的快照，不说清几点取回的就没人知道它有多新；
+                    // 手动刷新是唯一的「现在就重取」入口（自动只在过 12 小时或源顺序变了时才发生）。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (homeAt > 0L) {
+                            Text(
+                                "取回于 ${formatFetchedAt(homeAt)} · 12 小时内不重取",
+                                color = T.TextFaint,
+                                fontSize = Fs.tiny,
+                            )
+                        }
+                        Box(Modifier.weight(1f))
+                        Text(
+                            if (loading) "正在取…" else "↻ 刷新这一页",
+                            color = if (loading) T.TextFaint else T.Src500,
+                            fontSize = Fs.xs,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .clip(R.full)
+                                .clickable(enabled = !loading, onClick = vm::refreshHome)
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
+                    Spacer4()
+                }
             }
 
             if (shown.isEmpty()) {
@@ -249,10 +305,10 @@ fun HomeScreen(
                 // 这时候要说的是「这个条件下没有」而不是「没有内容」，并给一个能点的退出口。
                 item {
                     Column(Modifier.padding(horizontal = Sp.s4)) {
-                        Text("「$cat」在这一页里没有内容", color = T.TextDim, fontSize = Fs.sm)
+                        Text("${activeFilters.joinToString(" 且 ")}在这一页里没有内容", color = T.TextDim, fontSize = Fs.sm)
                         Spacer4()
                         Text(
-                            "有些播放源不给条目返回类型信息，这类内容会被类型筛选排除掉。",
+                            "有些播放源不给条目返回类型、地区、年份信息，这类内容会被筛选排除掉。",
                             color = T.TextFaint,
                             fontSize = Fs.xs,
                         )
@@ -262,7 +318,7 @@ fun HomeScreen(
                             color = T.Play400,
                             fontSize = Fs.sm,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clickable { cat = null },
+                            modifier = Modifier.clickable { clearFilters() },
                         )
                     }
                 }
@@ -319,15 +375,30 @@ fun HomeScreen(
 /**
  * 首页列表的栏目标题：只说这份数据撑得起的话。
  *
- * 仓库给的 home() 是「第一个能取到内容的源」返回的那一页，顺序就是源自己列的顺序 ——
+ * 仓库给的是「第一个能取到内容的源」返回的那一页，顺序就是源自己列的顺序 ——
  * 既没有热度也没有更新时间，所以「热播榜」「最近更新」两个标题都在承诺没做过的排序。
  * 这里只陈述真是如此的事：这些条目出自哪个源的这一页。
+ *
+ * [snapshotSource] 是取回这一页时记下的源 id。优先用它而不是从条目现推 ——
+ * 条目上的 sourceId 是它们各自的出身，快照换过源以后两者会不一致，那时要说的是这一页出自谁。
  */
-private fun homeSectionTitle(items: List<Media>, sources: List<SourceConfig>): String {
-    val ids = items.map { it.sourceId }.distinct()
-    // 万一将来首页改成多源拼接，这句「均来自」就不成立了，退回一句不会错的话
-    val name = if (ids.size == 1) sources.firstOrNull { it.id == ids.first() }?.name else null
+private fun homeSectionTitle(items: List<Media>, sources: List<SourceConfig>, snapshotSource: String?): String {
+    val id = snapshotSource ?: items.map { it.sourceId }.distinct().singleOrNull()
+    val name = id?.let { i -> sources.firstOrNull { it.id == i }?.name }
     return if (name != null) "均来自「$name」· 这一页" else "这一页给的"
+}
+
+/**
+ * 快照取回的时刻，只到分钟。
+ *
+ * 日期只在不是今天的时候才带 —— 「今天 09:32」比「10-14 09:32」更直接回答「这页新不新」。
+ * 用 SimpleDateFormat 而不是 java.time：minSdk 24，后者要 API 26 才在设备上跑得起来。
+ */
+private fun formatFetchedAt(at: Long): String {
+    val day = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.CHINA)
+    val sameDay = day.format(java.util.Date(at)) == day.format(java.util.Date())
+    val hm = java.text.SimpleDateFormat("HH:mm", java.util.Locale.CHINA).format(java.util.Date(at))
+    return if (sameDay) "今天 $hm" else "${java.text.SimpleDateFormat("M月d日", java.util.Locale.CHINA).format(java.util.Date(at))} $hm"
 }
 
 /**
@@ -337,10 +408,53 @@ private fun homeSectionTitle(items: List<Media>, sources: List<SourceConfig>): S
  * 免得「点了以后什么都不剩」被当成坏了。
  */
 private fun categoryChips(items: List<Media>): List<Pair<String, Int>> =
-    items.mapNotNull { it.category?.trim()?.takeIf { c -> c.isNotEmpty() } }
-        .groupingBy { it }.eachCount()
-        .entries.sortedByDescending { it.value }
+    chipCount(items) { it.category?.trim()?.takeIf { c -> c.isNotEmpty() } }
+
+/** 地区芯片。播放源常把空值写成 "0" 或纯数字，这类当没有处理，不做成芯片。 */
+private fun areaChips(items: List<Media>): List<Pair<String, Int>> =
+    chipCount(items) {
+        it.area?.trim()?.takeIf { a -> a.isNotEmpty() && a.any { c -> !c.isDigit() && !c.isWhitespace() } }
+    }
+
+/**
+ * 年份芯片，按年份从新到旧排。
+ *
+ * 只认 1900–2100 的四位数字：源里混着 "0"、"更新至第5集" 这类脏值，
+ * 让它们进芯片就等于一排点了没反应的按钮。
+ */
+private fun yearChips(items: List<Media>): List<Pair<String, Int>> =
+    chipCount(items) {
+        it.year?.trim()?.takeIf { y -> y.length == 4 && y.all { c -> c.isDigit() } && y.toInt() in 1900..2100 }
+    }.sortedByDescending { it.first }
+
+private fun chipCount(items: List<Media>, pick: (Media) -> String?): List<Pair<String, Int>> =
+    items.mapNotNull(pick).groupingBy { it }.eachCount().entries
+        .sortedByDescending { it.value }
         .map { it.key to it.value }
+
+/** 一排筛选芯片：首格是「全部X」，其余每格带命中条数；再点已选中的那格等于取消。 */
+@Composable
+private fun ChipRow(
+    allLabel: String,
+    chips: List<Pair<String, Int>>,
+    selected: String?,
+    onSelect: (String?) -> Unit,
+) {
+    LazyRow(
+        Modifier.padding(top = Sp.s2),
+        contentPadding = PaddingValues(horizontal = Sp.s4),
+        horizontalArrangement = Arrangement.spacedBy(Sp.s2),
+    ) {
+        item {
+            CatChip(allLabel, on = selected == null) { onSelect(null) }
+        }
+        items(chips) { (name, count) ->
+            CatChip("$name $count", on = selected == name) {
+                onSelect(if (selected == name) null else name)
+            }
+        }
+    }
+}
 
 /** 类型芯片。选中态靠底色 + 文字双重表达，不单靠颜色。 */
 @Composable

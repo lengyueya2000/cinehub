@@ -70,6 +70,8 @@ class MediaRepository(private val sources: SourceRepository) {
     /** 跨源搜索并归并。 */
     suspend fun search(keyword: String): SearchOutcome = coroutineScope {
         val active = sources.active()
+        // 用户拖出来的那个顺序，排序时要用（SourceAvailability 上不带优先级，所以单独传一份）
+        val priority = active.withIndex().associate { (i, cfg) -> cfg.id to (i + 1) }
         val per = active.map { cfg ->
             // 这里不按健康度设闸门：探根路径失败不代表这个源取不到内容，
             // 拿 Down 当闸门会让一次抖动把源整个会话判死 —— 表现就是「搜索失效、少了几个源」。
@@ -122,8 +124,11 @@ class MediaRepository(private val sources: SourceRepository) {
             items = merged.entries.map { (key, av) ->
                 AggregatedMedia(
                     media = seed.getValue(key),
+                    // 先按用户在「播放源管理」里拖出来的顺序，再看能不能播、多快：
+                    // 顺序是他表达过的意图，比一次探测到的延迟更该被尊重（延迟只用来在同优先级里分先后）
                     availability = av.sortedWith(
                         compareBy(
+                            { priority[it.sourceId] ?: Int.MAX_VALUE },
                             { it.health == Health.Down },
                             { it.health == Health.Slow },
                             { it.latencyMs ?: Long.MAX_VALUE },
@@ -135,21 +140,24 @@ class MediaRepository(private val sources: SourceRepository) {
         )
     }
 
+    /** [homeWithSource] 的两部分：内容，和它是哪个源给的 —— 首页标题要说这个名字。 */
+    data class HomeFeed(val items: List<Media>, val sourceId: String)
+
     /**
-     * 首页 / 片库：取优先级最高的可用源的内容。
+     * 首页 / 片库那一页：取优先级最高的、真给了内容的那个源的那一页。
      *
      * 之前 logic 只从一个源取，导致「片库」整页都空着、且聚合不出别的源。
-     * 现在优先取北觅这类真能给内容的源（按优先级），但至少把命中的那一个铺满。
-     * v1.0.3 起片库页直接复用这个列表。
+     * 现在按优先级依次试，至少把命中的那一个铺满，并把它是谁带回去
+     * ——「均来自〈源名〉」这句话得有依据。
      */
-    suspend fun home(): List<Media> = coroutineScope {
+    suspend fun homeWithSource(): HomeFeed = coroutineScope {
         val active = sources.active()
         for (cfg in active) {
             // 同样不按健康度跳过：探根路径失败的源照样可能给出内容，取不到自然会落到下一个
             val list = quietly { SourceAdapters.create(cfg).browse(1) }.getOrNull().orEmpty()
-            if (list.isNotEmpty()) return@coroutineScope list
+            if (list.isNotEmpty()) return@coroutineScope HomeFeed(list, cfg.id)
         }
-        emptyList()
+        HomeFeed(emptyList(), "")
     }
 
     suspend fun detail(cfg: SourceConfig, id: String): MediaDetail =

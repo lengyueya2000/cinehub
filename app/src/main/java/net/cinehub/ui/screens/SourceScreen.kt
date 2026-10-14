@@ -3,6 +3,7 @@ package net.cinehub.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DragIndicator
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -44,10 +46,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.SourceConfig
@@ -78,6 +85,22 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val unreadable by vm.sourcesUnreadable.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
+
+    // 界面上的顺序 = 优先级顺序。落盘那份不保证有序，所以这里自己排一次；
+    // 拖拽要在「看得见的那份顺序」上做，否则拖完对不上号。
+    val order = remember(sources) { sources.sortedBy { it.priority }.map { it.id } }
+    val byId = remember(sources) { sources.associateBy { it.id } }
+
+    // 拖拽排序的临时状态：material3 这一版还没有可用的 reorderable 列表，只能自己接手势。
+    // dragTo 只是「松手会落到第几位」，真正的顺序要等 vm.reorder 落库、sources 重新发一次才算数。
+    var dragId by remember { mutableStateOf<String?>(null) }
+    var dragDy by remember { mutableStateOf(0f) }
+    var dragTo by remember { mutableStateOf(-1) }
+    // 每一行本来占在哪、多高。用普通 HashMap 而不是 State：
+    // 记进 State 会变成「布局 → 记录 → 重组 → 布局」转个不停；读它的只有拖动回调和紧随的那次重组，
+    // 那时值已经写好了。
+    val tops = remember { HashMap<String, Float>() }
+    val heights = remember { HashMap<String, Float>() }
 
     val ok = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Ok }
     val slow = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Slow }
@@ -173,9 +196,10 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     }
                     Spacer12()
                     Text(
-                        "点某一行的「上移」调整优先级 · 数字越小越优先",
+                        "长按行首的拖动手柄换位置，也可以点某一行的「上移」· 越靠上越优先",
                         color = T.TextDim,
                         fontSize = Fs.xxs,
+                        lineHeight = Fs.xxs * 1.6f,
                     )
                     // 落盘那份读不通时不能装作一切正常：现在屏上这几条是内置源，
                     // 用户自己加的那几条还在盘上的存档里，一次保存就会把显示中的这份写回去。
@@ -252,23 +276,98 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                 }
             }
 
-            items(sources.size) { i ->
-                val cfg = sources[i]
-                SourceRow(
-                    cfg = cfg,
-                    report = health[cfg.id],
-                    onToggle = { vm.toggleSource(cfg.id, it) },
-                    onDelete = { vm.deleteSource(cfg.id) },
-                    onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
-                    onUp = if (i == 0) null else {
-                        {
-                            val ids = sources.map { it.id }.toMutableList()
-                            val tmp = ids[i - 1]; ids[i - 1] = ids[i]; ids[i] = tmp
-                            vm.reorder(ids)
+            items(count = order.size, key = { order[it] }) { i ->
+                val id = order[i]
+                val cfg = byId[id]
+                if (cfg != null) {
+                    // 外层的 Column 只负责「记录这一行本来在哪」，位移交给内层 ——
+                    // 记位置的节点要是自己也跟着动，判断压到哪一行就成了自我循环。
+                    Column(
+                        Modifier.fillMaxWidth().onGloballyPositioned { c ->
+                            tops[id] = c.positionInWindow().y
+                            heights[id] = c.size.height.toFloat()
+                        },
+                    ) {
+                        val drag = dragId
+                        val dragged = drag == id
+                        val from = if (drag != null) order.indexOf(drag) else -1
+                        // 被压到的那一整段各让出一个位次（按被抬起那行自己的高度估，
+                        // 这一列表的行都是同一个组件，高度一致）
+                        val step = if (drag != null) heights[drag] ?: 0f else 0f
+                        val ty = when {
+                            dragged -> dragDy
+                            from >= 0 && dragTo > from && i in (from + 1)..dragTo -> -step
+                            from >= 0 && dragTo in 0 until from && i in dragTo until from -> step
+                            else -> 0f
                         }
-                    },
-                )
-                Spacer8()
+                        Column(
+                            Modifier.fillMaxWidth().zIndex(if (dragged) 1f else 0f)
+                                .graphicsLayer { translationY = ty },
+                        ) {
+                            SourceRow(
+                                cfg = cfg,
+                                report = health[cfg.id],
+                                dragging = dragged,
+                                grip = Modifier.pointerInput(id) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            dragId = id
+                                            dragDy = 0f
+                                            dragTo = order.indexOf(id)
+                                        },
+                                        onDrag = { change, amount ->
+                                            change.consume()
+                                            val d = dragId
+                                            if (d != null) {
+                                                dragDy += amount.y
+                                                // 落点看的是「被抬起那行的中心」压过了哪几行的中心
+                                                val center = (tops[d] ?: 0f) + (heights[d] ?: 0f) / 2f + dragDy
+                                                var t = order.lastIndex
+                                                for (j in order.indices) {
+                                                    val top = tops[order[j]] ?: continue
+                                                    if (center < top + (heights[order[j]] ?: 0f) / 2f) {
+                                                        t = j
+                                                        break
+                                                    }
+                                                }
+                                                dragTo = t.coerceIn(0, order.lastIndex)
+                                            }
+                                        },
+                                        onDragEnd = {
+                                            val d = dragId
+                                            val t = dragTo
+                                            dragId = null; dragDy = 0f; dragTo = -1
+                                            if (d != null && t >= 0) {
+                                                val f = order.indexOf(d)
+                                                if (f != t) {
+                                                    val moved = order.toMutableList()
+                                                    moved.add(t, moved.removeAt(f))
+                                                    vm.reorder(moved)
+                                                }
+                                            }
+                                        },
+                                        onDragCancel = {
+                                            dragId = null; dragDy = 0f; dragTo = -1
+                                        },
+                                    )
+                                },
+                                onToggle = { vm.toggleSource(cfg.id, it) },
+                                onDelete = { vm.deleteSource(cfg.id) },
+                                onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
+                                onUp = if (i == 0) null else {
+                                    {
+                                        // 用 order 而不是 sources：界面按优先级排过，落盘那份不保证有序，
+                                        // 拿未排的那份换位次会交换到看不见的两行上
+                                        val ids = order.toMutableList()
+                                        val tmp = ids[i - 1]; ids[i - 1] = ids[i]; ids[i] = tmp
+                                        vm.reorder(ids)
+                                    }
+                                },
+                            )
+                            Spacer8()
+                        }
+                    }
+                }
             }
 
             item {
@@ -286,8 +385,11 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 
         if (showAdd) {
             AddSourceSheet(
+                candidates = net.cinehub.data.Seed.candidates,
                 onDismiss = { showAdd = false },
-                onTest = { name, url, kind, token, playPath, cb -> vm.testSource(name, url, kind, token, playPath, cb) },
+                onTest = { name, url, kind, token, playPath, html, cb ->
+                    vm.testSource(name, url, kind, token, playPath, html, cb)
+                },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
                     showAdd = false
@@ -309,24 +411,47 @@ private fun Stat(value: String, label: String, color: Color, modifier: Modifier 
 private fun SourceRow(
     cfg: SourceConfig,
     report: HealthReport?,
+    dragging: Boolean,
+    grip: Modifier,
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
     onOpenSite: () -> Unit,
     onUp: (() -> Unit)?,
 ) {
     val h = report?.health ?: Health.Unknown
-    val border = when (h) {
-        Health.Down -> T.Err.copy(alpha = .26f)
-        Health.Ok -> T.Src500.copy(alpha = .28f)
+    val border = when {
+        dragging -> T.Src500
+        h == Health.Down -> T.Err.copy(alpha = .26f)
+        h == Health.Ok -> T.Src500.copy(alpha = .28f)
         else -> T.Border
     }
     Row(
         Modifier.fillMaxWidth().clip(R.lg)
-            .background(if (h == Health.Down) T.Err.copy(alpha = .035f) else T.Surface)
+            .background(
+                when {
+                    dragging -> T.Src500.copy(alpha = .13f)
+                    h == Health.Down -> T.Err.copy(alpha = .035f)
+                    else -> T.Surface
+                }
+            )
             .border(1.dp, border, R.lg)
             .padding(Sp.s3),
         verticalAlignment = Alignment.Top,
     ) {
+        // 拖拽手柄单独占一格：整行都接手势会和右边的开关、删除抢事件，
+        // 而「按住这里拖」也比「不知道哪能拖」清楚。
+        Box(
+            grip.size(30.dp).clip(R.sm),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.DragIndicator,
+                "长按拖动排序",
+                tint = if (dragging) T.Src400 else T.TextFaint,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Spacer8()
         Box(
             Modifier.size(40.dp).clip(RoundedCornerShape(12.dp))
                 .background(
@@ -480,8 +605,9 @@ private fun SourceRow(
 /** 添加播放源：底部弹层，带实时连通性反馈。 */
 @Composable
 private fun AddSourceSheet(
+    candidates: List<SourceConfig>,
     onDismiss: () -> Unit,
-    onTest: (String, String, SourceKind, String?, String?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
+    onTest: (String, String, SourceKind, String?, String?, net.cinehub.data.model.HtmlRules?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
     onSave: (SourceConfig) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
@@ -489,6 +615,8 @@ private fun AddSourceSheet(
     var token by remember { mutableStateOf("") }
     var playPath by remember { mutableStateOf("") }
     var kind by remember { mutableStateOf(SourceKind.Html) }
+    // 候选配置带的那套解析规则；自己换接入方式就该作废，不能再拿旧模板去试新方式
+    var presetHtml by remember { mutableStateOf<net.cinehub.data.model.HtmlRules?>(null) }
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -496,7 +624,7 @@ private fun AddSourceSheet(
     // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
     // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
     // 「测试并保存」实际只测了第一次，而界面还写着「保存并启用」。
-    LaunchedEffect(name, url, kind, token, playPath) {
+    LaunchedEffect(name, url, kind, token, playPath, presetHtml) {
         tested = null
         result = null
     }
@@ -538,6 +666,49 @@ private fun AddSourceSheet(
             )
             Spacer16()
 
+            // 候选配置：影枢没能替这些站打包票，所以不进内置列表，只在这里把表单填好，
+            // 通不通由下面那次「测试」当着用户的面说。
+            if (candidates.isNotEmpty()) {
+                Text(
+                    "没头绪就先点一个",
+                    color = T.TextDim,
+                    fontSize = Fs.xs,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer8()
+                candidates.forEach { c ->
+                    Row(
+                        Modifier.fillMaxWidth().clip(R.md)
+                            .background(T.Surface2)
+                            .border(1.dp, T.Border, R.md)
+                            .clickable {
+                                name = c.name
+                                url = c.baseUrl
+                                kind = c.kind
+                                playPath = c.playPath ?: ""
+                                presetHtml = c.html
+                            }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(c.name, color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.SemiBold)
+                            Spacer4()
+                            Text(
+                                c.tags.joinToString(" · "),
+                                color = T.Warn,
+                                fontSize = Fs.tiny,
+                                lineHeight = Fs.tiny * 1.6f,
+                            )
+                        }
+                        Spacer8()
+                        Text("填入", color = T.Src400, fontSize = Fs.xs, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer8()
+                }
+                Spacer16()
+            }
+
             Field("名称", "用于界面展示") {
                 Box(
                     Modifier.fillMaxWidth().height(44.dp).clip(R.md)
@@ -578,12 +749,12 @@ private fun AddSourceSheet(
             Field("接入方式", "不确定就选网页解析") {
                 Column(verticalArrangement = Arrangement.spacedBy(Sp.s2)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
+                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
+                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; presetHtml = null; invalidate() }
                     }
                 }
             }
@@ -689,7 +860,7 @@ private fun AddSourceSheet(
                             }
                             busy = true
                             result = null
-                            onTest(name, url, kind, token, playPath) { ok, msg, cfg ->
+                            onTest(name, url, kind, token, playPath, presetHtml) { ok, msg, cfg ->
                                 busy = false
                                 result = ok to msg
                                 tested = cfg

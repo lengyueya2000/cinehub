@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -268,6 +269,7 @@ private fun Long.ofTime(): String =
 fun DownloadsScreen(vm: AppViewModel) {
     val tasks by vm.downloads.collectAsState()
     val space by vm.downloadSpace.collectAsState()
+    val speeds by vm.downloadSpeed.collectAsState()
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {
         Box(Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s3)) {
@@ -310,6 +312,7 @@ fun DownloadsScreen(vm: AppViewModel) {
                 items(tasks.sortedByDescending { it.createdAt }) { t ->
                     DownloadCard(
                         task = t,
+                        speed = speeds[t.id] ?: 0L,
                         onPlay = { vm.playCached(t) },
                         onPause = { vm.pauseDownload(t.id) },
                         onResume = { vm.resumeDownload(t.id) },
@@ -324,6 +327,7 @@ fun DownloadsScreen(vm: AppViewModel) {
 @Composable
 private fun DownloadCard(
     task: DownloadTask,
+    speed: Long,
     onPlay: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -351,7 +355,8 @@ private fun DownloadCard(
                     DownloadStatus.Failed -> "失败"
                     DownloadStatus.Paused -> "已暂停"
                     DownloadStatus.Queued -> "排队中"
-                    DownloadStatus.Running -> "${(task.progress * 100).toInt()}%"
+                    // 百分比在下面那行和小字一起报，这里只说状态，不重复一个数
+                    DownloadStatus.Running -> "下载中"
                 },
                 color = when (task.status) {
                     DownloadStatus.Done -> T.Ok
@@ -380,14 +385,20 @@ private fun DownloadCard(
                         .background(Brush.horizontalGradient(listOf(T.Play400, T.Play500))),
                 )
             }
-            if (task.segmentsTotal > 0) {
-                Spacer4()
-                Text(
-                    "已取 ${task.segmentsDone} / ${task.segmentsTotal} 个分片",
-                    color = T.TextFaint,
-                    fontSize = Fs.tiny,
-                )
-            }
+            Spacer4()
+            // 报的是「下了多少 / 一共多大 / 现在多快」。分片个数不显示 ——
+            // 用户要判断的是还要等多久，字节和速度够回答，分片数只是实现细节。
+            Text(
+                downloadStatsLine(task, speed),
+                color = T.TextFaint,
+                fontSize = Fs.tiny,
+            )
+        }
+
+        // 下完了也把实际落盘的大小留着：删不删之前总得知道它占了多少
+        if (task.status == DownloadStatus.Done && task.bytesTotal > 0) {
+            Spacer4()
+            Text("已缓存 ${fmtBytes(task.bytesTotal)}", color = T.TextFaint, fontSize = Fs.tiny)
         }
 
         task.error?.let {
@@ -429,6 +440,25 @@ private fun DownloadAction(label: String, color: Color, onClick: () -> Unit) {
     )
 }
 
+/**
+ * 一行下载进度：百分比 + 字节 + 速度。
+ *
+ * 总大小估不出来时（HLS 第一个分片还没落地）直说，不拿 0% 冒充「刚开始下」；
+ * 速度只在真有速度时出现 —— 暂停中的任务报 0 B/s 会被读成「网卡了」。
+ */
+private fun downloadStatsLine(task: DownloadTask, speed: Long): String {
+    val parts = mutableListOf("${(task.progress * 100).toInt()}%")
+    parts += when {
+        task.bytesTotal > 0 ->
+            "${fmtBytes(task.bytesDone)} / ${if (task.sizeEstimated) "约 " else ""}${fmtBytes(task.bytesTotal)}"
+        task.bytesDone > 0 -> "已下 ${fmtBytes(task.bytesDone)}，总大小还估不出来"
+        task.status == DownloadStatus.Queued -> "排队中，还没开始取"
+        else -> "正在取第一段，还不知道总共多大"
+    }
+    if (speed > 0) parts += "${fmtBytes(speed)}/s"
+    return parts.joinToString(" · ")
+}
+
 private fun fmtBytes(b: Long): String {
     val tenthsGb = b * 10 / (1L shl 30)
     val tenthsMb = b * 10 / (1L shl 20)
@@ -437,5 +467,69 @@ private fun fmtBytes(b: Long): String {
         b >= 1L shl 20 -> "${tenthsMb / 10}.${tenthsMb % 10} MB"
         b >= 1024 -> "${b / 1024} KB"
         else -> "$b B"
+    }
+}
+
+/**
+ * 下载设置。
+ *
+ * 并发数单独放一页而不是塞在下载页顶部：它说的是「接下来怎么下」，
+ * 和某一条任务的操作不是一回事，混在一起会看不清改了它到底影响谁。
+ */
+@Composable
+fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
+    val parallel by vm.segParallel.collectAsState()
+    val space by vm.downloadSpace.collectAsState()
+    val tasks by vm.downloads.collectAsState()
+    val inFlight = tasks.count { it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued }
+
+    Column(Modifier.fillMaxSize().background(T.Bg)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s2),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.size(28.dp).clip(CircleShape).clickable(onClick = onBack),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.ArrowBack, "返回", tint = T.Text, modifier = Modifier.size(19.dp))
+            }
+            Spacer8()
+            Column(Modifier.weight(1f)) {
+                Text("下载设置", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
+                Spacer4()
+                Text("${tasks.size} 个任务 · 共占 ${fmtBytes(space)}", color = T.TextFaint, fontSize = Fs.xxs)
+            }
+        }
+
+        Spacer8()
+        Column(Modifier.padding(horizontal = Sp.s4)) {
+            Text("同时取几个分片", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
+            Spacer4()
+            Text(
+                "缓存一集时会同时开几条连接去取它切片。越多越快，" +
+                    "但片源的 CDN 也可能把高频请求当成爬虫拦掉。",
+                color = T.TextDim,
+                fontSize = Fs.xs,
+                lineHeight = Fs.xs * 1.7f,
+            )
+            Spacer8()
+            Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                listOf(1, 2, 4, 8).forEach { n ->
+                    Chip("$n 路", parallel == n) { vm.setSegParallel(n) }
+                }
+            }
+            Spacer8()
+            Text(
+                when {
+                    inFlight > 0 -> "现在正有 $inFlight 个任务在下：改动不会作用到它们身上，" +
+                        "要等这条结束后新开始的才会按 $parallel 路取。"
+                    else -> "改动从下一个开始的任务生效，正在下的不受影响。"
+                } + if (parallel == 8) " 8 路是最快的一档，也最容易被片源拒绝。" else "",
+                color = T.TextFaint,
+                fontSize = Fs.xs,
+                lineHeight = Fs.xs * 1.7f,
+            )
+        }
     }
 }

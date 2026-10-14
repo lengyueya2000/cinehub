@@ -7,10 +7,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
+import net.cinehub.data.HomeRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
@@ -41,12 +43,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val mediaRepo = MediaRepository(sourceRepo)
     private val watchRepo = WatchRepository(app)
     private val doubanRepo = DoubanRepository(app)
+    private val homeRepo = HomeRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
     val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
 
     /** 缓存占掉的字节数。仓库在协程里数好，界面只读这个值。 */
     val downloadSpace: StateFlow<Long> = downloadRepo.space
+
+    /** 每个任务当前的下载速度（字节/秒）。只在内存里，重启后从 0 重新算。 */
+    val downloadSpeed: StateFlow<Map<String, Long>> = downloadRepo.speed
+
+    /** 单集内同时下几个分片（「我的 → 下载设置」里调，对正在下的任务不生效）。 */
+    val segParallel: StateFlow<Int> = downloadRepo.segParallel
+
+    fun setSegParallel(n: Int) = downloadRepo.setSegParallel(n)
 
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
@@ -91,6 +102,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- 首页 ----------
     private val _home = MutableStateFlow<List<Media>>(emptyList())
     val home: StateFlow<List<Media>> = _home.asStateFlow()
+
+    /** 这份首页内容是几点取回来的；0 = 还没有快照。 */
+    private val _homeAt = MutableStateFlow(0L)
+    val homeAt: StateFlow<Long> = _homeAt.asStateFlow()
+
+    /** 这一页内容来自哪个源（标题上要说它）。 */
+    private val _homeSource = MutableStateFlow<String?>(null)
+    val homeSource: StateFlow<String?> = _homeSource.asStateFlow()
 
     private val _homeLoading = MutableStateFlow(false)
     val homeLoading: StateFlow<Boolean> = _homeLoading.asStateFlow()
@@ -242,7 +261,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sourceRepo.sources.collect { _sources.value = it }
         }
         refreshHealth()
-        loadHome()
+        // 首页那一份不在这里取：什么时候该重新拉，判据是「这一页是用哪套源顺序拉回来的」，
+        // 而只有正在显示首页的那一页知道自己该不该重拉 —— 交给 HomeScreen 驱动。
     }
 
     // ---------- 源管理 ----------
@@ -290,9 +310,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String? = null,
         playPath: String? = null,
+        html: net.cinehub.data.model.HtmlRules? = null,
         onResult: (ok: Boolean, message: String, tested: SourceConfig?) -> Unit,
     ) = viewModelScope.launch {
-        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath)
+        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath, html)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
@@ -320,6 +341,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String?,
         playPath: String? = null,
+        html: net.cinehub.data.model.HtmlRules? = null,
     ): SourceConfig = SourceConfig(
         id = "src_" + System.currentTimeMillis().toString(36),
         name = name.ifBlank { baseUrl },
@@ -332,23 +354,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         else net.cinehub.data.model.AuthMode.Cookie,
         playPath = playPath?.takeIf { it.isNotBlank() },
         html = when (kind) {
-            SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic
+            // 候选配置带着自己那套模板来（比如按苹果 CMS 猜的），手填的地址只能退到通用的
+            SourceKind.Html -> html ?: net.cinehub.data.source.DefaultRules.generic
             else -> null
         },
     )
 
     // ---------- 首页 ----------
 
-    fun loadHome() = viewModelScope.launch {
+    fun loadHome(force: Boolean = false) = viewModelScope.launch {
+        // 先等落盘那份读完：不等就会把「还没读到」当成「没有快照」，白敲一次站点
+        homeRepo.ready.first { it }
+        // 指纹按启用源的 id:priority 现算。读 _sources 那份内存值不行 ——
+        // 冷启动那一刻它可能还是空的，指纹就成了空串，等于每次都重拉
+        val active = sourceRepo.active()
+        val fp = active.joinToString("|") { "${it.id}:${it.priority}" }
+        val snap = homeRepo.snapshot()
+        if (!force && snap != null && !homeRepo.staleFor(fp)) {
+            _home.value = snap.items.map { it.toMedia() }
+            _homeAt.value = snap.at
+            _homeSource.value = snap.sourceId
+            return@launch
+        }
         _homeLoading.value = true
         _homeError.value = null
-        val list = mediaRepo.home()
-        _home.value = list
-        if (list.isEmpty()) {
-            _homeError.value = "所有播放源都没有返回内容，请在「播放源管理」里检查"
+        val res = mediaRepo.homeWithSource()
+        // 取空了不能把旧快照冲掉：一次抖动不该让用户对着一个空白首页
+        if (res.items.isNotEmpty()) {
+            _home.value = res.items
+            _homeSource.value = res.sourceId
+            _homeAt.value = System.currentTimeMillis()
+            homeRepo.save(res.items, res.sourceId, fp)
+        } else {
+            _homeError.value = if (snap == null) {
+                "所有播放源都没有返回内容，请在「播放源管理」里检查"
+            } else {
+                "最新一次没刷新成功：所有播放源都没有返回内容（下面还是上次取回的那一页）"
+            }
         }
         _homeLoading.value = false
     }
+
+    /** 手动刷新：不管过没过期，现在就去取一次。 */
+    fun refreshHome() = loadHome(force = true)
 
     // ---------- 搜索 ----------
 

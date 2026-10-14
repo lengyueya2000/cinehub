@@ -146,4 +146,27 @@ object Seed {
      * 按 id 清掉它们，用户自己手动加的同类源（id 形如 `src_xxx`）不受影响。
      */
     val retiredIds = setOf("k4vm", "xiguazx")
+
+    /**
+     * 「添加源」里可以先点一下把表单填好的候选配置 —— 它们**不是**内置源。
+     *
+     * 区别在验证：内置的那几个是影枢从本机实际取到过内容的，而 4kcz.com 站在一道雷池 WAF 后面，
+     * 开发机（出口 IP 在美国）连浏览器都被它拦下，影枢没能亲眼看一次它返回什么。
+     * 把一个没验证过的地址直接写进内置列表，等于替它打了包票 ——
+     * 放在候选里、由用户点一下再走「测试」，通不通当场照实说，票由站点自己打。
+     *
+     * html 规则是按这类站最常见的苹果 CMS 模板猜的；猜错了不会静默装死，
+     * 「测试」那一步会报「一个资源都没给」。
+     */
+    val candidates = listOf(
+        SourceConfig(
+            id = "cand_4kcz",
+            name = "4kcz.com",
+            baseUrl = "https://www.4kcz.com",
+            kind = net.cinehub.data.model.SourceKind.Html,
+            priority = 1,
+            tags = listOf("影枢没能从本机访问过这个站", "按苹果 CMS 模板猜的规则"),
+            html = net.cinehub.data.source.DefaultRules.maccms,
+        ),
+    )
 }

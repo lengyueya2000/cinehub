@@ -30,6 +30,13 @@ data class DownloadTask(
     val status: DownloadStatus = DownloadStatus.Queued,
     val bytesDone: Long = 0,
     val bytesTotal: Long = 0,
+    /**
+     * [bytesTotal] 是估的还是准的。
+     *
+     * HLS 的分片列表不给字节数，只能按已下的那些估一个平均，界面上要带「约」；
+     * 单文件有 Content-Length，直接就是准的。下完之后一律转成实际落盘的字节。
+     */
+    val sizeEstimated: Boolean = false,
     /** HLS 按切片计数，单文件按字节计数。 */
     val segmentsDone: Int = 0,
     val segmentsTotal: Int = 0,
@@ -37,11 +44,12 @@ data class DownloadTask(
     /** 落地后的入口文件名（HLS 是重写过的 index.m3u8，单文件就是视频本身）。 */
     val fileName: String? = null,
 ) {
+    /** 有字节数就按字节算（用户看的、也参与「约」那句的都是它），估不出来才退回按分片数。 */
     val progress: Float
         get() = when {
             status == DownloadStatus.Done -> 1f
-            segmentsTotal > 0 -> (segmentsDone.toFloat() / segmentsTotal).coerceIn(0f, 1f)
             bytesTotal > 0 -> (bytesDone.toFloat() / bytesTotal).coerceIn(0f, 1f)
+            segmentsTotal > 0 -> (segmentsDone.toFloat() / segmentsTotal).coerceIn(0f, 1f)
             else -> 0f
         }
 }

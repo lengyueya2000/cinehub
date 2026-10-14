@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -41,10 +42,10 @@ import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
 
 /**
- * 「我的」：三行同级入口。
+ * 「我的」：几行同级入口。
  *
  * 之前这一页就是播放源管理本身，收藏和最近观看被塞在它头顶，看起来像源管理的附属品。
- * 三者其实平级 —— 都是「我自己的东西」，所以这里只放菜单，各页各自成一屏。
+ * 它们其实平级 —— 都是「我自己的东西」，所以这里只放菜单，各页各自成一屏。
  */
 @Composable
 fun MineScreen(
@@ -52,11 +53,14 @@ fun MineScreen(
     onOpenSourceManage: () -> Unit,
     onOpenFavorites: () -> Unit,
     onOpenHistory: () -> Unit,
+    onOpenDownloadSettings: () -> Unit,
 ) {
     val sources by vm.sources.collectAsState()
     val health by vm.health.collectAsState()
     val favorites by vm.favorites.collectAsState()
     val history by vm.watchHistory.collectAsState()
+    val segParallel by vm.segParallel.collectAsState()
+    val downloads by vm.downloads.collectAsState()
 
     val enabled = sources.count { it.enabled }
     val ok = sources.count { health[it.id]?.health == net.cinehub.data.model.Health.Ok }
@@ -105,6 +109,16 @@ fun MineScreen(
                 sub = if (history.isEmpty()) "播过的片会记在这里，下次从那一秒接上"
                 else "${history.size} 部 · 最近一部 ${history.first().title}",
                 onClick = onOpenHistory,
+            )
+        }
+        item {
+            MenuRow(
+                icon = Icons.Outlined.Download,
+                tint = T.Ok,
+                title = "下载设置",
+                sub = if (downloads.isEmpty()) "缓存一集时同时开 $segParallel 条连接取分片"
+                else "${downloads.size} 个缓存任务 · 同时开 $segParallel 条连接",
+                onClick = onOpenDownloadSettings,
             )
         }
     }

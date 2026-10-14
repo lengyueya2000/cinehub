@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import net.cinehub.ui.screens.DetailScreen
+import net.cinehub.ui.screens.DownloadSettingsScreen
 import net.cinehub.ui.screens.DownloadsScreen
 import net.cinehub.ui.screens.HomeScreen
 import net.cinehub.ui.screens.LibraryScreen
@@ -70,6 +71,7 @@ private sealed interface Route {
     data object Sources : Route
     data object SourceManage : Route
     data object Downloads : Route
+    data object DownloadSettings : Route
     data object Favorites : Route
     data object History : Route
 }
@@ -108,10 +110,11 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
             is Route.Library -> Route.Home
             is Route.Downloads -> Route.Home
             is Route.Detail -> Route.Home
-            // 这三页都是从「我的」进来的，返回就该回到「我的」，不该弹回首页
+            // 这几页都是从「我的」进来的，返回就该回到「我的」，不该弹回首页
             is Route.SourceManage -> Route.Sources
             is Route.Favorites -> Route.Sources
             is Route.History -> Route.Sources
+            is Route.DownloadSettings -> Route.Sources
             is Route.Player -> {
                 // stopPlaying() 会把 playing 清掉，所以「刚才是哪一部」要先拿到手。
                 val playedId = vm.playing.value?.mediaId
@@ -200,6 +203,12 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenSourceManage = { route = Route.SourceManage },
                         onOpenFavorites = { route = Route.Favorites },
                         onOpenHistory = { route = Route.History },
+                        onOpenDownloadSettings = { route = Route.DownloadSettings },
+                    )
+
+                    is Route.DownloadSettings -> DownloadSettingsScreen(
+                        vm = vm,
+                        onBack = { route = Route.Sources },
                     )
 
                     is Route.SourceManage -> SourceScreen(

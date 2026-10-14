@@ -2,6 +2,7 @@ package net.cinehub.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
@@ -9,6 +10,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,6 +38,8 @@ import java.io.FileOutputStream
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -72,7 +77,14 @@ class DownloadRepository(
     }
 
     private val jobs = ConcurrentHashMap<String, Run>()
-    private val calls = ConcurrentHashMap<String, okhttp3.Call>()
+
+    /**
+     * 一个任务手上还在飞的请求。
+     *
+     * 分片并发之后一个任务同时有好几个连接，所以这里是一对多：暂停 / 删除时要**整组**掐掉，
+     * 只掐第一个的话其余几个还在往同一个目录里写。
+     */
+    private val calls = ConcurrentHashMap<String, MutableSet<okhttp3.Call>>()
 
     /** pump() 会从主线程和 IO 线程两侧进来，占位与发射得看着同一把锁。 */
     private val queueLock = Any()
@@ -82,6 +94,7 @@ class DownloadRepository(
 
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY = stringPreferencesKey("downloads_v1")
+    private val KEY_SEG_PARALLEL = intPreferencesKey("seg_parallel")
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
 
@@ -97,6 +110,24 @@ class DownloadRepository(
      * 直接在组合里调就是拿主线程去数文件，而下载页每 500ms 就在刷新。
      */
     val space: StateFlow<Long> = _space.asStateFlow()
+
+    private val _speed = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    /**
+     * 每个任务当前的下载速度（字节 / 秒）。
+     *
+     * 只按最近 [SPEED_WINDOW_MS] 的样本算，而且**不落盘** —— 落盘的是字节数，
+     * 进程重启后速度本来就该从 0 重新算，把上次的速度存下来显示是假数字。
+     */
+    val speed: StateFlow<Map<String, Long>> = _speed.asStateFlow()
+
+    /** 任务 id → 最近的速度样本 (时刻, 累计字节)。 */
+    private val speedWin = ConcurrentHashMap<String, ArrayDeque<Pair<Long, Long>>>()
+
+    private val _segParallel = MutableStateFlow(DEFAULT_SEG_PARALLEL)
+
+    /** 单集内同时下多少个分片（用户在「下载设置」里调，对正在下的任务不生效）。 */
+    val segParallel: StateFlow<Int> = _segParallel.asStateFlow()
 
     private val root: File
         get() = File(context.getExternalFilesDir(null) ?: context.filesDir, "downloads")
@@ -164,9 +195,10 @@ class DownloadRepository(
         pausedByUser += id
         patch(id, persist = true) { it.copy(status = DownloadStatus.Paused) }
         synchronized(queueLock) {
-            calls.remove(id)?.cancel()
+            cancelCalls(id)
             jobs.remove(id)?.job?.cancel()
         }
+        forgetSpeed(id)
         pump()
     }
 
@@ -183,7 +215,7 @@ class DownloadRepository(
     fun delete(id: String) {
         pausedByUser += id
         val run = synchronized(queueLock) {
-            calls.remove(id)?.cancel()
+            cancelCalls(id)
             jobs.remove(id)
         }
         run?.job?.cancel()
@@ -196,6 +228,7 @@ class DownloadRepository(
             // 任务没了，名字也得跟着从「用户自己按的暂停」里摘掉：id 是按（源、片、集）算的，
             // 留着它，以后重下同一集时真失败会被当成用户暂停而一句原因都不写。
             pausedByUser -= id
+            forgetSpeed(id)
             refreshSpace()
             pump()
         }
@@ -254,13 +287,14 @@ class DownloadRepository(
             patch(id, persist = true) { it.copy(status = DownloadStatus.Failed, error = reasonOf(e)) }
         } finally {
             synchronized(queueLock) {
-                // 只摘自己那一笔：重开同一集时 map 里已经换成新的壳了，按 id 盲删会把
-                // 新那笔摘没，之后暂停和删除就管不住真正在跑的那个。
+                // 只摘自己这一笔：重开同一集时 map 里已经换成新的壳了，按 id 盲删会把
+                // 新那笔摘没，之后暂停和删除就管不住真正在跑的那一组连接。
                 if (jobs[id] === self) {
                     jobs.remove(id)
                     calls.remove(id)
                 }
             }
+            forgetSpeed(id)
             refreshSpace()
             pump()
         }
@@ -327,42 +361,55 @@ class DownloadRepository(
             val target = File(dir, "video" + pathExt(url, ".mp4"))
             val out = File(dir, target.name + ".part")
             val have = if (out.isFile) out.length() else 0L
-            val call = newCall(url, cfg, rangeFrom = have.takeIf { it > 0 })
-            calls[id] = call
-            call.execute().use { r ->
-                if (!r.isSuccessful) error(Http.failureReason(r.code))
-                val resumed = have > 0 && r.code == 206
-                var done = if (resumed) have else 0L
-                if (!resumed) { out.delete(); done = 0L }
-                val remaining = r.body?.contentLength() ?: -1L
-                val total = if (remaining > 0) done + remaining else 0L
-                patch(id) { it.copy(bytesDone = done, bytesTotal = total) }
+            // 单文件不做多段并行：那要对方支持 Range，而这类站的单文件地址常常不给，
+            // 失败模式多、收益小 —— 界面上一句「按字节续传」说的就是这一条。
+            val call = newCall(id, url, cfg, rangeFrom = have.takeIf { it > 0 })
+            try {
+                call.execute().use { r ->
+                    if (!r.isSuccessful) error(Http.failureReason(r.code))
+                    val resumed = have > 0 && r.code == 206
+                    var done = if (resumed) have else 0L
+                    if (!resumed) { out.delete(); done = 0L }
+                    val remaining = r.body?.contentLength() ?: -1L
+                    // Content-Length 给了就是准确值，不用像 HLS 那样估
+                    val total = if (remaining > 0) done + remaining else 0L
+                    patch(id) { it.copy(bytesDone = done, bytesTotal = total, sizeEstimated = false) }
 
-                val src = r.body?.byteStream() ?: error("空响应")
-                FileOutputStream(out, resumed).use { os ->
-                    val buf = ByteArray(64 * 1024)
-                    var tick = done
-                    while (true) {
-                        // 协程被摘走时 ensureActive 会抛 CancellationException：
-                        // 不检查的话这里会一直写到下完，和新起的那一笔一起磨同一个文件
-                        ensureActive()
-                        val n = src.read(buf)
-                        if (n < 0) break
-                        os.write(buf, 0, n)
-                        done += n
-                        if (done - tick >= 512 * 1024) {
-                            tick = done
-                            val d = done
-                            patch(id) { it.copy(bytesDone = d) }
+                    val src = r.body?.byteStream() ?: error("空响应")
+                    FileOutputStream(out, resumed).use { os ->
+                        val buf = ByteArray(64 * 1024)
+                        var tick = done
+                        while (true) {
+                            // 协程被摘走时 ensureActive 会抛 CancellationException：
+                            // 不检查的话这里会一直写到下完，和新起的那一笔一起磨同一个文件
+                            ensureActive()
+                            val n = src.read(buf)
+                            if (n < 0) break
+                            os.write(buf, 0, n)
+                            done += n
+                            if (done - tick >= 256 * 1024) {
+                                tick = done
+                                val d = done
+                                reportBytes(id, d)
+                                patch(id) { it.copy(bytesDone = d) }
+                            }
                         }
                     }
+                    if (total > 0 && done < total) error("下到 ${done * 100 / total}% 时断了，再点继续")
+                    val d = done
+                    reportBytes(id, d)
+                    promote(out, target)
+                    patch(id, persist = true) {
+                        it.copy(
+                            bytesDone = d,
+                            bytesTotal = total.coerceAtLeast(d),
+                            sizeEstimated = false,
+                            fileName = target.name,
+                        )
+                    }
                 }
-                if (total > 0 && done < total) error("下到 ${done * 100 / total}% 时断了，再点继续")
-                val d = done
-                promote(out, target)
-                patch(id, persist = true) {
-                    it.copy(bytesDone = d, bytesTotal = total.coerceAtLeast(d), fileName = target.name)
-                }
+            } finally {
+                untrackCall(id, call)
             }
         }
     }
@@ -402,29 +449,67 @@ class DownloadRepository(
         if (segs.isEmpty()) error("这份 m3u8 里没有分片")
         val init = initMap(playlist, listUrl)
 
-        // (密钥字节, IV)。同一条流通常全程一把，按地址缓存起来只取一次。
-        val keys = HashMap<String, ByteArray>()
-        suspend fun keyOf(c: Crypt?): Pair<ByteArray, ByteArray>? = c?.let {
-            keys.getOrPut(it.uri) { fetchKey(it.uri, cfg, auth) } to it.iv
+        // (密钥字节, IV)。同一条流通常全程一把。并发之后多个 worker 会同时来要，
+        // 所以用 ConcurrentHashMap：拿两遍同一把密钥无害，边写边读才会出事。
+        val keys = ConcurrentHashMap<String, ByteArray>()
+        // 不用 computeIfAbsent：那个 lambda 不是 suspend 的，取密钥这一步放进去就编不过。
+        // 两个 worker 同时撞上同一把密钥时最多重复取一次，比加锁简单、也无害。
+        suspend fun keyOf(c: Crypt?): Pair<ByteArray, ByteArray>? = c?.let { cr ->
+            val k = keys[cr.uri] ?: fetchKey(cr.uri, cfg, auth).also { keys.putIfAbsent(cr.uri, it) }
+            k to cr.iv
         }
 
         patch(id) { it.copy(segmentsTotal = segs.size, segmentsDone = 0) }
 
-        var n = 0
         var initName: String? = null
+        var initBytes = 0L
         if (init != null) {
             val (initUrl, initCrypt) = init
             val f = File(dir, "init" + pathExt(initUrl, ".mp4"))
             initName = f.name
-            if (!f.isFile || f.length() == 0L) fetchBytes(initUrl, cfg, f, keyOf(initCrypt))
+            initBytes = if (f.isFile && f.length() > 0L) f.length()
+            else fetchBytes(id, initUrl, cfg, f, keyOf(initCrypt))
         }
-        segs.forEach { seg ->
-            coroutineContext.ensureActive()
-            val f = File(dir, seg.name)
-            if (!f.isFile || f.length() == 0L) fetchBytes(seg.url, cfg, f, keyOf(seg.crypt))
-            n++
-            val d = n
-            patch(id) { it.copy(segmentsDone = d) }
+
+        /*
+         * 分片并发。
+         *
+         * 分片之间没有依赖（每片自己解自己），串行下载就是让一条本来能跑满的连接
+         * 在那儿排队等一个个 RTT。这里开 N 个 worker 从同一个 Channel 领活：
+         * 领走即出队，所以一片不会被两个 worker 重复取。
+         *
+         * 完成数和字节数用原子量累加，每 4 片才往状态里写一次 ——
+         * 每片都写的话下载页每片抖一下，而那一行数字本来就读不出名堂。
+         */
+        val doneN = AtomicInteger(0)
+        val bytesN = AtomicLong(initBytes)
+        val workers = _segParallel.value.coerceIn(1, MAX_SEG_PARALLEL)
+        coroutineScope {
+            val ch = Channel<Segment>(capacity = Channel.UNLIMITED)
+            segs.forEach { ch.trySend(it) }
+            ch.close()
+            repeat(workers) {
+                launch(Dispatchers.IO) {
+                    for (seg in ch) {
+                        val f = File(dir, seg.name)
+                        val wrote = if (f.isFile && f.length() > 0L) f.length()
+                        else fetchBytes(id, seg.url, cfg, f, keyOf(seg.crypt))
+                        val d = doneN.incrementAndGet()
+                        val b = bytesN.addAndGet(wrote)
+                        if (d % 4 == 0 || d == segs.size) {
+                            reportBytes(id, b)
+                            patch(id) {
+                                it.copy(
+                                    segmentsDone = d,
+                                    bytesDone = b,
+                                    bytesTotal = estimateTotal(b, d, segs.size),
+                                    sizeEstimated = d < segs.size,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 本地列表也是「写完才算数」：它一在，localUri 就会说这一集可以离线播了
@@ -432,18 +517,39 @@ class DownloadRepository(
         val tmp = File(dir, "index.m3u8.part")
         tmp.writeText(localPlaylist(segs, initName))
         promote(tmp, playlistFile)
-        patch(id, persist = true) { it.copy(fileName = playlistFile.name, segmentsDone = segs.size) }
+        val all = bytesN.get()
+        patch(id, persist = true) {
+            it.copy(
+                fileName = playlistFile.name,
+                segmentsDone = segs.size,
+                bytesDone = all,
+                // 全在盘上了，总数就是实际落下来的字节 —— 不再需要估，「约」字去掉
+                bytesTotal = all,
+                sizeEstimated = false,
+            )
+        }
     }
 
+    /**
+     * HLS 的总大小只能估。
+     *
+     * 分片列表不给字节数，要准确值得对每一片发一次 HEAD —— 一部 2000 片的剧就是 2000 个
+     * 额外请求，那是拿别人的站换界面上的一个数字。所以按「已下字节 ÷ 已完成片数 × 总片数」
+     * 估一个，界面上带「约」，下完之后换成实际落盘的字节。
+     */
+    private fun estimateTotal(bytesDone: Long, segsDone: Int, segsTotal: Int): Long =
+        if (segsDone > 0) bytesDone * segsTotal / segsDone else 0L
+
     private suspend fun fetchBytes(
+        id: String,
         url: String,
         cfg: SourceConfig,
         into: File,
         key: Pair<ByteArray, ByteArray>? = null,
-    ) {
-        withContext(Dispatchers.IO) {
-            ensureActive()
-            val call = newCall(url, cfg, rangeFrom = null)
+    ): Long = withContext(Dispatchers.IO) {
+        ensureActive()
+        val call = newCall(id, url, cfg, rangeFrom = null)
+        try {
             call.execute().use { r ->
                 if (!r.isSuccessful) error(Http.failureReason(r.code))
                 val bytes = r.body?.bytes() ?: error("空响应")
@@ -453,21 +559,61 @@ class DownloadRepository(
                 val part = File(into.parentFile, into.name + ".part")
                 part.writeBytes(plain)
                 promote(part, into)
+                plain.size.toLong()
             }
+        } finally {
+            untrackCall(id, call)
         }
     }
 
-    private fun newCall(url: String, cfg: SourceConfig, rangeFrom: Long?): okhttp3.Call {
+    private fun newCall(id: String, url: String, cfg: SourceConfig, rangeFrom: Long?): okhttp3.Call {
         val b = Request.Builder()
             .url(url)
             .header("User-Agent", Http.UA)
             .header("Referer", referer(cfg))
         Http.authHeaders(cfg).forEach { (k, v) -> b.header(k, v) }
         if (rangeFrom != null && rangeFrom > 0) b.header("Range", "bytes=$rangeFrom-")
-        return Http.client.newBuilder()
+        val call = Http.client.newBuilder()
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
             .newCall(b.build())
+        // 挂到这一组里，暂停 / 删除时才掐得住：分片并发之后一个任务同时有好几个连接在飞
+        calls.getOrPut(id) { java.util.Collections.synchronizedSet(mutableSetOf()) } += call
+        return call
+    }
+
+    private fun cancelCalls(id: String) {
+        calls.remove(id)?.forEach { runCatching { it.cancel() } }
+    }
+
+    /** 请求结束（成功、失败、被取消都算）后把它从组里摘掉，别攒着一堆死对象。 */
+    private fun untrackCall(id: String, call: okhttp3.Call) {
+        calls[id]?.remove(call)
+    }
+
+    /**
+     * 报一次累计字节，顺带算速度。
+     *
+     * 取最近 3 秒那个窗口：更长的窗口会把「刚连上时的慢」平均进来，显示出一个永远在爬的假速度；
+     * 更短则抖得没法读。窗口里样本太少（不到半秒）时保留上一个值，不显示 0。
+     */
+    private fun reportBytes(id: String, totalBytes: Long) {
+        val now = System.currentTimeMillis()
+        val dq = speedWin.getOrPut(id) { ArrayDeque() }
+        synchronized(dq) {
+            dq.addLast(now to totalBytes)
+            while (dq.size > 1 && now - dq.first().first > SPEED_WINDOW_MS) dq.removeFirst()
+            val span = now - dq.first().first
+            if (span >= 500L) {
+                val perSec = ((totalBytes - dq.first().second) * 1000 / span).coerceAtLeast(0L)
+                _speed.update { it + (id to perSec) }
+            }
+        }
+    }
+
+    private fun forgetSpeed(id: String) {
+        speedWin.remove(id)
+        _speed.update { it - id }
     }
 
     private fun referer(cfg: SourceConfig) = cfg.baseUrl.trimEnd('/') + "/"
@@ -686,7 +832,10 @@ class DownloadRepository(
     }
 
     private suspend fun load() {
-        val raw = context.downloadStore.data.map { it[KEY] }.first()
+        val p = context.downloadStore.data.first()
+        _segParallel.value = (p[KEY_SEG_PARALLEL] ?: DEFAULT_SEG_PARALLEL.toLong()).toInt()
+            .coerceIn(1, MAX_SEG_PARALLEL)
+        val raw = p[KEY]
         val stored = raw?.takeIf { it.isNotBlank() }?.let {
             runCatching { json.decodeFromString<List<DownloadTask>>(it) }.getOrElse { emptyList() }
         }.orEmpty()
@@ -705,9 +854,28 @@ class DownloadRepository(
         }
     }
 
+    /**
+     * 改「单集内同时下几个分片」。
+     *
+     * 只影响**之后**开始的任务：正在下的那一集已经按旧档数开好了 worker，
+     * 中途改档要么杀掉正在写的分片、要么凭空多开一路，两种都比等它下完更糟。
+     */
+    fun setSegParallel(n: Int) {
+        val v = n.coerceIn(1, MAX_SEG_PARALLEL)
+        _segParallel.value = v
+        scope.launch { context.downloadStore.edit { it[KEY_SEG_PARALLEL] = v } }
+    }
+
     private companion object {
         /** 同时在跑几集。多了没意义：带宽就那么宽，站点那边也容易把并发当成刷接口。 */
         const val MAX_PARALLEL = 3
+
+        /** 一档最多给到 8：再多就是拿别人的 CDN 试上限，被拒的是用户自己。 */
+        const val MAX_SEG_PARALLEL = 8
+        const val DEFAULT_SEG_PARALLEL = 4
+
+        /** 速度取多长的窗口：太长会把刚连上时的慢平均进来，太短抖得读不出。 */
+        const val SPEED_WINDOW_MS = 3_000L
 
         fun keyOf(sourceId: String, mediaId: String, episodeIndex: Int) =
             "dl_${sourceId}_${mediaId}_$episodeIndex".replace(Regex("[^A-Za-z0-9_.-]"), "_")
