@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,8 +51,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -86,21 +87,24 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 
     var showAdd by remember { mutableStateOf(false) }
 
-    // 界面上的顺序 = 优先级顺序。落盘那份不保证有序，所以这里自己排一次；
-    // 拖拽要在「看得见的那份顺序」上做，否则拖完对不上号。
-    val order = remember(sources) { sources.sortedBy { it.priority }.map { it.id } }
-    val byId = remember(sources) { sources.associateBy { it.id } }
+    // 界面上的顺序 = 优先级顺序。落盘那份不保证有序，所以这里自己排一次。
+    // 必须是 derivedStateOf 而不是 remember(sources) 取到的那份 List：拖拽手势的回调块只在
+    // key 不变时启动一次，抓住一份 List 就永远是那一份 —— 上一次拖完、或中途加了新源之后，
+    // 旧列表既会把顺序写回拖之前，也会把不在它里面的那个新源整条删掉（reorder 只写回列表里的 id）。
+    val order by remember {
+        derivedStateOf { sources.sortedBy { it.priority }.map { it.id } }
+    }
+    val byId by remember { derivedStateOf { sources.associateBy { it.id } } }
 
     // 拖拽排序的临时状态：material3 这一版还没有可用的 reorderable 列表，只能自己接手势。
     // dragTo 只是「松手会落到第几位」，真正的顺序要等 vm.reorder 落库、sources 重新发一次才算数。
     var dragId by remember { mutableStateOf<String?>(null) }
     var dragDy by remember { mutableStateOf(0f) }
     var dragTo by remember { mutableStateOf(-1) }
-    // 每一行本来占在哪、多高。用普通 HashMap 而不是 State：
-    // 记进 State 会变成「布局 → 记录 → 重组 → 布局」转个不停；读它的只有拖动回调和紧随的那次重组，
-    // 那时值已经写好了。
-    val tops = remember { HashMap<String, Float>() }
-    val heights = remember { HashMap<String, Float>() }
+    // 行在哪、多高，一律从 listState 的当前布局里现读，不自建坐标表：
+    // LazyColumn 会回收滑出屏幕的行，自己记的那份 HashMap 既不清理也不更新，
+    // 滚到底再往回拖就会拿陈旧坐标算落点，把顺序落到完全不相干的位次上。
+    val listState = rememberLazyListState()
 
     val ok = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Ok }
     val slow = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Slow }
@@ -109,6 +113,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = PaddingValues(horizontal = Sp.s4, vertical = Sp.s2),
         ) {
             item {
@@ -280,92 +285,79 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                 val id = order[i]
                 val cfg = byId[id]
                 if (cfg != null) {
-                    // 外层的 Column 只负责「记录这一行本来在哪」，位移交给内层 ——
-                    // 记位置的节点要是自己也跟着动，判断压到哪一行就成了自我循环。
+                    val drag = dragId
+                    val dragged = drag == id
+                    val from = if (drag != null) order.indexOf(drag) else -1
+                    // 让位的步长取被抬起那一行的实际高度（这一列表每行都是同一个组件，高度一致）
+                    val step = if (drag != null) {
+                        listState.layoutInfo.visibleItemsInfo
+                            .firstOrNull { it.key == drag }?.size?.toFloat() ?: 0f
+                    } else 0f
+                    val ty = when {
+                        dragged -> dragDy
+                        from >= 0 && dragTo > from && i in (from + 1)..dragTo -> -step
+                        from >= 0 && dragTo in 0 until from && i in dragTo until from -> step
+                        else -> 0f
+                    }
+                    // zIndex 必须挂在 item 的根节点上：LazyColumn 只把每个 item 的根当兄弟看待，
+                    // 挂到里面那层「只有一个孩子的 Column」上等于没挂 —— 向下拖时被抬起那行
+                    // 会钻到它下面那几行（不透明底）后面，视觉上直接消失。
                     Column(
-                        Modifier.fillMaxWidth().onGloballyPositioned { c ->
-                            tops[id] = c.positionInWindow().y
-                            heights[id] = c.size.height.toFloat()
-                        },
+                        Modifier.fillMaxWidth()
+                            .zIndex(if (dragged) 1f else 0f)
+                            .graphicsLayer { translationY = ty },
                     ) {
-                        val drag = dragId
-                        val dragged = drag == id
-                        val from = if (drag != null) order.indexOf(drag) else -1
-                        // 被压到的那一整段各让出一个位次（按被抬起那行自己的高度估，
-                        // 这一列表的行都是同一个组件，高度一致）
-                        val step = if (drag != null) heights[drag] ?: 0f else 0f
-                        val ty = when {
-                            dragged -> dragDy
-                            from >= 0 && dragTo > from && i in (from + 1)..dragTo -> -step
-                            from >= 0 && dragTo in 0 until from && i in dragTo until from -> step
-                            else -> 0f
-                        }
-                        Column(
-                            Modifier.fillMaxWidth().zIndex(if (dragged) 1f else 0f)
-                                .graphicsLayer { translationY = ty },
-                        ) {
-                            SourceRow(
-                                cfg = cfg,
-                                report = health[cfg.id],
-                                dragging = dragged,
-                                grip = Modifier.pointerInput(id) {
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = {
-                                            dragId = id
-                                            dragDy = 0f
-                                            dragTo = order.indexOf(id)
-                                        },
-                                        onDrag = { change, amount ->
-                                            change.consume()
-                                            val d = dragId
-                                            if (d != null) {
-                                                dragDy += amount.y
-                                                // 落点看的是「被抬起那行的中心」压过了哪几行的中心
-                                                val center = (tops[d] ?: 0f) + (heights[d] ?: 0f) / 2f + dragDy
-                                                var t = order.lastIndex
-                                                for (j in order.indices) {
-                                                    val top = tops[order[j]] ?: continue
-                                                    if (center < top + (heights[order[j]] ?: 0f) / 2f) {
-                                                        t = j
-                                                        break
-                                                    }
-                                                }
-                                                dragTo = t.coerceIn(0, order.lastIndex)
-                                            }
-                                        },
-                                        onDragEnd = {
-                                            val d = dragId
-                                            val t = dragTo
-                                            dragId = null; dragDy = 0f; dragTo = -1
-                                            if (d != null && t >= 0) {
-                                                val f = order.indexOf(d)
-                                                if (f != t) {
-                                                    val moved = order.toMutableList()
-                                                    moved.add(t, moved.removeAt(f))
-                                                    vm.reorder(moved)
-                                                }
-                                            }
-                                        },
-                                        onDragCancel = {
-                                            dragId = null; dragDy = 0f; dragTo = -1
-                                        },
-                                    )
-                                },
-                                onToggle = { vm.toggleSource(cfg.id, it) },
-                                onDelete = { vm.deleteSource(cfg.id) },
-                                onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
-                                onUp = if (i == 0) null else {
-                                    {
-                                        // 用 order 而不是 sources：界面按优先级排过，落盘那份不保证有序，
-                                        // 拿未排的那份换位次会交换到看不见的两行上
-                                        val ids = order.toMutableList()
-                                        val tmp = ids[i - 1]; ids[i - 1] = ids[i]; ids[i] = tmp
-                                        vm.reorder(ids)
-                                    }
-                                },
-                            )
-                            Spacer8()
-                        }
+                        SourceRow(
+                            cfg = cfg,
+                            report = health[cfg.id],
+                            dragging = dragged,
+                            grip = Modifier.pointerInput(id) {
+                                detectDragGesturesAfterLongPress(
+                                    onDragStart = {
+                                        dragId = id
+                                        dragDy = 0f
+                                        dragTo = order.indexOf(id)
+                                    },
+                                    onDrag = { change, amount ->
+                                        change.consume()
+                                        dragDy += amount.y
+                                        dragTo = targetIndexFor(dragId, dragDy, order, listState)
+                                    },
+                                    onDragEnd = {
+                                        val d = dragId
+                                        val t = dragTo
+                                        dragId = null; dragDy = 0f; dragTo = -1
+                                        // order 读定一次：守卫和搬移之间它要是又变了，
+                                        // indexOf 的结果就和 add/removeAt 对不上
+                                        val cur = order
+                                        val f = if (d != null) cur.indexOf(d) else -1
+                                        // 两个守卫都得有。拖动途中另一根手指删了源、或者刚保存了新源，
+                                        // 列表长度和 f / t 都可能不再成立 —— 少了守卫就是 removeAt(-1) 当场崩。
+                                        if (f >= 0 && cur.isNotEmpty() && t in 0..cur.lastIndex && f != t) {
+                                            val moved = cur.toMutableList()
+                                            moved.add(t, moved.removeAt(f))
+                                            vm.reorder(moved)
+                                        }
+                                    },
+                                    onDragCancel = {
+                                        dragId = null; dragDy = 0f; dragTo = -1
+                                    },
+                                )
+                            },
+                            onToggle = { vm.toggleSource(cfg.id, it) },
+                            onDelete = { vm.deleteSource(cfg.id) },
+                            onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
+                            onUp = if (i == 0) null else {
+                                {
+                                    // 用 order 而不是 sources：界面按优先级排过，落盘那份不保证有序，
+                                    // 拿未排的那份换位次会交换到看不见的两行上
+                                    val ids = order.toMutableList()
+                                    val tmp = ids[i - 1]; ids[i - 1] = ids[i]; ids[i] = tmp
+                                    vm.reorder(ids)
+                                }
+                            },
+                        )
+                        Spacer8()
                     }
                 }
             }
@@ -394,6 +386,37 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
             )
         }
     }
+}
+
+/**
+ * 手指现在压到第几位。
+ *
+ * 坐标一律从 [LazyListState] 的当前布局现读，不自攒一份表：滑出屏幕的行会被 LazyColumn 回收，
+ * 自己记过的那份既不清理也不更新，滚到底再往回拖就会拿陈旧坐标把顺序落到不相干的位次上。
+ *
+ * 判据是「被抬起那一行的中心」越过了哪一行的中心 —— 越过第一条就把那一条的位次当作落点。
+ */
+private fun targetIndexFor(
+    dragId: String?,
+    dragDy: Float,
+    order: List<String>,
+    listState: LazyListState,
+): Int {
+    if (dragId == null || order.isEmpty()) return -1
+    val visible = listState.layoutInfo.visibleItemsInfo
+    val self = visible.firstOrNull { it.key == dragId } ?: return order.indexOf(dragId)
+    val center = self.offset + self.size / 2f + dragDy
+    for (vi in visible) {
+        val pos = (vi.key as? String)?.let { order.indexOf(it) } ?: -1
+        if (pos < 0 || vi.key == dragId) continue
+        if (vi.offset + vi.size / 2f > center) return pos
+    }
+    // 已经压过所有可见行的中心：落到这一批里最后一个源的位次。
+    // 这一版不做拖到边缘自动滚动，拖不出屏幕就是拖不出这一批 —— 宁可少排一位，也不要凭陈旧的
+    // 屏外坐标猜一个落点。
+    return visible.lastOrNull { (it.key as? String)?.let { k -> order.indexOf(k) }?.let { p -> p >= 0 } == true }
+        ?.let { order.indexOf(it.key as String) }
+        ?: order.indexOf(dragId)
 }
 
 @Composable
