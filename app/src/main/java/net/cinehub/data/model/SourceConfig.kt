@@ -26,9 +26,6 @@ data class SourceConfig(
     val api: ApiRules? = null,
     /**
      * 用户自己提供的站点会话凭证（Cookie / token）。
-     *
-     * 有些站点要求登录后才给直链。影枢不去绕过对方的校验，
-     * 而是让用户填自己的凭证 —— 能不能看取决于用户在该站的账号。
      */
     val authToken: String? = null,
     /** 凭证的传递方式。 */
@@ -37,7 +34,6 @@ data class SourceConfig(
      * 源站自己播放页的路径模板，占位符 `{id}` `{sid}` `{nid}`（线路号 / 第几集）。
      *
      * 只有接口型源需要：苹果 CMS 的 `vod_play_url` 里给的可能直接是
-     * 爱奇艺 / 腾讯那种平台播放页（西瓜影院就是这样），影枢拿它没法播。
      * 但源站自己的播放页能播 —— 它自己的播放器会去把平台页地址换成可播流。
      * 于是影枢打开这个页面，在旁边接住页面已经请求出来的那条流 —— 换流是源站自己的播放器做的。
      */
@@ -111,7 +107,6 @@ data class HtmlRules(
      * 直链获取方式。
      *
      * 苹果 CMS 模板站会把真实地址写进播放页的 `player_aaaa` 配置里，
-     * 这是公开的页面数据（不是绕过登录），所以可以照读；
      * 地址要靠站点脚本现算的标 [MODE_CLIENT_SCRIPT]，
      * 直链只对登录用户开放的标 [MODE_SESSION]，
      * 其余留 [MODE_NONE]，由 [net.cinehub.data.source.HtmlAdapter.resolveStream] 如实说明。
@@ -126,9 +121,6 @@ data class HtmlRules(
 
         /**
          * 直链由站点自己的页面脚本现算（WASM 签名 / JS 拼地址）。
-         *
-         * 不执行对方的脚本就构造不出请求，所以影枢不解析、也不去逆它的签名 ——
-         * 标这个模式只是为了让提示语说实话。
          */
         const val MODE_CLIENT_SCRIPT = "clientScript"
 

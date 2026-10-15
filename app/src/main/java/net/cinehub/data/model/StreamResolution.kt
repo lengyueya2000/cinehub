@@ -13,7 +13,7 @@ sealed interface StreamResolution {
     /** 拿到了能直接交给播放器的地址。 */
     data class Ready(val url: String) : StreamResolution
 
-    /** 源给的是爱奇艺 / 腾讯 / B 站那类平台的播放页，本机解不了别人的页面。 */
+    /** 源给的是爱奇艺 / 腾讯 / B 站那类平台的播放页 */
     data class ThirdPartyPage(val pageUrl: String, val platform: String) : StreamResolution
 
     /** 直链藏在站内登录态后面 —— 填用户自己的凭证有可能走通。 */
@@ -21,10 +21,6 @@ sealed interface StreamResolution {
 
     /**
      * 地址由源站自己的页面脚本现算出来（常见于用 WASM 做签名的站）。
-     *
-     * 和 [NeedsSession] 的区别：这里连**请求本身**都构造不出来 —— 参数里带签名，
-     * 不执行站点的脚本就得不到。所以填凭证解决不了这一步。
-     * 影枢不执行站点脚本、也不去逆它的签名，于是如实说「拿不到」。
      */
     data object NeedsClientScript : StreamResolution
 

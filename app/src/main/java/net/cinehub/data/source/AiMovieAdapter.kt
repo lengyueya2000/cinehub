@@ -25,7 +25,6 @@ import javax.crypto.spec.SecretKeySpec
  *
  * 站点前端把「方法 + 路径 + 时间戳 + 随机串」拼成消息算 HMAC-SHA256，
  * 密钥是前端自己带在包里的常量。影枢照同一套协议把请求算出来发过去 ——
- * 用的是站点发给每一个访客的公开常量，不是任何人的账号凭据；能拿到什么取决于站点愿意给匿名会话什么。
  */
 internal object AiMovieSign {
 
