@@ -17,6 +17,7 @@ import net.cinehub.data.HomeRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
+import net.cinehub.data.quietly
 import net.cinehub.data.shortReason
 import net.cinehub.data.model.AggregatedMedia
 import net.cinehub.data.model.DoubanChart
@@ -50,10 +51,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val homeRepo = HomeRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
+    /**
+     * 一次性的一句话告知，界面那侧弹出来。
+     *
+     * 「点了没反应」是最难自己发现的 bug：入口看着是活的，按下去既没结果也没说法。
+     * 凡是走不通的分支都该在这儿留一句 —— 尤其那些 `?: return` 的入口。
+     */
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+
+    fun showNotice(text: String) { _notice.value = text }
+
+    fun consumeNotice() { _notice.value = null }
+
     val downloads: StateFlow<List<DownloadTask>> = downloadRepo.tasks
 
     /** 缓存占掉的字节数。仓库在协程里数好，界面只读这个值。 */
     val downloadSpace: StateFlow<Long> = downloadRepo.space
+
+    /** 盘上那份任务清单这一版读不通了（[net.cinehub.data.DownloadRepository.unreadable]）。 */
+    val downloadsUnreadable: StateFlow<Boolean> = downloadRepo.unreadable
 
     /** 每个任务当前的下载速度（字节/秒）。只在内存里，重启后从 0 重新算。 */
     val downloadSpeed: StateFlow<Map<String, Long>> = downloadRepo.speed
@@ -66,6 +83,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
     val watchHistory: StateFlow<List<HistoryEntry>> = watchRepo.history
+
+    /** 盘上那份收藏/观看记录这一版读不通了（[net.cinehub.data.WatchRepository.unreadable]）。 */
+    val watchUnreadable: StateFlow<Boolean> = watchRepo.unreadable
 
     // ---------- 豆瓣榜单 ----------
 
@@ -280,11 +300,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 源管理 ----------
 
+    /**
+     * 探一轮所有源的连通性。
+     *
+     * 三个洞：① 没有 `finally`，探测里抛一下就永远停在转圈（源多、网差时这是常态）；
+     * ② 没有代号，前一慢后一新 —— 慢那趟回来会把新那趟的结果盖掉，
+     * 而它的 `_checking=false` 还会把新那趟正在转的圈关掉，界面显示的是过期健康表却没有加载痕迹；
+     * ③ 多路同时扇出，同一个站被连打几次。
+     * 所以和详情一样：只跑一个，后来的顶掉前面的，标记只由当代那一次来关。
+     */
+    private var healthJob: Job? = null
+    private var healthGen = 0
+
     fun refreshHealth(force: Boolean = true) {
-        viewModelScope.launch {
-            _checking.value = true
-            _health.value = mediaRepo.healthAll(force)
-            _checking.value = false
+        val mine = ++healthGen
+        healthJob?.cancel()
+        healthJob = viewModelScope.launch {
+            try {
+                _checking.value = true
+                val h = mediaRepo.healthAll(force)
+                if (mine == healthGen) _health.value = h
+            } finally {
+                if (mine == healthGen) _checking.value = false
+            }
         }
     }
 
@@ -305,10 +343,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         val mine = ++detailGen
         detailJob?.cancel()
+        // 这一趟本身就在探所有源，所以把并发的那轮普通探测顶掉：
+        // 两趟同时扇出等于挨着把每个站打两遍，而且谁先结束不好说，转圈标记会先灭。
+        healthJob?.cancel()
+        val mineH = ++healthGen
         detailJob = viewModelScope.launch {
             try {
                 _checking.value = true
-                _health.value = mediaRepo.healthAll(force = true)
+                val h = mediaRepo.healthAll(force = true)
+                if (mineH == healthGen) _health.value = h
                 if (mine != detailGen) return@launch
                 val s = mediaRepo.siblingsOf(d.media)
                 if (mine != detailGen) return@launch
@@ -318,7 +361,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _siblings.value = s.items.sortedByDescending { it.sourceId == act }
                 _siblingsOf = d.media.key
             } finally {
-                _checking.value = false
+                // 只由当代这一次关转圈：被顶掉的那趟把新一次的圈关掉，
+                // 用户看到的就是「重新检测」点了以后探测还在跑、界面上却已经不动了
+                if (mine == detailGen && mineH == healthGen) _checking.value = false
             }
         }
     }
@@ -397,7 +442,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         authToken: String?,
         playPath: String? = null,
     ): SourceConfig = SourceConfig(
-        id = "src_" + System.currentTimeMillis().toString(36),
+        // 毫秒时间戳做 id 会撞：连着「探测并保存」两个站点（或者脚本一样的两个源）
+        // 完全可能落在同一毫秒里，后存的那个把前一个原地覆盖 —— 界面上是
+        // 「我加了两个，只剩一个」。补一段随机，id 才是唯一的。
+        id = "src_" + System.currentTimeMillis().toString(36) +
+            java.util.UUID.randomUUID().toString().take(4),
         name = name.ifBlank { baseUrl },
         baseUrl = baseUrl.trim().trimEnd('/'),
         kind = kind,
@@ -481,7 +530,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 搜索 ----------
 
-    fun onQueryChange(q: String) { _query.value = q }
+    /**
+     * 搜索框改了字。
+     *
+     * 改了词就等于上一趟不作了数：不顶掉它的话，框里已经是「三体 2」、屏上还是「三体」的
+     * 命中，还挂着一条「正在并发查询…」—— 两趟的账并成一行显示，用户分不清哪条是哪个词的。
+     * 在跑的那一笔回来时会发现代号对不上，自己就把结果丢了。
+     */
+    fun onQueryChange(q: String) {
+        if (q == _query.value) return
+        ++searchGen
+        _query.value = q
+        _searching.value = false
+        _results.value = emptyList()
+        _searchFailures.value = emptyList()
+    }
 
     /**
      * 搜一次。
@@ -579,8 +642,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     _detailError.value = "播放源不存在"
                     return@launch
                 }
-                runCatching { mediaRepo.detail(cfg, mediaId) }
+                // 用 quietly 而不是 runCatching：这一笔是会被后一次顶掉的，
+                // runCatching 把 CancellationException 也当成「加载失败」，
+                // 于是换得越快，屏幕上越会闪出一句莫名其妙的报错。
+                quietly { mediaRepo.detail(cfg, mediaId) }
                     .onSuccess { raw ->
+                        // 被顶掉的那一次不能往下写：它手里这份是上一部片的，
+                        // 落下去就把新一次刚摆好的详情盖成了旧的（选集和源徽标分属两片）。
+                        if (mine != detailGen) return@onSuccess
                         // 详情页常常不写年份，卡片写了。留着空的走下去，同一部片会因为
                         // 「卡片那条带 |2026、详情那条不带」变成两条收藏 / 两条观看记录。
                         val d = raw.withYear(yearKnownFor(cfg.id, mediaId, raw.media.title))
@@ -598,10 +667,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             ),
                         )
                         val s = mediaRepo.siblingsOf(d.media)
+                        if (mine != detailGen) return@onSuccess
                         _siblingFailures.value = s.failures
                         _siblings.value = _siblings.value + s.items.filter { it.sourceId != cfg.id }
                     }
-                    .onFailure { _detailError.value = it.message ?: "详情加载失败" }
+                    .onFailure { if (mine == detailGen) _detailError.value = it.message ?: "详情加载失败" }
             } finally {
                 if (mine == detailGen) _detailLoading.value = false
             }
@@ -644,13 +714,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _detailError.value = null
                 val keepYear = _siblings.value.firstNotNullOfOrNull { it.item.year }
                     ?: yearKnownFor(av.sourceId, av.item.id, av.item.title)
-                runCatching { mediaRepo.detail(cfg, av.item.id) }
+                quietly { mediaRepo.detail(cfg, av.item.id) }
                     .onSuccess {
-                        _detail.value = it.withYear(it.media.year ?: keepYear)
+                        if (mine != detailGen) return@onSuccess
+                        val d = it.withYear(it.media.year ?: keepYear)
+                        _detail.value = d
                         // 取回来了才认这个源：失败了还标着新源，界面就是在说一件没发生的事
                         _activeSourceId.value = av.sourceId
+                        // 那一栏的次序就是「你正在用哪个源」的次序，切了源必须跟着换；
+                        // _siblingsOf 也要落在这部片的新 key 上，否则下面那排芯片还挂在
+                        // 上一次的比对结果上，点它会把人带回刚离开的那个源。
+                        _siblingsOf = d.media.key
+                        // 这一栏里当前源必须排第一，而且得有一条 —— 跨源比对那趟可能压根
+                        // 没探到这个源（它就是因此才排在后面的），切过来之后芯片上却没有
+                        // 「正在用的这个」，看着就像列表漏了一项。
+                        val others = _siblings.value.filterNot { it.sourceId == av.sourceId }
+                        _siblings.value = listOf(
+                            SourceAvailability(
+                                sourceId = av.sourceId,
+                                sourceName = av.sourceName,
+                                item = d.media,
+                                health = _health.value[av.sourceId]?.health ?: Health.Unknown,
+                                quality = qualityOf(d.media),
+                                latencyMs = _health.value[av.sourceId]?.latencyMs,
+                            ),
+                        ) + others
                     }
                     .onFailure {
+                        if (mine != detailGen) return@onFailure
                         // 换不过去就退回原来那一页：把人手上正在看的详情整个撤掉，
                         // 等于让他为了换一个源而丢掉刚才那半屏
                         _detail.value = prev
@@ -959,13 +1050,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 lastDurationSec = 0L
 
                 if (cfg == null) {
-                    _playing.value = _playing.value?.copy(
-                        note = "播放源已不存在，可能在「播放源管理」里被删掉了",
-                    )
+                    val why = "播放源已不存在，可能在「播放源管理」里被删掉了"
+                    _playing.value = _playing.value?.copy(note = why)
+                    reportAndContinue(why)
                     return@launch
                 }
                 if (episodeUrl.isNullOrBlank()) {
-                    _playing.value = _playing.value?.copy(note = "该源的播放地址无效")
+                    val why = "这个源没给出这一集的播放地址"
+                    _playing.value = _playing.value?.copy(note = why)
+                    reportAndContinue(why)
                     return@launch
                 }
 
@@ -982,13 +1075,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // 拿不到可播地址就是「这个源放不出来这一集」，交给自动换源往下走。
                 // 另开一个协程去汇报：这里正跑在本轮的 playJob 里，就地切换会把它取消掉。
                 if (res !is StreamResolution.Ready) {
-                    val why = noteOf(res) ?: "这个源给不出可播地址"
-                    viewModelScope.launch { reportPlaybackFailure(why) }
+                    reportAndContinue(noteOf(res) ?: "这个源给不出可播地址")
                 }
             } finally {
                 if (mine == playGen) _resolving.value = false
             }
         }
+    }
+
+    /**
+     * 起播这一步就地失败，也要把这一轮推下去。
+     *
+     * 不汇报的话这一轮就停在「正在试第 N 个」不动了 —— 横幅说它在换源，屏上却再没有任何动作，
+     * 用户看到的就是「点了没反应」。另开一个协程汇报：这里正跑在本轮的 playJob 里，
+     * 就地切源会把自己取消掉，取消掉的那一半又会被当成一次新的失败。
+     */
+    private fun reportAndContinue(reason: String) {
+        viewModelScope.launch { reportPlaybackFailure(reason) }
     }
 
     /**
@@ -1086,14 +1189,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cache(sourceId: String, media: Media, episode: Episode) {
         viewModelScope.launch {
-            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId } ?: return@launch
+            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
+            if (cfg == null) {
+                showNotice("这个播放源已经不在了，缓存不了 —— 到「播放源管理」里换一个源再存。")
+                return@launch
+            }
             downloadRepo.enqueue(cfg, media, episode)
         }
     }
 
     fun cacheLine(sourceId: String, media: Media, episodes: List<Episode>) {
         viewModelScope.launch {
-            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId } ?: return@launch
+            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId }
+            if (cfg == null) {
+                showNotice("这个播放源已经不在了，缓存不了 —— 到「播放源管理」里换一个源再存。")
+                return@launch
+            }
+            if (episodes.isEmpty()) {
+                showNotice("这一条线路一个分集都没给，整条存不下来 —— 换一条线路试试。")
+                return@launch
+            }
             downloadRepo.enqueueAll(cfg, media, episodes)
         }
     }
@@ -1101,13 +1216,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 播放器里的「缓存」：把当前这一集存下来，用的就是它刚解析过的那条直链。 */
     fun cachePlaying() {
         val p = _playing.value ?: return
-        val mediaId = p.mediaId ?: return
+        val mediaId = p.mediaId
+        val originId = p.originSourceId ?: p.sourceId
         // 先看播放器自己那份快照（起播时对过号），再退回详情页当前那一份 ——
-        // 只认得得上号的那部，否则会把另一部片的字段写进这条缓存任务
-        val d = _playingDetail.value?.takeIf { it.media.id == mediaId }
-            ?: _detail.value?.takeIf { it.media.id == mediaId } ?: return
+        // 只认得得上号的那部，否则会把另一部片的字段写进这条缓存任务。
+        // 光对 mediaId 不够：各家的条目 id 是各自编号，两个源都可能有 id=12345 的两部片，
+        // 而这条缓存之后要拿它去重新解析直链 —— 存成另一部，下下来就是另一部。
+        fun fits(d: MediaDetail?) = d != null && mediaId != null &&
+            d.media.id == mediaId && d.media.sourceId == originId
+        val d = _playingDetail.value?.takeIf { fits(it) } ?: _detail.value?.takeIf { fits(it) }
+        if (d == null || mediaId == null) {
+            showNotice("这一集对不上任何一部片的详情，缓存不了 —— 回详情页从那儿存。")
+            return
+        }
         cache(
-            p.originSourceId ?: p.sourceId,
+            originId,
             d.media,
             Episode(p.episodeName, p.episodeIndex, p.episodeUrl),
         )
@@ -1121,7 +1244,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 直接播已缓存好的文件，不再碰网络。 */
     fun playCached(task: DownloadTask) {
-        val uri = downloadRepo.localUri(task.id) ?: return
+        val uri = downloadRepo.localUri(task.id)
+        if (uri == null) {
+            // 记录说「已缓存」、文件却不在 —— 多半是被清理软件或系统删了。
+            // 悄悄 return 的话，这一行看着就是能点、点了没反应。
+            showNotice("这一集的文件已经不在盘上了（多半被清理软件删掉了）—— 重新缓存一次。")
+            return
+        }
         val start = watchRepo.resumeAt(task.mediaKey, task.episodeIndex)
         _resumePosition.value = start
         lastDurationSec = 0L
@@ -1252,11 +1381,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun resumeFromHistory(e: HistoryEntry) {
         viewModelScope.launch {
-            val cfg = sourceRepo.all().firstOrNull { it.id == e.sourceId } ?: return@launch
-            val fetched = runCatching { mediaRepo.detail(cfg, e.mediaId) }
+            // 源被删掉了也要给一句说法：静默 return 等于那张卡片根本点不动，
+            // 而用户看到的是「我点了继续观看，什么都没发生」。
+            val cfg = sourceRepo.all().firstOrNull { it.id == e.sourceId }
+            if (cfg == null) {
+                refuseToPlay(
+                    e, "源已移除",
+                    "这部片当初是「${e.sourceId}」这个源给的，它已经在「播放源管理」里被删掉了 —— " +
+                        "进度还留着。去播放源管理把它加回来，或者从「片库 / 搜索」里重新找一部。",
+                )
+                return@launch
+            }
+            val fetched = quietly { mediaRepo.detail(cfg, e.mediaId) }
             val d = fetched.getOrElse { err ->
                 refuseToPlay(
-                    e, cfg,
+                    e, cfg.name,
                     "没能从「${cfg.name}」问到这一集的最新地址：" +
                         "${err.shortReason()} —— 进度给你留着，稍后再试，或者在播放器里换一个源。",
                 )
@@ -1266,7 +1405,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (ep == null || ep.playUrl.isNullOrBlank()) {
                 // 源改版或这一集真的没了：把记录去掉，别让它一直躺在「继续观看」里点不动
                 refuseToPlay(
-                    e, cfg,
+                    e, cfg.name,
                     "「${cfg.name}」这一部里已经没有第 ${e.episodeIndex} 集了（源改版或那一集被撤了）" +
                         "—— 这条记录先替你去掉。",
                 )
@@ -1295,13 +1434,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 用户点「继续观看」时人已经在播放器门口，什么也不弹等于点了没反应；
      * 但记录不能因为这一次拿不到就删 —— 所以落一个没有地址的 Playing，把原因说清楚。
      */
-    private fun refuseToPlay(e: HistoryEntry, cfg: SourceConfig, why: String) {
+    private fun refuseToPlay(e: HistoryEntry, sourceName: String, why: String) {
         _playing.value = Playing(
             mediaTitle = e.title,
             episodeName = "第 ${e.episodeIndex} 集",
             episodeIndex = e.episodeIndex,
-            sourceName = cfg.name,
-            sourceId = cfg.id,
+            sourceName = sourceName,
+            sourceId = e.sourceId,
             streamUrl = null,
             note = why,
             mediaId = e.mediaId,
@@ -1381,7 +1520,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _doubanItems.value = it.items
             _doubanAt.value = it.at
         }
-        if (!_doubanLoading.value) refreshDouban()
+        // 每次进片库都去敲豆瓣的门没道理，但也不能拿一个布尔当门闩：
+        // 那一笔要是中途被切榜顶掉了，标记留在 true 上，片库从此不再自动刷新。
+        if (doubanJob?.isActive != true) refreshDouban()
     }
 
     /** 切榜：先把上次那份缓存放上去，再后台刷新。 */
@@ -1395,27 +1536,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         refreshDouban()
     }
 
+    /**
+     * 拉一次榜单。
+     *
+     * 只跑一个，后来的顶掉前一个，转圈标记也只由当代那次来关 —— 不然连切两个榜时，
+     * 前一个的请求晚一步回来，会把后一个正在转的圈关掉，还把别的榜的结果泼上来。
+     */
+    private var doubanJob: Job? = null
+    private var doubanGen = 0
+
     fun refreshDouban() {
         val chart = _doubanChart.value
+        val mine = ++doubanGen
+        doubanJob?.cancel()
         _doubanLoading.value = true
-        viewModelScope.launch {
-            val res = runCatching { doubanRepo.fetch(chart) }
-            // 拉回来这段时间里用户可能已经切走了，别把结果泼到新的榜上
-            if (chart.id != _doubanChart.value.id) {
-                _doubanLoading.value = false
-                return@launch
+        doubanJob = viewModelScope.launch {
+            try {
+                val res = quietly { doubanRepo.fetch(chart) }
+                if (mine != doubanGen) return@launch
+                res.onSuccess { items ->
+                    doubanRepo.put(chart, items)
+                    _doubanItems.value = items
+                    _doubanAt.value = System.currentTimeMillis()
+                    _doubanError.value = null
+                }.onFailure {
+                    // 有旧数据就留着旧数据，只把原因写在旁边：
+                    // 一次网络抖动不该把一整屏片清空。
+                    _doubanError.value = it.message ?: "拉取失败"
+                }
+            } finally {
+                if (mine == doubanGen) _doubanLoading.value = false
             }
-            res.onSuccess { items ->
-                doubanRepo.put(chart, items)
-                _doubanItems.value = items
-                _doubanAt.value = System.currentTimeMillis()
-                _doubanError.value = null
-            }.onFailure {
-                // 有旧数据就留着旧数据，只把原因写在旁边：
-                // 一次网络抖动不该把一整屏片清空。
-                _doubanError.value = it.message ?: "拉取失败"
-            }
-            _doubanLoading.value = false
         }
     }
 

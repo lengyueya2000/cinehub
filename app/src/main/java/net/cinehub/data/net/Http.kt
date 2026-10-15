@@ -49,6 +49,60 @@ object Http {
         }
     }
 
+    /**
+     * 一次响应最多读进内存多少字节。
+     *
+     * 原来四处 `body?.string()` 都是「有多少读多少」。这不是理论风险：把一个 m3u 源
+     * 指向一个 `.mp4`，或者站点把某个列表接成了分页无限下钻的接口，这里就会照着
+     * 几百 MB 往一个 String 里搬 —— Android 的堆上限是几百 MB，装不下就是 OOM，
+     * 用户看到的现象是「搜一下就闪退」，而且下次进来还这样。
+     */
+    const val MAX_BODY_BYTES = 4_000_000L
+
+    /**
+     * 读正文，超过 [MAX_BODY_BYTES] 就报错，不截断、也不继续读。
+     *
+     * 为什么不截断着解析：半份 HTML 解析出来是「零条结果」，界面就会把它写成
+     * 「这个源里没有这部片」—— 一句假话，而且方向还会把人支使得更远（换源、换关键词）。
+     * 报错则落在「这个源没答上话」那一类，是真话。
+     */
+    private fun okhttp3.Response.bodyText(): String {
+        val b = body ?: return ""
+        val stream = b.byteStream()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(16 * 1024)
+        var total = 0L
+        while (true) {
+            val n = stream.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            total += n
+            if (total > MAX_BODY_BYTES) error(
+                "这个源回的内容超过 ${MAX_BODY_BYTES / 1024 / 1024} MB，不像一份能解析的页面 —— " +
+                    "多半是地址指到了视频本身",
+            )
+        }
+        return String(out.toByteArray(), charsetOf(b.contentType()?.toString()))
+    }
+
+    /** 从 Content-Type 里认字符集；认不出来按 UTF-8 处理（这批站基本都声明了 gbk/utf-8）。 */
+    private fun charsetOf(contentType: String?): java.nio.charset.Charset {
+        val name = contentType?.substringAfter("charset=", "")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return Charsets.UTF_8
+        return runCatching { java.nio.charset.Charset.forName(name) }.getOrNull() ?: Charsets.UTF_8
+    }
+
+    /**
+     * 一次请求的总预算。
+     *
+     * readTimeout 只管「两次读之间最多等多久」，一个每次挤几百字节、永远不断流的慢站
+     * 可以把一次请求拖成几分钟，而这期间界面一直挂着「正在查询…」。
+     * 这里给每条页面类请求加一个总时限 —— 下载那条路不加：一集本来就要下十几分钟。
+     */
+    private fun OkHttpClient.Builder.withBudget(timeoutSec: Long): OkHttpClient.Builder =
+        readTimeout(timeoutSec, TimeUnit.SECONDS)
+            .callTimeout(timeoutSec * 3, TimeUnit.SECONDS)
+
     suspend fun get(
         url: String,
         referer: String? = null,
@@ -61,11 +115,11 @@ object Http {
             .header("Accept-Language", "zh-CN,zh;q=0.9")
         referer?.let { b.header("Referer", it) }
         headers.forEach { (k, v) -> b.header(k, v) }
-        client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
+        client.newBuilder().withBudget(timeoutSec).build()
             .newCall(b.build()).await().use { r ->
-                val body = r.body?.string()
-                if (!r.isSuccessful) error(failureReason(r.code, body.orEmpty()))
-                body ?: error("空响应")
+                val body = r.bodyText()
+                if (!r.isSuccessful) error(failureReason(r.code, body))
+                body.ifBlank { error("空响应") }
             }
     }
 
@@ -85,12 +139,12 @@ object Http {
         b.header("User-Agent", UA)
         referer?.let { b.header("Referer", it) }
         headers.forEach { (k, v) -> b.header(k, v) }
-        client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
+        client.newBuilder().withBudget(timeoutSec).build()
             .newCall(b.build()).await().use { r ->
-                val body = r.body?.string()
-                if (!r.isSuccessful) error(failureReason(r.code, body.orEmpty()))
+                val body = r.bodyText()
+                if (!r.isSuccessful) error(failureReason(r.code, body))
                 ResponseBody(
-                    body = body ?: error("空响应"),
+                    body = body.ifBlank { error("空响应") },
                     setCookie = r.headers("Set-Cookie").joinToString("; ") {
                         it.substringBefore(';')
                     }.takeIf { it.isNotBlank() },
@@ -108,10 +162,10 @@ object Http {
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val b = Request.Builder().url(url).header("User-Agent", UA).post(json.toRequestBody(mediaType))
         headers.forEach { (k, v) -> b.header(k, v) }
-        client.newBuilder().readTimeout(timeoutSec, TimeUnit.SECONDS).build()
+        client.newBuilder().withBudget(timeoutSec).build()
             .newCall(b.build()).await().use { r ->
                 ResponseBody(
-                    body = r.body?.string().orEmpty(),
+                    body = r.bodyText(),
                     status = r.code,
                     setCookie = r.headers("Set-Cookie").joinToString("; ") {
                         it.substringBefore(';')
@@ -138,6 +192,7 @@ object Http {
         client.newBuilder()
             .readTimeout(8, TimeUnit.SECONDS)
             .connectTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(24, TimeUnit.SECONDS)
             .build()
             .newCall(b.build()).await().use { r: Response ->
                 // 「测试连接」这句结论要能自证 —— 拒答页正文里写着真正的原因，
@@ -203,10 +258,23 @@ object Http {
      * 取错误响应的正文前若干字节，供 [failureReason] 判定。
      *
      * 只在失败这一条路上调，所以正文本来也没别用。拦下访问的页面都很小（实测十几 KB），
-     * 截断到 8 KB 够把字样看到了。
+     * 截断到 8 KB 够把字样看到了 —— 而且是**只读这么多**：一个 500 页也可能有几 MB，
+     * 全读进来等于让报错这一条路上也埋着 OOM。
      */
-    fun errorSnippet(r: Response): String =
-        runCatching { r.body?.string() }.getOrNull()?.take(8_000).orEmpty()
+    fun errorSnippet(r: Response): String = runCatching {
+        val b = r.body ?: return@runCatching ""
+        val stream = b.byteStream()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(2048)
+        var left = 8_000L
+        while (left > 0L) {
+            val n = stream.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+            if (n < 0) break
+            out.write(buf, 0, n)
+            left -= n
+        }
+        String(out.toByteArray(), charsetOf(b.contentType()?.toString()))
+    }.getOrNull().orEmpty()
 
     /** 解析站点 baseUrl 是否可用，返回最终生效的 baseUrl（可能被重定向）。 */
     suspend fun resolveBase(base: String): String = withContext(Dispatchers.IO) {

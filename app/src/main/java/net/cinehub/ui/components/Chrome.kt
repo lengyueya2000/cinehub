@@ -254,3 +254,23 @@ fun EmptyState(
     }
 }
 
+/**
+ * 「屏上这份不是全部」的告示。
+ *
+ * 三份本机记录（播放源、收藏与观看、缓存任务）都可能因为版本换了格式而读不通。
+ * 那时候界面显示的是回落出来的空列表，而盘上那份原文还在存档里 —— 不说清楚的话，
+ * 「还没有缓存任何内容」会被读成「我自己删光了」，而用户下一次任何操作就把屏幕上
+ * 这份空的写回盘上，那份旧的才真的没了。
+ */
+@Composable
+fun UnreadableNotice(what: String) {
+    Text(
+        "注意：本机存的${what}这一版读不通（多半是刚换过格式）。现在显示的是回落出来的空列表，" +
+            "原来那份已另存了一份没动 —— 先别在这里增删，等升级到能读的版本。",
+        color = T.Warn,
+        fontSize = Fs.xxs,
+        lineHeight = Fs.xxs * 1.6f,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s1),
+    )
+}
+

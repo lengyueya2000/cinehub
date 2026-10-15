@@ -12,7 +12,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -38,12 +37,24 @@ class WatchRepository(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY_FAV = stringPreferencesKey("favorites_v1")
     private val KEY_HIS = stringPreferencesKey("history_v1")
+    /** 解不通时那份原文的去处，见 [snapshot]。和 [SourceRepository] 的备份键同一套路。 */
+    private val KEY_FAV_BAK = stringPreferencesKey("favorites_v1_unreadable")
+    private val KEY_HIS_BAK = stringPreferencesKey("history_v1_unreadable")
 
     private val _favorites = MutableStateFlow<List<Favorite>>(emptyList())
     val favorites: StateFlow<List<Favorite>> = _favorites.asStateFlow()
 
     private val _history = MutableStateFlow<List<HistoryEntry>>(emptyList())
     val history: StateFlow<List<HistoryEntry>> = _history.asStateFlow()
+
+    /**
+     * 盘上那份有内容、但这一版解析不了。
+     *
+     * 必须和「压根没存过」分开：两者都当空列表处理的话，用户看到的是「我收藏的东西没了」，
+     * 而真相是版本对不上 —— 更糟的是下一次写入会把那份还救得回来的原文彻底冲掉。
+     */
+    private val _unreadable = MutableStateFlow(false)
+    val unreadable: StateFlow<Boolean> = _unreadable.asStateFlow()
 
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
@@ -139,6 +150,12 @@ class WatchRepository(private val context: Context) {
         scope.launch {
             runCatching {
                 context.watchStore.edit {
+                    // 覆盖之前先验一眼盘上那份：解不通就先挪进备份键，再写新的。
+                    // 这一版既然读不懂它，直接盖就等于把用户的东西删了。
+                    it[KEY_FAV]?.takeIf { raw -> raw.isNotBlank() && !readable<Favorite>(raw) }
+                        ?.let { raw -> it[KEY_FAV_BAK] = raw }
+                    it[KEY_HIS]?.takeIf { raw -> raw.isNotBlank() && !readable<HistoryEntry>(raw) }
+                        ?.let { raw -> it[KEY_HIS_BAK] = raw }
                     it[KEY_FAV] = json.encodeToString(_favorites.value)
                     it[KEY_HIS] = json.encodeToString(_history.value)
                 }
@@ -146,20 +163,45 @@ class WatchRepository(private val context: Context) {
         }
     }
 
-    private suspend fun load() {
-        val p = context.watchStore.data.first()
-        // 同上：读盘这段时间里用户点的收藏、播的那一集，不能被整份覆盖掉。
-        _favorites.value =
-            (_favorites.value + p[KEY_FAV].decode<Favorite>()).distinctBy { it.key }
-        _history.value = (_history.value + p[KEY_HIS].decode<HistoryEntry>())
-            .distinctBy { it.key }
-            .sortedByDescending { it.updatedAt }
-            .take(MAX_HISTORY)
+    /**
+     * 启动那一次读盘，整套放在 `edit` 的变换里。
+     *
+     * 原来是 `data.first()` 读完再在内存里拼 —— 中间那几十毫秒没有任何东西挡着：
+     * 用户冷启动就点收藏、或者进「最近观看」直接清空，改的都在内存里，
+     * 而 load 手里还是读盘那一刻的旧 blob，拼完写回就把他刚做的操作复活成原样。
+     * DataStore 的变换是串行的，读—合—写落在同一个事务里就不会有这件事。
+     *
+     * 解不通的那一份**不回写**：留着原文（并挪一份进备份键），内存里保持空，
+     * 界面上用 [unreadable] 说清楚，而不是让下一次保存坐实成「用户自己删光的」。
+     */
+    private suspend fun load() = runCatching {
+        context.watchStore.edit { p ->
+            val favRaw = p[KEY_FAV]
+            val hisRaw = p[KEY_HIS]
+            val favs = favRaw?.takeIf { it.isNotBlank() }?.let { decodeIt<Favorite>(it) }
+            val his = hisRaw?.takeIf { it.isNotBlank() }?.let { decodeIt<HistoryEntry>(it) }
+            val favBad = !favRaw.isNullOrBlank() && favs == null
+            val hisBad = !hisRaw.isNullOrBlank() && his == null
+            _unreadable.value = favBad || hisBad
+            if (favBad) p[KEY_FAV_BAK] = favRaw.orEmpty()
+            if (hisBad) p[KEY_HIS_BAK] = hisRaw.orEmpty()
+
+            val nextFavs = (_favorites.value + (favs ?: emptyList())).distinctBy { it.key }
+            val nextHis = (_history.value + (his ?: emptyList()))
+                .distinctBy { it.key }
+                .sortedByDescending { it.updatedAt }
+                .take(MAX_HISTORY)
+            _favorites.value = nextFavs
+            _history.value = nextHis
+            if (!favBad) p[KEY_FAV] = json.encodeToString(nextFavs)
+            if (!hisBad) p[KEY_HIS] = json.encodeToString(nextHis)
+        }
     }
 
-    private inline fun <reified T> String?.decode(): List<T> =
-        if (isNullOrBlank()) emptyList()
-        else runCatching { json.decodeFromString<List<T>>(this) }.getOrNull() ?: emptyList()
+    private inline fun <reified T> decodeIt(raw: String): List<T>? =
+        runCatching { json.decodeFromString<List<T>>(raw) }.getOrNull()
+
+    private inline fun <reified T> readable(raw: String): Boolean = decodeIt<T>(raw) != null
 
     private companion object {
         const val MAX_HISTORY = 100

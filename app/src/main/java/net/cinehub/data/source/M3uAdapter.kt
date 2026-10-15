@@ -19,11 +19,18 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
     @Volatile
     private var cache: List<Media>? = null
 
+    @Volatile
+    private var cachedAt = 0L
+
     private suspend fun load(): List<Media> {
-        cache?.let { return it }
+        // 缓存要有期限。原来一旦拉成功就永久有效（这个适配器随进程活着）：
+        // 列表里撤了一部片，界面上它照样挂着「可播」，点进去 404 —— 用户会以为是影枢坏了。
+        // 一份公共测试列表隔半小时重新看一次，代价是一次 GET，比留着一屏过期条目便宜。
+        cache?.let { if (System.currentTimeMillis() - cachedAt < TTL_MS) return it }
         val text = Http.get(config.baseUrl, referer = null, timeoutSec = 40)
         val list = parse(text).takeIf { it.any { m -> m.id.startsWith("http") } }
             ?: singleStream()
+        cachedAt = System.currentTimeMillis()
         return list.also { cache = it }
     }
 
@@ -56,9 +63,11 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
 
     override suspend fun search(keyword: String, page: Int): List<Media> {
         val k = keyword.lowercase()
-        val hit = load().filter {
-            it.title.lowercase().contains(k) || config.name.lowercase().contains(k)
-        }
+        // 原来还加了一条 `config.name.contains(k)`：那是拿**源的名字**当片名匹配 ——
+        // 搜「演示」会把这份列表里的每一条都算命中（因为源叫「演示源」），
+        // 搜任何一个撞上源名的词都会冒出整列表。单直链那种源的条目标题本来就是源名，
+        // 上面那半句已经覆盖它了，不需要这条。
+        val hit = load().filter { it.title.lowercase().contains(k) }
         val per = 60
         return hit.drop((page - 1) * per).take(per)
     }
@@ -114,5 +123,10 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
             }
         }
         return out
+    }
+
+    private companion object {
+        /** 列表缓存的有效期。见 [load]。 */
+        const val TTL_MS = 30 * 60_000L
     }
 }

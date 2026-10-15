@@ -33,15 +33,24 @@ class MediaRepository(private val sources: SourceRepository) {
     private val healthAt = ConcurrentHashMap<String, Long>()
 
     /**
-     * Down 只算「这一刻没探通」，过一分钟就自动重试。
+     * 健康度多久算过期。
      *
+     * 原来只有 `Down` 会过期（一分钟）—— 意思是「一次都没探通」会自己重试，
+     * 而「上周三它还挺快」这条结论永远作数。屏幕上一个源挂着 12ms 绿点，
+     * 实际那个站三天前就换了 CDN，用户照着这个绿点去缓存，等来的是一整夜的失败。
+     * 探测本来就是易碎的瞬时事实，和 Down 一样得让它自己褪色。
+     *
+     * 顺带一句：`Down` 只算「这一刻根路径没答话」，过一分钟就自动重试。
      * 探的是站点根路径，跟真正取内容的接口不是一回事：根路径抖一下就把源判死，
-     * 用户看到的就成了「搜索没结果」「某几个源凭空消失」。
+     * 用户看到的就成了「搜索没结果」「某几个源凭空消失」—— 所以外面一律拿它当参考、
+     * 不当闸门（见 [search]）。
      */
     suspend fun healthOf(cfg: SourceConfig, force: Boolean = false): HealthReport {
         val cached = healthCache[cfg.id]
-        val expired = cached != null && cached.health == Health.Down &&
-            System.currentTimeMillis() - (healthAt[cfg.id] ?: 0L) > DOWN_RETRY_MS
+        val at = healthAt[cfg.id] ?: 0L
+        val age = System.currentTimeMillis() - at
+        val expired = cached != null &&
+            (if (cached.health == Health.Down) age > DOWN_RETRY_MS else age > HEALTH_TTL_MS)
         if (!force && cached != null && !expired) return cached
         val report = check(cfg)
         healthCache[cfg.id] = report
@@ -68,8 +77,19 @@ class MediaRepository(private val sources: SourceRepository) {
         }.map { it.await() }.toMap()
     }
 
-    /** 跨源搜索并归并。 */
-    suspend fun search(keyword: String): SearchOutcome = coroutineScope {
+    /**
+     * 跨源搜索并归并。
+     *
+     * 整趟套在 IO 上：`async { }` 继承的是调用方的调度器，而调用方是 viewModelScope ——
+     * 主线程。取正文那几步 Http 自己会切到 IO，可**解析**是留在调用线程上做的，
+     * Jsoup 把几个站的 HTML 捋一遍就是几十毫秒起步，源越多越久。表现就是搜索时整屏卡住、
+     * 点什么都没反应，最后 Android 甩一个「应用没有响应」把它自己杀掉。
+     */
+    suspend fun search(keyword: String): SearchOutcome = withContext(Dispatchers.IO) {
+        searchOnIo(keyword)
+    }
+
+    private suspend fun searchOnIo(keyword: String): SearchOutcome = coroutineScope {
         val active = sources.active()
         // 用户拖出来的那个顺序，排序时要用（SourceAvailability 上不带优先级，所以单独传一份）
         val priority = active.withIndex().associate { (i, cfg) -> cfg.id to (i + 1) }
@@ -151,14 +171,16 @@ class MediaRepository(private val sources: SourceRepository) {
      * 现在按优先级依次试，至少把命中的那一个铺满，并把它是谁带回去
      * ——「均来自〈源名〉」这句话得有依据。
      */
-    suspend fun homeWithSource(): HomeFeed = coroutineScope {
-        val active = sources.active()
-        for (cfg in active) {
-            // 同样不按健康度跳过：探根路径失败的源照样可能给出内容，取不到自然会落到下一个
-            val list = quietly { SourceAdapters.create(cfg).browse(1) }.getOrNull().orEmpty()
-            if (list.isNotEmpty()) return@coroutineScope HomeFeed(list, cfg.id)
+    suspend fun homeWithSource(): HomeFeed = withContext(Dispatchers.IO) {
+        coroutineScope {
+            val active = sources.active()
+            for (cfg in active) {
+                // 同样不按健康度跳过：探根路径失败的源照样可能给出内容，取不到自然会落到下一个
+                val list = quietly { SourceAdapters.create(cfg).browse(1) }.getOrNull().orEmpty()
+                if (list.isNotEmpty()) return@coroutineScope HomeFeed(list, cfg.id)
+            }
+            HomeFeed(emptyList(), "")
         }
-        HomeFeed(emptyList(), "")
     }
 
     suspend fun detail(cfg: SourceConfig, id: String): MediaDetail =
@@ -202,7 +224,9 @@ class MediaRepository(private val sources: SourceRepository) {
      * 原标题一条都对不上时，会换写法再试（见 [findInSource]）—— 片名里的空格和季号写法
      * 是「明明有却说没有」最常见的两个来源。
      */
-    suspend fun siblingsOf(media: Media): Siblings = coroutineScope {
+    suspend fun siblingsOf(media: Media): Siblings = withContext(Dispatchers.IO) { siblingsOnIo(media) }
+
+    private suspend fun siblingsOnIo(media: Media): Siblings = coroutineScope {
         val want = titleFingerprint(media.title)
         val year = media.key.substringAfter('|', "").takeIf { it.isNotBlank() }
         val active = sources.active()
@@ -286,5 +310,8 @@ class MediaRepository(private val sources: SourceRepository) {
 
     private companion object {
         const val DOWN_RETRY_MS = 60_000L
+
+        /** 一次都没探通之外，「探通过」这条结论也一样会过期。见 [healthOf]。 */
+        const val HEALTH_TTL_MS = 10 * 60_000L
     }
 }

@@ -52,6 +52,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import net.cinehub.data.model.Health
 import net.cinehub.data.model.HistoryEntry
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.SourceConfig
@@ -179,7 +180,11 @@ fun HomeScreen(
                         .padding(Sp.s4),
                 ) {
                     Column {
-                        Text("没有可用的播放源", color = T.Err, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
+                        // 这句不能写「没有可用的播放源」。这一屏真正知道的是「源没给内容」，
+                        // 而源给不出内容有一百种原因（改版、地区、超时、列表本来就空），
+                        // 其中只有一种是「源本身不在了」。定性错了，用户就会去删源、重加源，
+                        // 而问题根本不在那儿。
+                        Text("没有取回任何内容", color = T.Err, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
                         Spacer4()
                         Text(error!!, color = T.TextDim, fontSize = Fs.xs)
                         Spacer12()
@@ -524,7 +529,17 @@ private fun HeroCard(
                     Spacer4()
                 }
                 Text(
-                    "$sourceName · 已就绪",
+                    // 「已就绪」得是探测说过的话。原来这四个字是写死的：
+                    // 一个刚测出连不通的源，角标上照样写着它已就绪 —— 那是拿徽标替源作保。
+                    listOfNotNull(
+                        sourceName,
+                        when (sourceHealth) {
+                            Health.Ok -> "· 能连上"
+                            Health.Slow -> "· 连上但慢"
+                            Health.Down -> "· 连不通"
+                            Health.Unknown, null -> "· 还没测过"
+                        }
+                    ).joinToString(" "),
                     color = T.Src500,
                     fontSize = Fs.xxs,
                     fontWeight = FontWeight.SemiBold,

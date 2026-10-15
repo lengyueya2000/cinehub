@@ -45,18 +45,36 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
 
     override suspend fun browse(page: Int): List<Media> {
         val path = rules.browsePath.ifBlank { rules.listPath }
-        return parseList(fetch(path, page))
+        val list = parseList(fetch(path, page))
+        // 列表页一条都读不出来，几乎不可能是「这个源今天没有片子」，而是那条选择器
+        // 已经追不上它的模板了。这一句得报出来：静默返回空列表的话，首页会把「改版」
+        // 显示成「这个源没有内容」，用户就会去删源、换源，而该改的其实是规则。
+        if (list.isEmpty()) error(
+            "这个源的列表页一个条目都没读出（选择器「${rules.itemSelector}」在这页上没命中）—— " +
+                "多半是它改版了，不是它没有内容",
+        )
+        return list
     }
 
     override suspend fun search(keyword: String, page: Int): List<Media> {
         val path = rules.listPath
-            .replace("{q}", java.net.URLEncoder.encode(keyword, "UTF-8"))
+            .replace("{q}", pathEncode(keyword))
             .replace("{page}", "$page")
         return parseList(fetch(path, page))
     }
 
+    /**
+     * 填进地址里的片段要按**路径**编码。
+     *
+     * `URLEncoder` 是表单编码：空格编成 `+`。放在查询串里没错，放在路径段里
+     * 站点会把 `+` 当成一个加号字符 —— 带空格的片名（豆瓣那种「绝望写手 第五季」）
+     * 于是搜的是一条根本不存在的字符串，结果就是那句假的「源里搜不到」。
+     */
+    private fun pathEncode(s: String): String =
+        java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
+
     override suspend fun detail(id: String): MediaDetail {
-        val url = abs(rules.detailPath.replace("{id}", id))
+        val url = abs(rules.detailPath.replace("{id}", pathEncode(id)))
         val doc = Jsoup.parse(
             Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config)),
             url,
@@ -179,14 +197,45 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
      * 苹果 CMS 模板把播放地址写在页面的 `player_aaaa` 里。
      *
      * 这是页面自身的公开数据，不是绕过登录；站点若把它藏起来，这里就拿不到。
+     *
+     * 原来用一条 `(\{.*?\})\s*[;<]` 加 DOT_MATCHES_ALL 去抓那段 JSON —— 这是会把
+     * 一个页面变成一场等待的写法：`\s*[;<]` 只要往后出现一次「不像结尾」的片段，
+     * 引擎就要把花括号里的每一个位置重数一遍，页面一大（模板里几十个 script 很常见）
+     * 就是指数级回溯，界面表现为「详情页转圈转到天荒地老」。
+     * 改成从 `player_xxx =` 这个锚点起做一次配对括号扫描：只看它自己那一段，一遍走完。
      */
     private fun macPlayerUrl(html: String): String? {
-        val raw = Regex("""player_[a-zA-Z0-9]+\s*=\s*(\{.*?\})\s*[;<]""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-            ?: return null
+        val raw = extractPlayerJson(html) ?: return null
         val obj = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull() ?: return null
         val url = (obj["url"] as? JsonPrimitive)?.content?.trim().orEmpty()
         return url.takeIf { it.startsWith("http") }
+    }
+
+    /** 从 `player_<名字> = { … }` 里按配对括号切出那段对象。 */
+    private fun extractPlayerJson(html: String): String? {
+        val anchor = Regex("""player_[A-Za-z0-9_]+\s*=\s*\{""").find(html) ?: return null
+        val open = html.indexOf('{', anchor.range.first)
+        if (open < 0) return null
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in open until html.length) {
+            val c = html[i]
+            when {
+                inString && escaped -> escaped = false
+                inString && c == '\\' -> escaped = true
+                inString && c == '"' -> inString = false
+                !inString && c == '"' -> inString = true
+                !inString && c == '{' -> depth++
+                !inString && c == '}' -> {
+                    depth--
+                    if (depth == 0) return html.substring(open, i + 1)
+                }
+            }
+            // 一坨超过 256 KB 的「脚本」不是站点给播放地址的那份数据，别陪着它耗内存
+            if (i - open > 256_000) return null
+        }
+        return null
     }
 
     /**

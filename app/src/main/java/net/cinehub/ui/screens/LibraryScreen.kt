@@ -67,6 +67,7 @@ import net.cinehub.ui.components.Spacer12
 import net.cinehub.ui.components.SectionLabel
 import net.cinehub.ui.components.SubHeader
 import net.cinehub.ui.components.TextAction
+import net.cinehub.ui.components.UnreadableNotice
 import net.cinehub.ui.theme.T
 
 /**
@@ -283,6 +284,7 @@ fun DownloadsScreen(vm: AppViewModel) {
     val tasks by vm.downloads.collectAsState()
     val space by vm.downloadSpace.collectAsState()
     val speeds by vm.downloadSpeed.collectAsState()
+    val tasksUnreadable by vm.downloadsUnreadable.collectAsState()
     // 删一条 = 连文件一起没，重下要重新解析直链 —— 这一刀得先问一句
     var pendingDelete by remember { mutableStateOf<DownloadTask?>(null) }
     var confirmClean by remember { mutableStateOf(false) }
@@ -309,6 +311,8 @@ fun DownloadsScreen(vm: AppViewModel) {
                 null
             },
         )
+
+        if (tasksUnreadable) UnreadableNotice("缓存任务清单")
 
         if (tasks.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

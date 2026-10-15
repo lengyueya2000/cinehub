@@ -95,9 +95,19 @@ class DownloadRepository(
 
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY = stringPreferencesKey("downloads_v1")
+    /** 盘上那份有内容但这一版解不通时的去处，见 [load] 与 [saveNow]。 */
+    private val KEY_BAK = stringPreferencesKey("downloads_v1_unreadable")
     private val KEY_SEG_PARALLEL = intPreferencesKey("seg_parallel")
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
+
+    /**
+     * 落盘那份读不通了。和 [SourceRepository.unreadable] 同一件事：
+     * 不能和「还没有过任务」混为一谈，否则界面上是一句「还没有缓存任何内容」，
+     * 而真相是版本对不上，且用户下一次操作会把那份原文彻底冲掉。
+     */
+    private val _unreadable = MutableStateFlow(false)
+    val unreadable: StateFlow<Boolean> = _unreadable.asStateFlow()
 
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
@@ -143,7 +153,9 @@ class DownloadRepository(
 
     init {
         scope.launch {
-            load()
+            // 只有真的读通了盘才敢清孤儿目录：读盘失败时 _tasks 是空的，
+            // 照着「没有任务」去清就等于把所有缓存文件全删了。
+            if (load().isSuccess) pruneOrphans()
             refreshSpace()
         }
     }
@@ -158,8 +170,37 @@ class DownloadRepository(
     /** 已占用的字节数。只在 [refreshSpace] 的协程里数，别拿到组合里直接调。 */
     private fun spaceUsed(): Long = root.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
 
+    /**
+     * 数一次目录。
+     *
+     * 数失败时**保留上一个数**，别写 0：`File.walk` 会在存储暂时读不了的时候抛，
+     * 而下载页顶部那句「共 x MB」跟着变成「共 0 B」—— 那是在告诉用户他的缓存全没了。
+     * 上一个数顶多旧，不会假。
+     */
+    /**
+     * 删掉没有任务认领的目录。
+     *
+     * 每条缓存的目录名就是任务 id，两者一对多丢在任何一步都可能发生：删除那一下
+     * 进程被杀、清理撞上写了一半的目录、老版本留下的结构。留着它们，顶部那句
+     * 「共 x MB」就一直比用户看得到的任务多，而多出来的那些字节既播不了也删不掉 ——
+     * 界面上没有它们的入口。
+     *
+     * 只认已经在册的 id，其余整个目录删掉。跑之前等一次 `pump` 之外的一切写入：
+     * 正在下的那一笔一定在册，所以不会被误删。
+     */
+    private suspend fun pruneOrphans() {
+        val live = _tasks.value.map { it.id }.toSet()
+        val rootDir = root
+        val dirs = withContext(Dispatchers.IO) {
+            runCatching { rootDir.listFiles()?.filter { it.isDirectory } ?: emptyList() }.getOrNull()
+        } ?: return
+        withContext(Dispatchers.IO) {
+            dirs.filterNot { it.name in live }.forEach { runCatching { it.deleteRecursively() } }
+        }
+    }
+
     private fun refreshSpace() {
-        scope.launch { _space.value = runCatching { spaceUsed() }.getOrDefault(0L) }
+        scope.launch { runCatching { spaceUsed() }.onSuccess { _space.value = it } }
     }
 
     suspend fun enqueue(cfg: SourceConfig, m: Media, ep: Episode) {
@@ -185,6 +226,15 @@ class DownloadRepository(
         // 重下同一集（上一次是 Failed/Paused）时要把「用户按过暂停」这个名字摘掉，
         // 否则这一笔真失败了会被当成用户暂停，界面上一个原因都不写。
         pausedByUser -= id
+        // 上一次那一笔可能只是「状态已经写成失败/暂停，协程还没退干净」——分片 worker
+        // 每片之间才查一次活性，手上一片正在写。不等它停就换任务，它会把已经删掉的
+        // 分片重新写回这个目录，而新那笔按「盘上没有」从零开始，两边磨同一个 .part。
+        val stale = synchronized(queueLock) {
+            cancelCalls(id)
+            jobs.remove(id)
+        }
+        stale?.job?.cancel()
+        stale?.job?.join()
         _tasks.update { list -> list.filterNot { it.id == id } + task }
         saveNow()
         pump()
@@ -410,7 +460,49 @@ class DownloadRepository(
      * 重试进来会重新读那个偏移，所以断了再试不会白下已经落盘的那部分。
      */
     private suspend fun downloadSingle(id: String, dir: File, url: String, cfg: SourceConfig) {
+        bindStream(id, dir, "file:" + streamIdentity(url))
         withRetry("视频") { downloadSingleOnce(id, dir, url, cfg) }
+    }
+
+    /**
+     * 地址的主机 + 路径，丢掉查询串和片段。
+     *
+     * 这就是「同一条流」的判据：时效签名、随机 token 都在查询串里，每次解析都换；
+     * 而 CDN 主机或路径变了，意味着站点把你挪到了另一份编码上。
+     */
+    private fun streamIdentity(url: String): String {
+        val u = url.substringBefore('#').substringBefore('?')
+        val host = u.substringAfter("://").substringBefore('/', "")
+        return host + u.substringAfter("://", u).substringAfter('/', "")
+    }
+
+    /**
+     * 把这一笔绑到它此刻正在下的那条流上，流变了就作废已经落盘的那些。
+     *
+     * 续传必须重新解析直链（时效 + Referer），可重新解析也意味着重新分配：站点完全可能
+     * 把你从 A 变体挪到 B。而分片名是按下标算的（`seg_00007.ts`），两条流的下标长得一模一样，
+     * 「文件在而且非空就跳过」于是把 A 的分片喂给 B 的列表 —— 存出来一份进度 100%、
+     * 标着可离线播放、点开画面花的文件。分片数一起进判据：同一路径重切了刀也是换了内容。
+     *
+     * 旧记录的 streamKey 是 null（这一版之前存的），一律当「来路不明」清一次 ——
+     * 只在第一次续传时多下一遍，之后就有了身份。
+     *
+     * 流变了不做声张：界面上看到的是进度回到 0 然后重新开始，那正是发生的事。
+     */
+    private fun bindStream(id: String, dir: File, ident: String) {
+        val t = taskOf(id) ?: return
+        if (t.streamKey == ident) return
+        runCatching { dir.listFiles()?.forEach { it.deleteRecursively() } }
+        patch(id, persist = true) {
+            it.copy(
+                streamKey = ident,
+                segmentsDone = 0,
+                segmentsTotal = 0,
+                bytesDone = 0L,
+                bytesTotal = 0L,
+                fileName = null,
+            )
+        }
     }
 
     private suspend fun downloadSingleOnce(id: String, dir: File, url: String, cfg: SourceConfig) {
@@ -463,6 +555,13 @@ class DownloadRepository(
                     if (total > 0 && done < total) throw Transient(
                         "下到 ${done * 100 / total}% 时连接断了 —— 已经落盘的部分还在，点继续接着来。",
                     )
+                    // 对方压根没给 Content-Length：那上面那条判据就是一条都不成立，
+                    // 「读到 EOF」在这时候不等于「下完了」—— 有些站就是靠断开连接收尾，
+                    // 半截断开和正常结束在客户端看来一模一样。所以要问一句：
+                    // 从这一字节起还有没有内容。有就交给外层重试接着下，别急着 promote。
+                    if (total == 0L && done > 0L && tailWaiting(id, url, cfg, done)) throw Transient(
+                        "对方没给文件总长度，按字节续到 ${fmtSize(done)} 时后面还有内容 —— 接着下。",
+                    )
                     val d = done
                     reportBytes(id, d)
                     promote(out, target)
@@ -481,6 +580,31 @@ class DownloadRepository(
         }
     }
 
+    /**
+     * 已经存到 [haveAt] 之后还有没有内容 —— 只在对方不给 Content-Length 时用。
+     *
+     * 只认 206：它明确回答「这些字节我还有」。416 是「你要的起点已经越过结尾」，也就是完了；
+     * 200 说明对方不理 Range，那这次探测给不出任何结论，宁可可疑地收下，
+     * 也不能因为「问不出答案」就把一整集重下一遍 —— 那个循环用户等不起。
+     */
+    private suspend fun tailWaiting(id: String, url: String, cfg: SourceConfig, haveAt: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            ensureActive()
+            val call = newCall(id, url, cfg, rangeFrom = haveAt)
+            try {
+                call.await().use { r ->
+                    if (r.code != 206) return@use false
+                    val left = r.body?.contentLength() ?: -1L
+                    left > 0L
+                }
+            } catch (e: Exception) {
+                // 探不出结论就当没有：探测失败不该把一集已经落盘的视频判成没下完
+                false
+            } finally {
+                untrackCall(id, call)
+            }
+        }
+
     /** 把写完了的 .part 换成正式文件名。 */
     private fun promote(part: File, into: File) {
         if (into.exists() && !into.delete()) error("${into.name} 删不掉，这一条缓存没法收尾")
@@ -498,14 +622,12 @@ class DownloadRepository(
         // （实测 mux 的测试流：变体在 url_8/，分片又在 url_8/url_590/），
         // 用主列表的地址去拼就会 404 —— 播放器自己能播、这里缓存不了，就是这么来的。
         var listUrl = url
-        // 分片用的是 newCall（带源站给的鉴权头），列表这两次拉取也得带上，
-        // 否则要登录的源会在这里 401/403 —— 在线能播、缓存却起不来。
-        val auth = Http.authHeaders(cfg)
-        var playlist = Http.get(url, referer(cfg), auth)
+        // 列表和密钥都不走 [Http.get]：那条路上发的请求不在这一笔的册子上，暂停管不住
+        var playlist = fetchText(id, url, cfg)
         if (playlist.contains("#EXT-X-STREAM-INF")) {
             val best = bestVariant(playlist, url) ?: error("这份 m3u8 里只有主列表，没有可下载的分片")
             listUrl = best
-            playlist = Http.get(best, referer(cfg), auth)
+            playlist = fetchText(id, best, cfg)
         }
         // 加密流：站点把密钥连同列表一起发给它自己的播放器，取钥解密就是标准 HLS 客户端
         // 要做的那一步，影枢照做。但它只用自己的会话去取 —— 站点不给的密钥不去换、不猜。
@@ -521,6 +643,9 @@ class DownloadRepository(
 
         val segs = parseSegments(playlist, listUrl)
         if (segs.isEmpty()) error("这份 m3u8 里没有分片")
+        // 到这儿才知道这次解析真正落到哪条流上。和上一次存的不是同一条，就把目录清空：
+        // 分片名按下标算，两条流的下标完全对得上，留着旧分片等于把它们塞进新列表。
+        bindStream(id, dir, "hls:" + streamIdentity(listUrl) + "#" + segs.size)
         val init = initMap(playlist, listUrl)
 
         // (密钥字节, IV)。同一条流通常全程一把。并发之后多个 worker 会同时来要，
@@ -529,7 +654,7 @@ class DownloadRepository(
         // 不用 computeIfAbsent：那个 lambda 不是 suspend 的，取密钥这一步放进去就编不过。
         // 两个 worker 同时撞上同一把密钥时最多重复取一次，比加锁简单、也无害。
         suspend fun keyOf(c: Crypt?): Pair<ByteArray, ByteArray>? = c?.let { cr ->
-            val k = keys[cr.uri] ?: fetchKey(cr.uri, cfg, auth).also { keys.putIfAbsent(cr.uri, it) }
+            val k = keys[cr.uri] ?: fetchKey(id, cr.uri, cfg).also { keys.putIfAbsent(cr.uri, it) }
             k to cr.iv
         }
 
@@ -667,7 +792,7 @@ class DownloadRepository(
                     if (e is Transient) error(e.message ?: "$label 取不到")
                     throw e
                 }
-                delay(RETRY_BACKOFF_MS[attempt - 1])
+                delay(RETRY_BACKOFF_MS.getOrElse(attempt - 1) { RETRY_BACKOFF_MS.last() })
             }
         }
     }
@@ -707,6 +832,47 @@ class DownloadRepository(
             }
         }
     }
+
+    /**
+     * 取一份播放列表正文。
+     *
+     * 不走 [Http.get]：那条路上发的请求不在这笔任务的册子上，暂停管不住；
+     * 而且它把正文整个 `string()` 进内存 —— 有人把一个 m3u 源指到 `.mp4` 上时，
+     * 这里会照着几百 MB 往下读。列表本来就是给播放器看的索引，超过
+     * [MAX_PLAYLIST_BYTES] 就不是列表，直接判「这地址不对」，不猜也不截断着解析。
+     */
+    private suspend fun fetchText(id: String, url: String, cfg: SourceConfig): String =
+        withRetry("播放列表") {
+            withContext(Dispatchers.IO) {
+                ensureActive()
+                val call = newCall(id, url, cfg, rangeFrom = null)
+                try {
+                    call.await().use { r ->
+                        if (!r.isSuccessful) {
+                            val why = Http.failureReason(r.code, Http.errorSnippet(r))
+                            if (r.code in 500..599 || r.code == 429) throw Transient(why)
+                            error(why)
+                        }
+                        val body = r.body ?: error("空响应")
+                        val stream = body.byteStream()
+                        val out = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(16 * 1024)
+                        var total = 0L
+                        while (true) {
+                            ensureActive()
+                            val n = stream.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            total += n
+                            if (total > MAX_PLAYLIST_BYTES)
+                                error("这个地址回的内容超过 ${(MAX_PLAYLIST_BYTES / 1024)} KB，不像一份播放列表 —— 换一条线路")
+                        }
+                        out.toString("UTF-8")                    }
+                } finally {
+                    untrackCall(id, call)
+                }
+            }
+        }
 
     private fun newCall(id: String, url: String, cfg: SourceConfig, rangeFrom: Long?): okhttp3.Call {
         val b = Request.Builder()
@@ -844,24 +1010,31 @@ class DownloadRepository(
         return iv
     }
 
-    private suspend fun fetchKey(uri: String, cfg: SourceConfig, auth: Map<String, String>): ByteArray =
+    private suspend fun fetchKey(id: String, uri: String, cfg: SourceConfig): ByteArray =
         withRetry("密钥") {
             withContext(Dispatchers.IO) {
-                val call = Request.Builder().url(uri)
-                    .header("User-Agent", Http.UA)
-                    .header("Referer", referer(cfg))
-                    .apply { auth.forEach { (k, v) -> header(k, v) } }
-                    .build()
-                Http.client.newCall(call).await().use { r ->
-                    if (!r.isSuccessful) {
-                        val why = Http.failureReason(r.code, Http.errorSnippet(r)) +
-                            " —— 站点不给这把密钥，这一条缓存不了"
-                        if (r.code in 500..599 || r.code == 429) throw Transient(why)
-                        error(why)
+                // 同样走 newCall：取密钥也是一次能拖十几秒的网络往返，
+                // 用户按暂停时它得跟着停，不然这一笔摘走了还在往外要东西。
+                val call = newCall(id, uri, cfg, rangeFrom = null)
+                try {
+                    call.await().use { r ->
+                        if (!r.isSuccessful) {
+                            val why = Http.failureReason(r.code, Http.errorSnippet(r)) +
+                                " —— 站点不给这把密钥，这一条缓存不了"
+                            if (r.code in 500..599 || r.code == 429) throw Transient(why)
+                            error(why)
+                        }
+                        val body = r.body ?: error("空响应")
+                        // 密钥就 16 字节。站点回一整页 HTML 时（多半是被拦下了）
+                        // 不能跟着把整页读进内存 —— 那既是假成功也是内存炸点。
+                        val declared = body.contentLength()
+                        if (declared > 64) error("站点给的密钥不是 16 字节（$declared 字节），解不了")
+                        val b = body.bytes()
+                        if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
+                        b
                     }
-                    val b = r.body?.bytes() ?: error("密钥是空的")
-                    if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
-                    b
+                } finally {
+                    untrackCall(id, call)
                 }
             }
         }
@@ -876,6 +1049,14 @@ class DownloadRepository(
             out.copyOf(out.size - pad) else out
     }
 
+    /**
+     * 挑带宽最高的一路。
+     *
+     * 并列最高时取**第一个**，不是最后一个：`>=` 会把同一份主列表里最后出现的那路挑走，
+     * 而主列表条目的顺序由站点说了算 —— 它哪天换了顺序（加一路、去掉一路、服务端排序抖一下），
+     * 下次续传解析到的就是另一条流。单看这一次无害，配上按文件名跳过的续传就会
+     * 把两条流的分片混进同一份 index.m3u8。用 `>` 之后，同一份列表永远给出同一个答案。
+     */
     private fun bestVariant(playlist: String, base: String): String? {
         val lines = playlist.lines()
         var bestBw = -1L
@@ -886,7 +1067,7 @@ class DownloadRepository(
             val bw = Regex("BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
             val uri = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.trim().startsWith("#") }
                 ?.trim() ?: continue
-            if (bw >= bestBw) { bestBw = bw; best = resolve(base, uri) }
+            if (bw > bestBw) { bestBw = bw; best = resolve(base, uri) }
         }
         return best
     }
@@ -1033,48 +1214,66 @@ class DownloadRepository(
         lastSaveAt = System.currentTimeMillis()
         scope.launch {
             runCatching {
-                context.downloadStore.edit { it[KEY] = json.encodeToString(_tasks.value) }
+                context.downloadStore.edit {
+                    // 覆盖前先验一眼盘上那份，解不通就先挪进备份键 ——
+                    // 这一版既然读不懂它，直接盖就等于把用户的任务清单删了。
+                    it[KEY]?.takeIf { raw -> raw.isNotBlank() && !tasksReadable(raw) }
+                        ?.let { raw -> it[KEY_BAK] = raw }
+                    it[KEY] = json.encodeToString(_tasks.value)
+                }
             }
         }
     }
 
-    private suspend fun load() {
-        val p = context.downloadStore.data.first()
-        _segParallel.value = (p[KEY_SEG_PARALLEL] ?: DEFAULT_SEG_PARALLEL.toLong()).toInt()
-            .coerceIn(1, MAX_SEG_PARALLEL)
-        val raw = p[KEY]
-        val stored = raw?.takeIf { it.isNotBlank() }?.let {
-            runCatching { json.decodeFromString<List<DownloadTask>>(it) }.getOrElse { emptyList() }
-        }.orEmpty()
-        // 进程被系统回收后没有协程还在跑，界面上却显示「下载中」是骗人 —— 落回已暂停。
-        //
-        // 而「已缓存」这一句更要验：记录是落盘的，文件却可能被系统清理、被手机管家、
-        // 被用户手动删掉 —— 光信记录就会留着一行点不开的「可离线播放」，
-        // 而且 enqueue 看见 Done 直接返回，用户连重下的入口都没有。
-        val fixed = stored.map {
-            when {
-                it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued ->
-                    it.copy(status = DownloadStatus.Paused)
+    /**
+     * 启动读盘。整套放在 `edit` 的变换里 —— 和 [WatchRepository.load] 同一个理由：
+     * 先 `first()` 再在内存里合，中间用户新排的那个任务会被盘上那份旧的盖掉。
+     *
+     * 变换里做的 `entryOnDisk` 只是 `exists()`/`length()` 级别的检查，任务数又被
+     * 上限管着；为了这一眼把合并挪回事务外面，代价是丢用户的任务，不值。
+     */
+    private suspend fun load() = runCatching {
+        context.downloadStore.edit { p ->
+            _segParallel.value = (p[KEY_SEG_PARALLEL] ?: DEFAULT_SEG_PARALLEL.toLong()).toInt()
+                .coerceIn(1, MAX_SEG_PARALLEL)
+            val raw = p[KEY]
+            val decoded = raw?.takeIf { it.isNotBlank() }?.let { tasksOf(it) }
+            val unreadable = !raw.isNullOrBlank() && decoded == null
+            _unreadable.value = unreadable
+            if (unreadable) p[KEY_BAK] = raw.orEmpty()
+            val stored = decoded ?: emptyList()
+            // 进程被系统回收后没有协程还在跑，界面上却显示「下载中」是骗人 —— 落回已暂停。
+            //
+            // 而「已缓存」这一句更要验：记录是落盘的，文件却可能被系统清理、被手机管家、
+            // 被用户手动删掉 —— 光信记录就会留着一行点不开的「可离线播放」，
+            // 而且 enqueue 看见 Done 直接返回，用户连重下的入口都没有。
+            val fixed = stored.map {
+                when {
+                    it.status == DownloadStatus.Running || it.status == DownloadStatus.Queued ->
+                        it.copy(status = DownloadStatus.Paused)
 
-                it.status == DownloadStatus.Done && !entryOnDisk(it) -> it.copy(
-                    status = DownloadStatus.Paused,
-                    segmentsDone = 0,
-                    bytesDone = 0L,
-                    error = "缓存文件已经不在了（多半被系统或清理软件删掉了）—— 点继续会重新缓存这一集。",
-                )
+                    it.status == DownloadStatus.Done && !entryOnDisk(it) -> it.copy(
+                        status = DownloadStatus.Paused,
+                        segmentsDone = 0,
+                        bytesDone = 0L,
+                        error = "缓存文件已经不在了（多半被系统或清理软件删掉了）—— 点继续会重新缓存这一集。",
+                    )
 
-                else -> it
+                    else -> it
+                }
             }
-        }
-        // 落盘读回来之前用户可能已经排了一个任务：整份覆盖会把那一笔吞掉，
-        // 之后任何一次保存再把「没有它」的状态写回磁盘。所以合并，内存里的优先。
-        val merged = (_tasks.value + fixed).distinctBy { it.id }
-        _tasks.value = merged
-        if (merged != stored) {
-            lastSaveAt = System.currentTimeMillis()
-            context.downloadStore.edit { it[KEY] = json.encodeToString(merged) }
+            // 落盘读回来之前用户可能已经排了一个任务：整份覆盖会把那一笔吞掉，
+            // 之后任何一次保存再把「没有它」的状态写回磁盘。所以合并，内存里的优先。
+            val merged = (_tasks.value + fixed).distinctBy { it.id }
+            _tasks.value = merged
+            if (!unreadable && merged != stored) p[KEY] = json.encodeToString(merged)
         }
     }
+
+    private fun tasksOf(raw: String): List<DownloadTask>? =
+        runCatching { json.decodeFromString<List<DownloadTask>>(raw) }.getOrNull()
+
+    private fun tasksReadable(raw: String): Boolean = tasksOf(raw) != null
 
     /**
      * 改「单集内同时下几个分片」。
@@ -1110,6 +1309,9 @@ class DownloadRepository(
          */
         const val SEG_ATTEMPTS = 3
         val RETRY_BACKOFF_MS = longArrayOf(400L, 1_200L)
+
+        /** 一份播放列表最多读多少。超过就不当它是列表 —— 见 [fetchText]。 */
+        const val MAX_PLAYLIST_BYTES = 2_000_000L
 
         /** 长下载过程中刷新「共 x MB」的最小间隔：那是一次整树遍历。 */
         const val SPACE_REFRESH_MS = 15_000L

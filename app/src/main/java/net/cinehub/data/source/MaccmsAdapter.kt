@@ -48,7 +48,9 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     override suspend fun detail(id: String): MediaDetail {
-        val url = abs(rules.detailPath.replace("{id}", id))
+        // id 是从列表页/别的源手里接过来的字符串，原样拼进查询串就等于让它替我们决定
+        // 这次请求长什么样（带一个 `&` 就能多出个参数）。填之前编一次。
+        val url = abs(rules.detailPath.replace("{id}", java.net.URLEncoder.encode(id, "UTF-8")))
         val root = json.parseToJsonElement(Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config))).jsonObject
         val item = firstListItem(root) ?: error("详情接口无数据")
 
@@ -115,11 +117,28 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
         return null
     }
 
+    /**
+     * 把列表接口读成条目。
+     *
+     * 「这个源没有这部片」和「这一版规则读不懂这个源」是两句话，以前混成了一句：
+     * 字段找不到就返回空列表，界面照着说「没有」。可苹果 CMS 真的没搜到时给的是
+     * `{"list":[]}` —— 那个空数组是答案；而**整个 list 字段都不存在**不是答案，
+     * 是接口改了、或者这一路根本不是一个列表接口。那种情况必须报出来，
+     * 否则用户会拿着一句假话去换关键词、换源，而真正该改的是这个源的规则。
+     */
     private fun parseList(body: String): List<Media> {
-        val root = json.parseToJsonElement(body).jsonObject
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrElse {
+            error("这个源给回来的不是 JSON，接口形态多半已经改了")
+        }
         val arr = (root[rules.listField] as? JsonArray)
             ?: ((root["data"] as? JsonObject)?.get(rules.listField) as? JsonArray)
-            ?: JsonArray(emptyList())
+        if (arr == null) {
+            val msg = (root["msg"] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+            error(
+                "这个源的接口里没有「${rules.listField}」这一项，这一版规则读不动它" +
+                    (msg?.let { "（接口自己说：$it）" } ?: ""),
+            )
+        }
 
         return arr.mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null

@@ -105,7 +105,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** 播放器右侧浮层的内容。 */
-private enum class Panel { Episodes, Line, Quality, Speed }
+private enum class Panel { Episodes, Line, Quality, Speed, Source }
 
 /** 横滑划满一屏对应的跳转量。 */
 private const val SCRUB_SPAN_MS = 120_000L
@@ -290,12 +290,18 @@ fun PlayerScreen(
 
     // 起播看门狗：地址是通的，但 20 秒还不出第一帧，就当作这个源放不出来这一集。
     // 只管起播这一段 —— 播到一半卡顿和用户自己拖进度条长得一模一样，误判的代价比救回来的收益大。
-    // 还要看一眼 currentPosition：纯音频流（或画面比声音晚到位的源）压根不会回调首帧，
-    // 位置在往前走就说明它真的在播，不能换走。
+    //
+    // 判据是「还没进 READY」，不是「位置还在 0」：位置那一条会把续播和换源全排除掉 ——
+    // 从第 18 分钟续起来的这一笔，位置一上来就不是 0，看门狗于是永远不开火，
+    // 而恰恰是这类源最需要在起不来时换走。纯音频流不回首帧回调是真的，
+    // 但它会进 READY，那正是「确实播开了」的证据。
     LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
         if (playing?.streamUrl.isNullOrBlank()) return@LaunchedEffect
         delay(STARTUP_GRACE_MS)
-        if (!firstFrame && wantsPlay && errText == null && player.currentPosition <= 0L) {
+        val st = player.playbackState
+        if (!firstFrame && wantsPlay && errText == null &&
+            st != Player.STATE_READY && st != Player.STATE_ENDED
+        ) {
             vm.reportPlaybackFailure("一直缓冲，没能开播")
         }
     }
@@ -311,7 +317,11 @@ fun PlayerScreen(
             pos = msToSec(player.currentPosition)
             dur = msToSec(player.duration)
             wantsPlay = player.playWhenReady
-            vm.updatePosition(pos, dur)
+            // 只有真的进了 READY 才把位置交给仓库落盘。
+            // prepare 之前那一句 seekTo 就已经让 currentPosition 报出续播起点了 —— 
+            // 不问一句就写，等于把「这一集根本没播开」记成「看到了第 18 分钟」，
+            // 下次进来「已经看完了」的判断、继续观看的位置全是拿它算的。
+            if (player.playbackState == Player.STATE_READY) vm.updatePosition(pos, dur)
             val hs: List<Int> = runCatching {
                 player.currentTracks.groups
                     .filter { it.type == C.TRACK_TYPE_VIDEO }
@@ -893,6 +903,26 @@ fun PlayerScreen(
                             )
                         }
                     }
+                    // 竖排只摆三个，多的得有个说法、也得有个出口：
+                    // 底下明明还查到两个源，屏上却像「就这三个」，那是把列表裁掉了还不承认。
+                    if (siblings.size > 3) {
+                        Column(
+                            Modifier.width(50.dp).clip(R.md)
+                                .background(Color.Black.copy(alpha = .55f))
+                                .border(1.dp, Color.White.copy(alpha = .14f), R.md)
+                                .clickable { panel = Panel.Source }
+                                .padding(vertical = 9.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                "+${siblings.size - 3}",
+                                color = T.TextDim,
+                                fontSize = Fs.tiny,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text("换源", color = T.TextFaint, fontSize = Fs.tiny)
+                        }
+                    }
                 }
             }
 
@@ -1133,6 +1163,62 @@ fun PlayerScreen(
                                             }
                                             .padding(horizontal = 12.dp, vertical = 10.dp),
                                     )
+                                }
+                            }
+                        }
+
+                        Panel.Source -> {
+                            Text("换源", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
+                            Spacer8()
+                            Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                                if (siblings.isEmpty()) {
+                                    // 这一栏空着是有原因的：起播时手上没有跨源比对的结果
+                                    // （从首页或继续观看直接进来）。别摆一排看不见的源冒充可选。
+                                    Text(
+                                        "这一部在其它源里还没查到 —— 右侧那条竖排只有查得到的源才会出现。",
+                                        color = T.TextFaint,
+                                        fontSize = Fs.xs,
+                                        lineHeight = Fs.xs * 1.6f,
+                                    )
+                                }
+                                siblings.forEach { av ->
+                                    val on = av.sourceId == playing?.sourceId
+                                    val h = health[av.sourceId]?.health ?: av.health
+                                    Column(
+                                        Modifier.fillMaxWidth()
+                                            .clip(R.sm)
+                                            .background(
+                                                if (on) T.Play500.copy(alpha = .16f) else Color.Transparent
+                                            )
+                                            .clickable {
+                                                vm.switchPlayingSource(
+                                                    av, playing?.episodeIndex ?: 1,
+                                                )
+                                                panel = null
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            StatusDot(h)
+                                            Spacer4()
+                                            Text(
+                                                av.sourceName,
+                                                color = if (on) T.Play400 else T.Text,
+                                                fontSize = Fs.sm,
+                                            )
+                                            av.quality?.let {
+                                                Spacer4()
+                                                Text(it, color = T.TextFaint, fontSize = Fs.tiny)
+                                            }
+                                        }
+                                        Text(
+                                            av.item.title.ifBlank { "同一部片" },
+                                            color = T.TextFaint,
+                                            fontSize = Fs.tiny,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
                                 }
                             }
                         }

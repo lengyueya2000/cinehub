@@ -80,7 +80,14 @@ class SourceRepository(private val context: Context) {
             val raw = p[KEY]
             val (stored, unreadable) = decode(raw)
             val prev = stored ?: lastGood ?: Seed.sources
-            val next = f(prev.filterNot { it.id in Seed.retiredIds }).sortedBy { it.priority }
+            // 排完之后统一重编成 1..n。
+            //
+            // 属性名是 JSON 键、值是用户看到的顺序，重复的 priority 会让「谁排前面」
+            // 取决于排序算法的稳定性， restoreDefaults 补回来的内置源尤其容易和现有条目撞号。
+            // 顺手把整列压成连续整数，读写两边就都只有一种解释。
+            val next = f(prev.filterNot { it.id in Seed.retiredIds })
+                .sortedBy { it.priority }
+                .mapIndexed { i, s -> s.copy(priority = i + 1) }
             // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
             // 而不是被「看起来正常」的新列表就地替换掉。
             if (unreadable && !raw.isNullOrBlank()) p[BACKUP_KEY] = raw
@@ -100,9 +107,19 @@ class SourceRepository(private val context: Context) {
         l.map { if (it.id == id) it.copy(enabled = enabled) else it }
     }
 
+    /**
+     * 按界面上的新顺序重排。
+     *
+     * 没出现在 [ids] 里的源要留在末尾，不能顺手删掉：拖拽那一刻正好有另一笔写落了新源
+     * （补回内置源、存好一个新源），UI 手里那份顺序就已经少了它 —— 照原样「只保留传进来的」
+     * 写回去，用户加的那个源就凭空消失了，而界面上他刚刚只是在挪位置。
+     */
     suspend fun reorder(ids: List<String>) = mutate { cur ->
         val byId = cur.associateBy { it.id }
-        ids.mapIndexedNotNull { i, id -> byId[id]?.copy(priority = i + 1) }
+        val moved = ids.toSet()
+        // 新位置要写成新号：mutate 之后按 priority 排，只换列表顺序不换号等于什么都没改。
+        (ids.mapNotNull { byId[it] } + cur.filterNot { it.id in moved })
+            .mapIndexed { i, s -> s.copy(priority = i + 1) }
     }
 
     /**

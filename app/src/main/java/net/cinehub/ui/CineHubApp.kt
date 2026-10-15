@@ -88,7 +88,17 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     val playing by vm.playing.collectAsState()
     val browser by vm.browser.collectAsState()
+    val notice by vm.notice.collectAsState()
     val ctx = LocalContext.current
+
+    // 走不通的分支得说出一句话。没有这一条，那些 `?: return` 的入口就是「按下去没反应」，
+    // 而用户只能靠反复点、反复重装去猜到底哪儿出了问题。
+    LaunchedEffect(notice) {
+        notice?.let {
+            Toast.makeText(ctx, it, Toast.LENGTH_LONG).show()
+            vm.consumeNotice()
+        }
+    }
 
     fun openDetail(sourceId: String, mediaId: String) {
         vm.openDetail(sourceId, mediaId)
@@ -132,9 +142,16 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
         }
     }
 
-    // 起播时自动进播放器
-    LaunchedEffect(playing) {
-        if (playing != null && route !is Route.Player) route = Route.Player
+    // 起播时自动进播放器 —— 但只认「从没有到有了」这一次跳变。
+    //
+    // 原来盯的是 playing 这个对象本身：它每变一次（换源、拿到直链、自动换源那一轮改 note）
+    // 这里就跑一次，把人从详情页、从下载页硬拽回播放器。用户明明已经退出来了，
+    // 屏上却又弹出播放中 —— 那是把「状态有更新」当成了「用户想播放」。
+    var wasPlaying by remember { mutableStateOf(false) }
+    LaunchedEffect(playing != null) {
+        val now = playing != null
+        if (now && !wasPlaying && route !is Route.Player) route = Route.Player
+        wasPlaying = now
     }
 
     Box(
@@ -189,9 +206,14 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                     is Route.Player -> PlayerScreen(
                         vm = vm,
                         onBack = {
+                            // 和上面那条返回路径同一个规矩：先记下刚播的是哪一部再 stopPlaying，
+                            // 而且只有详情页挂着的就是这一部才回得去。从「继续观看」或下载页
+                            // 直接起播时没人打开过详情页，那时回 Detail 等于把上一部的页面
+                            // 当成这一部摆出来 —— 选集、收藏那颗心全是别的片的。
+                            val playedId = vm.playing.value?.mediaId
                             vm.stopPlaying()
                             val d = vm.detail.value
-                            route = if (d != null) {
+                            route = if (d != null && playedId != null && d.media.id == playedId) {
                                 Route.Detail(vm.activeSourceId.value ?: d.media.sourceId, d.media.id)
                             } else Route.Home
                         },

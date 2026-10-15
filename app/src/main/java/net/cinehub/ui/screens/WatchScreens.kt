@@ -58,6 +58,7 @@ import net.cinehub.ui.components.SectionLabel
 import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.components.SubHeader
+import net.cinehub.ui.components.UnreadableNotice
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
@@ -80,6 +81,7 @@ fun FavoritesScreen(
 ) {
     val favorites by vm.favorites.collectAsState()
     val history by vm.watchHistory.collectAsState()
+    val watchUnreadable by vm.watchUnreadable.collectAsState()
     var sort by remember { mutableIntStateOf(0) }
     // 取消收藏要过一道确认：收藏的片常常是找了好久才定位到某一源的，点错一下就得重来
     var pendingDrop by remember { mutableStateOf<Fav?>(null) }
@@ -92,6 +94,10 @@ fun FavoritesScreen(
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {
         SubHeader("收藏", "${favorites.size} 部", onBack)
+
+        // 「还没有收藏」和「存的那份读不通」在屏幕上长得一样，但只有一句是真话能说：
+        // 后者意味着现在这一份是空的、盘上那份还在，而这里任何一次写入都会把空的落回去。
+        if (watchUnreadable) UnreadableNotice("收藏和观看记录")
 
         if (favorites.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -242,6 +248,7 @@ fun HistoryScreen(
     onResume: (HistoryEntry) -> Unit,
 ) {
     val history by vm.watchHistory.collectAsState()
+    val watchUnreadable by vm.watchUnreadable.collectAsState()
     var pendingDelete by remember { mutableStateOf<HistoryEntry?>(null) }
     var confirmClear by remember { mutableStateOf(false) }
 
@@ -249,6 +256,8 @@ fun HistoryScreen(
         SubHeader("最近观看", "${history.size} 部 · 只存这台设备", onBack, action = {
             if (history.isNotEmpty()) HeaderAction("清空", danger = true) { confirmClear = true }
         })
+
+        if (watchUnreadable) UnreadableNotice("收藏和观看记录")
 
         if (history.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

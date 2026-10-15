@@ -83,6 +83,47 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
     private var sessionCookie: String? = config.authToken?.takeIf { it.isNotBlank() }
 
     /**
+     * 把站点新发回来的 Cookie 并进已有那一份，而不是整条替换。
+     *
+     * 原来每一次 `Set-Cookie` 都直接 `sessionCookie = 新的`：用户在源配置里填的那份凭证
+     * 是这里的初始值，站点一回话就把它冲没了 —— 他登录后填的 token 悄悄失效，
+     * 之后每一句「这个源没有这部片」都可能其实是「没带着我的凭证去问」。
+     * 按名字合并：站点刷新哪个就换哪个，用户那份它没提过的原样留着。
+     */
+    private fun mergeCookie(incoming: String) {
+        val pairs = LinkedHashMap<String, String>()
+        fun absorb(raw: String) = raw.split(';').forEach { piece ->
+            val kv = piece.trim()
+            val i = kv.indexOf('=')
+            if (i > 0) pairs[kv.substring(0, i)] = kv.substring(i + 1)
+        }
+        sessionCookie?.let(::absorb)
+        absorb(incoming)
+        sessionCookie = pairs.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
+    /**
+     * 两份线路缓存：一部片的线路名单、一集片的整包线路地址。
+     *
+     * 挂在**实例**上，不是 companion object。原来它们是进程级的：接两个同型源
+     * （两个都走这套接口的站）时，A 站那部片的线路名单会被当成 B 站同一 id 的答案直接返回 ——
+     * 站点不同、token 不同，拿回来的地址要么 404、要么放出另一家站的内容。
+     * 实例本来就按连接配置缓存在 [SourceAdapters] 里，跨调用照样复用，
+     * 但复用范围不再跨过源边界。
+     */
+    private val variantLines = LinkedHashMap<String, List<LineOpt>>()
+    private val episodeLines = LinkedHashMap<String, List<LineOpt>>()
+
+    @Synchronized
+    private fun <V> cached(map: MutableMap<String, V>, key: String): V? = map[key]
+
+    @Synchronized
+    private fun <V> remember(map: MutableMap<String, V>, key: String, value: V) {
+        map[key] = value
+        while (map.size > CACHE_MAX) map.remove(map.keys.first())
+    }
+
+    /**
      * 带签名地取一次 JSON。
      *
      * 第一次调用会先建匿名会话（站点自己的流程，等于浏览器里的未登录访客），
@@ -98,7 +139,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
             timeoutSec = 25,
         )
         return body.body.also {
-            body.setCookie?.takeIf { it.isNotBlank() }?.let { sessionCookie = it }
+            body.setCookie?.takeIf { it.isNotBlank() }?.let { mergeCookie(it) }
         }
     }
 
@@ -118,7 +159,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
             headers = headers,
             timeoutSec = 25,
         )
-        r.setCookie?.takeIf { it.isNotBlank() }?.let { sessionCookie = it }
+        r.setCookie?.takeIf { it.isNotBlank() }?.let { mergeCookie(it) }
         if (r.status !in 200..299) error(Http.failureReason(r.status, r.body))
         return r.body
     }
@@ -134,7 +175,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
                 json = """{"anonymous_id":"cinehub_${System.currentTimeMillis()}"}""",
                 headers = headers,
                 timeoutSec = 15,
-            ).setCookie?.takeIf { it.isNotBlank() }?.let { sessionCookie = it }
+            ).setCookie?.takeIf { it.isNotBlank() }?.let { mergeCookie(it) }
         }
         // 建不成会话不在这儿报错：后面的 api() 会撞上同一个原因，那时报一次就够了，
         // 而且报的是用户真正做的那一步（搜索/取线路），不是后台的准备工作。
@@ -211,7 +252,18 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 第三段为空（老下载任务、以及退回「智能选路」时建的坐标）就让 [bestLine] 自己挑一条。
      */
     private fun mark(variant: String, episodeToken: String?, lineId: String? = null): String =
-        "$MARK$variant|${episodeToken ?: ""}|${lineId ?: ""}"
+        MARK + listOf(variant, episodeToken ?: "", lineId ?: "").joinToString("|") { escField(it) }
+
+    /**
+     * 坐标里每一段都要转义。
+     *
+     * 这三段是拿 `|` 分的，而站点给的 variant / token 是它自己的字符串，没人保证里面没有 `|`：
+     * 有的话读回来就切成四段，第三段被当成「点名的线路」，于是这一集拿到的是**另一条线路**
+     * 的地址 —— 播得开，但放的不是用户点的那一条。`%` 也要转义，不然读的那一侧会解错。
+     */
+    private fun escField(s: String) = s.replace("%", "%25").replace("|", "%7C")
+
+    private fun unescField(s: String) = s.replace("%7C", "|").replace("%25", "%")
 
     /** 分集列表：`/v1/catalog/{variant}/episodes`。这一条不花额度。 */
     private suspend fun episodeIdsOf(variant: String): List<Triple<Int, String, String>> {
@@ -247,11 +299,15 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
         if (episodeUrl.startsWith(MARK)) {
             ensureSession()
             val parts = episodeUrl.removePrefix(MARK).split('|')
-            val variant = parts.firstOrNull().orEmpty()
+            val variant = unescField(parts.firstOrNull().orEmpty())
             // `!= "null"` 是给老任务兜底的：以前 mark() 把 null 直接拼进了坐标，
             // 那样存下来的下载任务解一次字符串就是字面量 "null"，会去请求 ?episode=null。
-            val token = parts.getOrNull(1)?.takeIf { it.isNotBlank() && it != "null" }
-            val lineId = parts.getOrNull(2)?.takeIf { it.isNotBlank() && it != "null" }
+            val token = parts.getOrNull(1)?.let { unescField(it) }.takeIf {
+                it != null && it.isNotBlank() && it != "null"
+            }
+            val lineId = parts.getOrNull(2)?.let { unescField(it) }.takeIf {
+                it != null && it.isNotBlank() && it != "null"
+            }
             return if (lineId == null) StreamResolution.Ready(bestLine(variant, token))
             else pickLine(variant, token, lineId)
         }
@@ -318,11 +374,11 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 额度用完、网络断、站点改版也返回 null —— 都不该让用户连这部片长什么样都看不到。
      */
     private suspend fun lineNamesOf(variant: String, probeToken: String?): List<LineOpt>? {
-        cached(VARIANT_LINES, variant)?.let { return it }
+        cached(variantLines, variant)?.let { return it }
         val opts = quietly { optionsOf(variant, probeToken) }.getOrNull() ?: return null
         val listed = opts.filter { it.official }.distinctBy { it.url }.distinctBy { it.id }
         if (listed.isEmpty()) return null
-        remember(VARIANT_LINES, variant, listed)
+        remember(variantLines, variant, listed)
         return listed
     }
 
@@ -391,7 +447,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      */
     private suspend fun optionsOf(variant: String, episodeToken: String?): List<LineOpt> {
         val key = "$variant|${episodeToken ?: ""}"
-        cached(EPISODE_LINES, key)?.let { return it }
+        cached(episodeLines, key)?.let { return it }
         val enc = java.net.URLEncoder.encode(variant, "UTF-8")
         val path = if (episodeToken == null) "/v1/playback/entry/$enc"
         else "/v1/playback/entry/$enc?episode=" + java.net.URLEncoder.encode(episodeToken, "UTF-8")
@@ -437,7 +493,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
                 .thenByDescending { it.official }
                 .thenByDescending { it.direct }
         )
-        remember(EPISODE_LINES, key, parsed)
+        remember(episodeLines, key, parsed)
         return parsed
     }
 
@@ -491,9 +547,14 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 所以这里直接把它当 Media.id —— 详情页不需要再猜一遍 id。
      */
     private fun parseCards(body: String): List<Media> {
-        val root = runCatching { json.parseToJsonElement(body).jsonObjectOrNull() }
-            .getOrNull() ?: return emptyList()
-        val cards = root["cards"]?.jsonArrayOrNull() ?: return emptyList()
+        val root = runCatching { json.parseToJsonElement(body).jsonObjectOrNull() }.getOrNull()
+            ?: error("这个源给回来的不是预期的 JSON，接口多半改了")
+        // 「搜不到」和「读不懂」是两句话：`cards: []` 是站点给的答案，
+        // 整个字段不存在是这一版代码跟不上它。原来两者都返回空列表，
+        // 于是接口一改，界面上就成了一句「这个源里没有这部片」——
+        // 用户会去换关键词、换源，而真正坏掉的是解析。
+        val cards = root["cards"]?.jsonArrayOrNull()
+            ?: error("这个源的返回里没有「cards」这一项，这一版解析跟不上它的接口")
         return cards.mapNotNull { el ->
             val o = el.jsonObjectOrNull() ?: return@mapNotNull null
             val id = o.str("id") ?: return@mapNotNull null
@@ -545,25 +606,10 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
         const val MAX_PROBE = 6
 
         /**
-         * 进程内两份缓存：一部片的线路名单、一集片的整包线路地址。
-         *
-         * 放进程里而不是落盘：站点那 3 万 token 买的是**有时效的地址**，
-         * 存到下次开机多半已经 404；值得留下的只有线路的名字和 id（它们跨集稳定），
-         * 而那份东西重取一次也只花一次额度。
-         * 键都是插入序，超上限就从最老的开始丢，避免长会话里一直涨。
+         * 线路缓存的条数上限。缓存本身见实例上的 [variantLines] / [episodeLines] ——
+         * 那两份必须按源各留一份，不能是进程级的。
          */
-        val VARIANT_LINES = LinkedHashMap<String, List<LineOpt>>()
-        val EPISODE_LINES = LinkedHashMap<String, List<LineOpt>>()
         const val CACHE_MAX = 48
-
-        @Synchronized
-        fun <V> cached(map: MutableMap<String, V>, key: String): V? = map[key]
-
-        @Synchronized
-        fun <V> remember(map: MutableMap<String, V>, key: String, value: V) {
-            map[key] = value
-            while (map.size > CACHE_MAX) map.remove(map.keys.first())
-        }
 
         /** 站点的内容类型枚举 → 中文分类名。 */
         val CONTENT_KIND = mapOf(
