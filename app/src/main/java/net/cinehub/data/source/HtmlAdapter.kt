@@ -44,6 +44,15 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     override suspend fun browse(page: Int): List<Media> {
+        // 没配浏览路径、而搜索模板里带 {q} —— 这一条不能照发。fetch() 会把 {q} 换成空串，
+        // 于是打出去的是 `/search?q=&page=1`，一发任何浏览器都不会发的请求。站点爱回什么回什么，
+        // 但界面把它翻成「站点异常 500」就是假话：明明是这条请求不该发（实测 hqvod 就是这么判死的）。
+        // 内置三条规则都显式配了 browsePath，只有认不出模板时用的 generic 会走到这条退化路径 ——
+        // 所以伤到的正好只有「用户手动添加陌生站」那一路。
+        if (rules.browsePath.isBlank() && rules.listPath.contains("{q}")) error(
+            "这个源没配浏览路径 —— 默认规则会拿它的搜索页当列表页，空着查询词打过去没有意义。" +
+                "在「浏览路径」里给它填一条分类页（形如 /vodshow/1--------{page}---.html）再试",
+        )
         val path = rules.browsePath.ifBlank { rules.listPath }
         val list = parseList(fetch(path, page))
         // 列表页一条都读不出来，几乎不可能是「这个源今天没有片子」，而是那条选择器

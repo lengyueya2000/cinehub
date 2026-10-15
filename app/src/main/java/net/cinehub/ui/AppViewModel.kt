@@ -408,13 +408,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String? = null,
         playPath: String? = null,
+        browsePath: String? = null,
         authMode: net.cinehub.data.model.AuthMode = net.cinehub.data.model.AuthMode.Cookie,
         onResult: (ok: Boolean, message: String, tested: SourceConfig?) -> Unit,
     ) = viewModelScope.launch {
-        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath, authMode)
+        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath, browsePath, authMode)
         val result = withContext(Dispatchers.IO) {
             runCatching {
-                val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
+                // 先判能力，再量延迟。原来这两步是反的：probe(站点根路径) 一抛就当场判死，
+                // browse() 根本不会被调用 —— 于是「首页对非浏览器客户端回 500、但接口取到得出内容」
+                // 的站加不进来（实测 hqvod：浏览器打得开，根路径 500）。内置列表那边有
+                // 「健康度一律不当闸门」兜着，用户主动添加这条路没有，所以门槛得架在真信号上。
                 val n = try {
                     SourceAdapters.create(cfg).browse(1).size
                 } finally {
@@ -422,10 +426,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // 适配器（和它那份站点会话）在内存里没人认领
                     SourceAdapters.forget(cfg.id)
                 }
-                // 「识别到 0 个资源」不是成功。根路径能连通是事实，但一个资源都没给，
-                // 存进来就是个占位的死源 —— 两句话都得说，别合成一句「连接成功」。
-                if (n == 0) "连上了（${ms}ms），但列表里一个资源都没给 —— 先搜一次再决定存不存"
-                else "识别到 $n 个资源 · 平均延迟 ${ms}ms"
+                // 根路径只用来报延迟。它失败不再是「这个源不行」，只是「这一项没量到」。
+                val ms = runCatching { net.cinehub.data.net.Http.probe(cfg.baseUrl) }.getOrNull()
+                val latency = if (ms != null) " · 平均延迟 ${ms}ms" else " · 根路径没答话（不影响取内容）"
+                // 「识别到 0 个资源」不是成功。一个资源都没给，存进来就是个占位的死源。
+                if (n == 0) "接口连上了，但列表里一个资源都没给 —— 先搜一次再决定存不存"
+                else "识别到 $n 个资源$latency"
             }
         }
         result.onSuccess { msg -> onResult(true, msg, cfg) }
@@ -444,6 +450,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String?,
         playPath: String? = null,
+        /** 网页解析源的分类页。陌生站点没有它，浏览就只能拿搜索页凑数（见 HtmlAdapter.browse）。 */
+        browsePath: String? = null,
         /** 用户选了凭证怎么带。没填凭证时这条没有意义。 */
         authMode: net.cinehub.data.model.AuthMode = net.cinehub.data.model.AuthMode.Cookie,
     ): SourceConfig = SourceConfig(
@@ -464,7 +472,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None else authMode,
         playPath = playPath?.takeIf { it.isNotBlank() },
         html = when (kind) {
-            SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic
+            // 通用兜底规则里唯一一格用户能自己填的就是浏览路径 —— 搜索模板对陌生站往往是错的，
+            // 而浏览路径给了，这个源才既能在片库里翻、也能在「测试并保存」里被正确判一次。
+            SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic.copy(
+                browsePath = browsePath?.trim()?.takeIf { it.isNotBlank() }
+                    ?: net.cinehub.data.source.DefaultRules.generic.browsePath,
+            )
             else -> null
         },
     )

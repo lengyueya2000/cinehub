@@ -18,7 +18,7 @@ import kotlin.coroutines.resumeWithException
 /**
  * 所有源共用的 HTTP 客户端。
  *
- * 每个源站点都会校验 Referer 与 UA，所以这里不做全局伪装，
+ * 每个源站点都会校验 Referer 与 UA
  * 由调用方按站点传合适的头。
  */
 object Http {
@@ -188,6 +188,16 @@ object Http {
             .url(url)
             .header("User-Agent", UA)
             .header("Accept-Language", "zh-CN,zh;q=0.9")
+            // 探测的语义就是「像浏览器一样把这个站打开一次」，所以这里补齐浏览器导航时会发的头。
+            // 只加在这一处：各源真正取数据的请求仍按站点传头（见本文件顶部的约定）。
+            // 少了 `Accept` 这一条，个别站在内容协商上直接回 500 —— 浏览器打得开、我们判死，
+            // 而 500 会被读成「这个源不行」，那是假话（实测：hqvod 根路径）。
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
         referer?.let { b.header("Referer", it) }
         client.newBuilder()
             .readTimeout(8, TimeUnit.SECONDS)
@@ -219,8 +229,13 @@ object Http {
     fun failureReason(code: Int, body: String = ""): String = when {
         code == 403 || code == 451 || code == 567 -> when {
             body.hasMarker(browserMarkers) ->
+                // 这里原本还写着「用『站点页取链』打开它」—— 那是一条走不到的路，所以删掉：
+                // 站点页取链要把接住的地址交给「正在播的那一集」（SiteBrowserScreen 的 canHandOff），
+                // 而播放器里那个入口开的又是「正在播的那个源」自己的页面（PlayerScreen 用 playing.sitePageUrl）。
+                // 偏偏这一类的源因为探不进来，根本存不进列表、也就永远成不了正在播的那个源 ——
+                // 于是这句话只在它唯一不适用的场合被说出来。指引要等那条路真能走通再放回来说。
                 "对方要求浏览器验证（这类站在访问前摆了一道反爬的题，只有真的浏览器答得上来）—— " +
-                    "这个源接不进搜索和首页，影枢也不去替程序答那道题。用「站点页取链」打开它，或者换一个源"
+                    "这个源接不进搜索和首页，影枢也不去替程序答那道题。换一个源"
 
             body.hasMarker(regionMarkers) ->
                 "拒绝来自访问地区 —— 换一条线路，或者换一个源"

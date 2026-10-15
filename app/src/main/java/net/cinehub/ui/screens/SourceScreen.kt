@@ -406,8 +406,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
             AddSourceSheet(
                 initial = editTarget,
                 onDismiss = { showAdd = false; editTarget = null },
-                onTest = { name, url, kind, token, playPath, mode, cb ->
-                    vm.testSource(name, url, kind, token, playPath, mode, cb)
+                onTest = { name, url, kind, token, playPath, browsePath, mode, cb ->
+                    vm.testSource(name, url, kind, token, playPath, browsePath, mode, cb)
                 },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
@@ -636,7 +636,7 @@ private fun SourceRow(
 @Composable
 private fun AddSourceSheet(
     onDismiss: () -> Unit,
-    onTest: (String, String, SourceKind, String?, String?, AuthMode, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
+    onTest: (String, String, SourceKind, String?, String?, String?, AuthMode, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
     onSave: (SourceConfig) -> Unit,
     /** 给了就是改这一个源，不是新加一个。 */
     initial: SourceConfig? = null,
@@ -645,6 +645,7 @@ private fun AddSourceSheet(
     var url by remember { mutableStateOf(initial?.baseUrl.orEmpty()) }
     var token by remember { mutableStateOf(initial?.authToken.orEmpty()) }
     var playPath by remember { mutableStateOf(initial?.playPath.orEmpty()) }
+    var browsePath by remember { mutableStateOf(initial?.html?.browsePath.orEmpty()) }
     var kind by remember { mutableStateOf(initial?.kind ?: SourceKind.Html) }
     var authMode by remember { mutableStateOf(initial?.authMode ?: AuthMode.Cookie) }
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
@@ -654,7 +655,7 @@ private fun AddSourceSheet(
     // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
     // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
     // 「测试并保存」实际只测了第一次，而界面还写着「保存并启用」。
-    LaunchedEffect(name, url, kind, token, playPath, authMode) {
+    LaunchedEffect(name, url, kind, token, playPath, browsePath, authMode) {
         tested = null
         result = null
     }
@@ -671,7 +672,11 @@ private fun AddSourceSheet(
             priority = initial.priority,
             enabled = initial.enabled,
             tags = initial.tags,
-            html = initial.html,
+            html = initial.html?.let { base ->
+                // 浏览路径是用户刚在这张表单里填/改的那一格，不能跟着身份一起被还原回旧值。
+                // 其余规则（选择器那几样）表单里根本没有，仍按原来那份留着。
+                base.copy(browsePath = cfg.html?.browsePath?.takeIf { it.isNotBlank() } ?: base.browsePath)
+            } ?: cfg.html,
             api = initial.api,
         )
 
@@ -824,6 +829,27 @@ private fun AddSourceSheet(
                 }
             }
 
+            Field("浏览路径", "选填 · 只对「网页解析」生效，缺它时浏览会退化成拿搜索页凑数") {
+                Box(
+                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                        .background(T.Surface2).border(1.dp, T.Border, R.md)
+                        .padding(horizontal = 13.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    if (browsePath.isEmpty()) Text(
+                        "如 /vodshow/1--------{page}---.html",
+                        color = T.TextFaint, fontSize = Fs.body2,
+                    )
+                    BasicTextField(
+                        browsePath, { browsePath = it; invalidate() },
+                        singleLine = true,
+                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                        cursorBrush = SolidColor(T.Src500),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+
             result?.let { (ok, msg) ->
                 Row(
                     Modifier.fillMaxWidth().clip(R.md)
@@ -886,7 +912,7 @@ private fun AddSourceSheet(
                             }
                             busy = true
                             result = null
-                            onTest(name, url, kind, token, playPath, authMode) { ok, msg, cfg ->
+                            onTest(name, url, kind, token, playPath, browsePath, authMode) { ok, msg, cfg ->
                                 busy = false
                                 result = ok to msg
                                 tested = cfg
