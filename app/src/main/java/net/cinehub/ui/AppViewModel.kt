@@ -515,11 +515,39 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun clearQuery() {
+    /**
+     * 退出搜索页时把这一页擦干净。
+     *
+     * 光清结果不够：在跑的那次搜索不取消，人已经回首页了，它晚一步回来还是会把旧结果
+     * 重新摆满屏幕，`_searching` 也一路挂着 —— 下次进来先看到「正在并发查询 N 个源…」，
+     * 然后落回上一轮那个词的结果，看着像是搜索页记住了自己上次搜了什么。
+     */
+    fun resetSearch() {
+        searchGen++
+        searchJob?.cancel()
+        searchJob = null
+        _searching.value = false
         _query.value = ""
         _results.value = emptyList()
         _searchFailures.value = emptyList()
     }
+
+    /** 清搜索框：回到「历史 + 当前接入的源」那一屏，但人还留在搜索页。 */
+    fun clearQuery() {
+        searchGen++
+        searchJob?.cancel()
+        _searching.value = false
+        _query.value = ""
+        _results.value = emptyList()
+        _searchFailures.value = emptyList()
+    }
+
+    /** 删一条搜索历史。不弹确认 —— 删错了重新搜一次就回来了。 */
+    fun removeSearchHistory(term: String) {
+        _history.value = _history.value.filterNot { it == term }
+    }
+
+    fun clearSearchHistory() { _history.value = emptyList() }
 
     // ---------- 详情 ----------
 

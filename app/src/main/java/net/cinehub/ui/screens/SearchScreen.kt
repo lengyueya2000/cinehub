@@ -2,7 +2,9 @@ package net.cinehub.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,11 +22,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,6 +50,7 @@ import net.cinehub.data.model.AggregatedMedia
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.SearchOutcome
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.components.ConfirmDialog
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
 import net.cinehub.ui.components.Spacer4
@@ -61,6 +66,7 @@ import net.cinehub.ui.theme.T
  *
  * 一部片只出一条，下面挂各源徽标 —— 不用点进去就能判断哪个源能播、画质如何。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun SearchScreen(
     vm: AppViewModel,
@@ -78,9 +84,17 @@ fun SearchScreen(
     val enabled = sources.filter { it.enabled }
     val hitSources = results.flatMap { it.availability }.map { it.sourceId }.distinct().size
 
+    // 离开这一页就把搜索擦干净。四条出路（取消、系统返回、切 tab、点进结果）都从这一个
+    // 口子走，不必每一处各自记得清 —— 漏一条就是「再进来还挂着上一轮的结果」。
+    DisposableEffect(Unit) {
+        onDispose { vm.resetSearch() }
+    }
+
     // 类型筛选是本页的临时状态：不写进 ViewModel、不落盘，退出搜索就没了。
     // 键在 query 上 —— 换了关键词就是另一批结果，旧筛选不该继续作用在它上面。
     var cat by remember(query) { mutableStateOf<String?>(null) }
+    // 「清空」历史是全删，得问一下；删单条不问，重新搜一次就回来了
+    var confirmClearHistory by remember { mutableStateOf(false) }
     // 芯片只写结果里真出现过的类型。很多源不给 category，一个可信类型都取不到时
     // 整排直接不渲染 —— 留一排点了没反应的芯片比不排更糟。
     val chips = remember(results) { resultChips(results) }
@@ -123,6 +137,21 @@ fun SearchScreen(
                         ),
                         modifier = Modifier.fillMaxWidth(),
                     )
+                }
+                // 清空只在有字时出现：空框里挂一个按了没反应的 × 比不挂更吵
+                if (query.isNotEmpty()) {
+                    Spacer8()
+                    Box(
+                        Modifier.size(22.dp).clip(CircleShape)
+                            .background(Color.White.copy(alpha = .10f))
+                            .clickable { vm.clearQuery() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.Close, "清空搜索框",
+                            tint = T.TextDim, modifier = Modifier.size(12.dp),
+                        )
+                    }
                 }
             }
             Spacer12()
@@ -221,7 +250,26 @@ fun SearchScreen(
                             Spacer12()
                         }
                         if (history.isNotEmpty()) {
-                            Text("搜索历史", color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "搜索历史",
+                                    color = T.Text,
+                                    fontSize = Fs.body2,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text(
+                                    "清空",
+                                    color = T.TextDim,
+                                    fontSize = Fs.xs,
+                                    modifier = Modifier.clip(R.full)
+                                        .clickable { confirmClearHistory = true }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                )
+                            }
                             Spacer8()
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                                 items(history) { h ->
@@ -229,8 +277,14 @@ fun SearchScreen(
                                         h,
                                         color = T.TextDim,
                                         fontSize = Fs.xs,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.clip(R.full).background(T.Surface2)
-                                            .clickable { vm.search(h) }
+                                            // 长按删一条，不弹确认：删错了重新搜一次就回来了
+                                            .combinedClickable(
+                                                onClick = { vm.search(h) },
+                                                onLongClick = { vm.removeSearchHistory(h) },
+                                            )
                                             .padding(horizontal = 12.dp, vertical = 7.dp),
                                     )
                                 }
@@ -283,6 +337,16 @@ fun SearchScreen(
                 }
             }
         }
+    }
+
+    if (confirmClearHistory) {
+        ConfirmDialog(
+            title = "清空搜索历史",
+            body = "这 ${history.size} 条搜索词只存在这台设备上，清掉就找不回来了。",
+            confirm = "清空",
+            onConfirm = { vm.clearSearchHistory(); confirmClearHistory = false },
+            onDismiss = { confirmClearHistory = false },
+        )
     }
 }
 
