@@ -290,10 +290,12 @@ fun PlayerScreen(
 
     // 起播看门狗：地址是通的，但 20 秒还不出第一帧，就当作这个源放不出来这一集。
     // 只管起播这一段 —— 播到一半卡顿和用户自己拖进度条长得一模一样，误判的代价比救回来的收益大。
+    // 还要看一眼 currentPosition：纯音频流（或画面比声音晚到位的源）压根不会回调首帧，
+    // 位置在往前走就说明它真的在播，不能换走。
     LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
         if (playing?.streamUrl.isNullOrBlank()) return@LaunchedEffect
         delay(STARTUP_GRACE_MS)
-        if (!firstFrame && wantsPlay && errText == null) {
+        if (!firstFrame && wantsPlay && errText == null && player.currentPosition <= 0L) {
             vm.reportPlaybackFailure("一直缓冲，没能开播")
         }
     }

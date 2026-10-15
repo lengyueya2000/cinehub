@@ -783,9 +783,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         r.cursor++
         publish(r, exhausted = false)
-        val next = r.candidates[r.cursor]
-        viewModelScope.launch { switchPlayingSource(next, r.episodeIndex, r.anchorSec, autoAdvance = true) }
+        switchWithinRound(r)
     }
+
+    /**
+     * 由这一轮发起的切源。和用户在播放器里手动切源 ([switchPlayingSource]) 不是一条路，
+     * 因为它多了两道锁：
+     *
+     * - **detail 回来之前可能已经过了好几秒**。这期间用户换了集、点了重试、或自己切了源，
+     *   这一笔就得丢掉 —— 不然屏幕上写着第 6 集、递出去的却是第 5 集的地址，
+     *   而这一轮的游标也早就不指这个源了。
+     * - **只认那一集**。这个源没有第 5 集就算它放不出来，不能拿它的第一集顶上：
+     *   集号一变 [play] 就当成新的一轮开，整张候选表和已经记下的原因一起作废，
+     *   剩下的源再也试不到，还可能和上一台源来回踢皮球。
+     */
+    private fun switchWithinRound(r: Round, at: Int = r.cursor) {
+        val av = r.candidates.getOrNull(at) ?: return
+        val genAtAsk = playGen
+        viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId }
+            val d = cfg?.let { c -> runCatching { mediaRepo.detail(c, av.item.id) }.getOrNull() }
+            if (!roundAlive(r, genAtAsk)) return@launch
+            val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == r.episodeIndex }
+            if (ep == null) {
+                r.reasons[r.cursor] =
+                    if (d == null) "这个源取不到详情" else "这个源没有第 ${r.episodeIndex} 集"
+                advance(r)
+                return@launch
+            }
+            play(
+                sourceId = av.sourceId,
+                mediaTitle = av.item.title,
+                episodeName = ep.name,
+                episodeIndex = ep.index,
+                episodeUrl = ep.playUrl,
+                resumeFrom = r.anchorSec,
+                mediaId = av.item.id,
+                mediaKey = av.item.key,
+                mediaYear = av.item.year,
+                mediaCover = av.item.cover,
+                detail = d,
+                autoAdvance = true,
+            )
+        }
+    }
+
+    /** 这一轮还算不算数：换集 / 重试 / 手动切源都会 [beginRound] 换成新的一组对象。 */
+    private fun roundAlive(r: Round, genAtAsk: Int) =
+        round === r && playGen == genAtAsk && _playing.value?.episodeIndex == r.episodeIndex
 
     /**
      * 第一帧出来了：横幅从此只作说明。
@@ -807,8 +852,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         r.cursor = 0
         r.reasons.clear()
         _fallback.value = null
-        val first = r.candidates.firstOrNull() ?: return
-        viewModelScope.launch { switchPlayingSource(first, r.episodeIndex, r.anchorSec, autoAdvance = true) }
+        switchWithinRound(r, 0)
     }
 
     private fun publish(r: Round, exhausted: Boolean) {
@@ -979,21 +1023,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun noteOf(res: StreamResolution): String? = res.userNote()
 
     /**
-     * 播放器里切源：保持进度。
+     * 播放器里手动切源：保持进度。
      *
-     * [resumeFrom] 给 null 时用当前听到的位置（手动切源就是这一种）；自动换源必须把这一轮的
-     * 锚点显式传进来 —— 那一刻 `_resumePosition` 可能已经被新播放器的 `stop()` 冲成 0。
-     * 线路一律取新源的第一条：[lineIndex] 是播放器界面自己的状态，拿它去指另一套源线路列表
-     * 的第 N 条，屏幕上写的线路名就是假的。
+     * 集号对不上时退回这个源的第一集 —— 手动切源的人看得见自己在切什么，
+     * 拿一集能播的顶上也比白屏强。自动换源不走这条路，见 [switchWithinRound]。
      */
-    fun switchPlayingSource(
-        av: SourceAvailability,
-        episodeIndex: Int,
-        resumeFrom: Long? = null,
-        autoAdvance: Boolean = false,
-    ) {
+    fun switchPlayingSource(av: SourceAvailability, episodeIndex: Int) {
         viewModelScope.launch {
-            val pos = resumeFrom ?: _resumePosition.value
+            val pos = _resumePosition.value
             val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
             val d = runCatching { mediaRepo.detail(cfg, av.item.id) }.getOrNull()
             val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == episodeIndex }
@@ -1010,7 +1047,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 mediaYear = av.item.year,
                 mediaCover = av.item.cover,
                 detail = d,
-                autoAdvance = autoAdvance,
             )
         }
     }
