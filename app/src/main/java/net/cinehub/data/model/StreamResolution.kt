@@ -24,14 +24,8 @@ sealed interface StreamResolution {
      */
     data object NeedsClientScript : StreamResolution
 
-    /**
-     * 解析过程本身失败了（规则缺失、网络错误、页面结构变了…），原因如实带回。
-     *
-     * [sourceWide] 说的是这条原因属于**整个源**而不是这一条线路：对方按 IP/客户端把我们
-     * 挡下来了（限流、拒答、要浏览器验证）。这种时候把剩下的线路挨个试完只会得到 N 个
-     * 一模一样的答案，还会把限流踩得更深 —— 自动重试要靠这一条决定「换线路」还是「换源」。
-     */
-    data class Failed(val reason: String, val sourceWide: Boolean = false) : StreamResolution
+    /** 解析过程本身失败了（规则缺失、网络错误、页面结构变了…），原因如实带回。 */
+    data class Failed(val reason: String) : StreamResolution
 }
 
 /**

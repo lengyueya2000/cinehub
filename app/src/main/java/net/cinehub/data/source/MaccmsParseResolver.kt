@@ -51,11 +51,7 @@ internal object MaccmsParseResolver {
         val auth = Http.authHeaders(cfg)
         // 凭证只往本站的地址上带。解析站是另一个域 —— 把用户在源配置里填的 cookie 发过去，
         // 等于替他把凭证抄送给第三方，所以这两条请求一律不带 auth。
-        val page = try {
-            playPage(episodeUrl, site, auth)
-        } catch (e: Refused) {
-            return StreamResolution.Failed(e.message.orEmpty(), sourceWide = true)
-        }
+        val page = playPage(episodeUrl, site, auth)
         val player = MacPlayerJson.read(page) ?: error(
             "播放页里没有 player_aaaa —— 站点连播放数据都不发了，多半是改版"
         )
@@ -94,14 +90,8 @@ internal object MaccmsParseResolver {
             timeoutSec = 30,
         )
         val obj = runCatching { json.parseToJsonElement(reply.body) as? JsonObject }.getOrNull()
-        val cipher = obj?.field("url")?.takeIf { it.isNotBlank() }
-        if (obj == null) {
-            val why = "解析站回的不是能读的那份数据（HTTP ${reply.status}）"
-            // 429 / 403 那一类是对方按地址把我们挡了，不是这一条线路的问题：
-            // 实测连点十几条线路会开始整片回 429，而那时换线路只会把限流踩得更深
-            if (isRefusal(reply.status)) return StreamResolution.Failed("$why —— 这个源暂时不给", sourceWide = true)
-            error("$why —— 换一条线路试试")
-        }
+            ?: error("解析站回的不是能读的那份数据（HTTP ${reply.status}）—— 换一条线路试试")
+        val cipher = obj.field("url")?.takeIf { it.isNotBlank() }
         if (obj.field("code")?.toIntOrNull() != 200 || cipher == null) {
             error("解析站没给出这一集的地址（回的是 code=${obj.field("code") ?: "?"}）—— 换一条线路试试")
         }
@@ -129,10 +119,11 @@ internal object MaccmsParseResolver {
         }
         val body = second?.body ?: first.body
         if (MacPlayerJson.read(body) != null) return body
-        val status = second?.status ?: first.status
-        val why = "打不开这一集的播放页：站点回 HTTP $status"
-        if (isRefusal(status)) throw Refused("$why —— 这个源暂时不给（同一台设备连着要会被它限流）")
-        error("$why，正文里没有播放数据（带着它下发的那颗会话再要过一次，还是不给）")
+        error(
+            "打不开这一集的播放页：站点回 HTTP ${second?.status ?: first.status}，" +
+                "正文里没有播放数据（带着它下发的那颗会话再要过一次，还是不给）" +
+                if (second?.status == 429 || first.status == 429) "—— 同一台设备连着要会被它限流" else ""
+        )
     }
 
     /**
@@ -155,13 +146,6 @@ internal object MaccmsParseResolver {
         }
 
     private val parserBases = java.util.concurrent.ConcurrentHashMap<String, String>()
-
-    /** 整源级别的挡下：换线路不会改变结果，交给自动重试去换源。 */
-    private class Refused(reason: String) : Exception(reason)
-
-    /** 这几个状态码说的是「这个客户端/这个地址现在不接待」，而不是「这一集没有」。 */
-    private fun isRefusal(status: Int): Boolean =
-        status == 403 || status == 429 || status == 451 || status == 567 || status in 500..599
 
     /**
      * 拼出签名原文 —— 与脚本看到的 iframe query string 一字不差。

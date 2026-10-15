@@ -922,10 +922,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 往下走时先在**当前这个源**里换线路，线路走完了才换源：换线路不用重取详情（那份
      * `MediaDetail` 就在手上，懂片帝那种连线路包都缓存好了），换源每次都要重新拉一遍详情。
-     * 便宜的先试。
+     * 便宜的先试 —— 而且**同源的线路一定先走完**：一个源里十几条线路，第一条撞上的临时状况
+     * （限流、对方那一路正在抽风）常常第二条就好了，一上来就判死这个源、换到别处去，
+     * 是拿片库最全的那条去换一个小的。
      *
-     * [wholeSource] 是这一条的例外：那个原因属于整个源（地址由站点脚本现算 / 要凭证 / 没配解析规则），
-     * 换线路不会有任何变化，直接跳到下一个源，别把流水写成「换过 13 次」。
+     * [wholeSource] 只留给一种例外：那个原因写在**规则**上（地址由站点脚本现算 / 要凭证 /
+     * 没配解析规则）。这种换线路不会有第二个答案，而且适配器看一眼模式就返回、不花网络，
+     * 所以直接跳到下一个源，别把流水写成「换过 13 次」。
+     * 对方按 IP/客户端挡下来那一类（403 / 429 / 5xx）**不算这种例外**：它是对这个源的
+     * 一次回答，不是对每一条线路的回答。
      */
     fun reportPlaybackFailure(reason: String, url: String? = null, wholeSource: Boolean = false) {
         val r = round ?: return
@@ -938,8 +943,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _resumePosition.value.takeIf { it > 0L }?.let { r.anchorSec = it }
         r.accounted = true
         r.tried += Attempt(cand.sourceName, lineNameOf(r), reason)
-        // [wholeSource] 时跳过这一段：那个原因写在整个源的规则上（见 [sourceLevel]），
-        // 它的 13 条线路会给出 13 个一模一样的答案，挨个试完只是把流水写成「换过 13 次」。
         if (!wholeSource && nextLine(r)) return
         if (r.candidates.size > 1) {
             advance(r)
@@ -1228,7 +1231,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // 最后从 4kku 播起来，而它自己那一页从没被打开过。
                     // 所以这里停在这一格，直接把这一集的站点页开给他，让站点把地址算给它自己的播放器。
                     // 自动换源走到这一格时不走这条路：那是「这个源不行，换一个」，不该顺手开一扇窗。
-                    if (!autoAdvance && siteLinkOnly(res) && page != null) {
+                    if (!autoAdvance && sourceLevel(res) && page != null) {
                         _playing.value = _playing.value?.copy(note = siteLinkNote(name))
                         openSiteBrowser(page, "$name · $mediaTitle $episodeName", cfg?.baseUrl?.let { "$it/" })
                     } else {
@@ -1246,19 +1249,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 这几种都在**发出任何请求之前**就定下来了（`resolveMode` 写在源规则里，13 条线路共用一份），
      * 所以换线路不会有任何变化 —— 该跳的是整个源，而不是把它的线路挨个试一遍再跳。
-     * 反过来，「播放页里没有 player_aaaa」「这条地址不是媒体文件」这类是逐条线路的，照旧一条一报。
+     * 反过来，「播放页里没有 player_aaaa」「站点回 403 / 429」这类是逐条线路的回答，
+     * 照旧一条一报、把这一源的线路走完才换源：对方这一次挡的未必每一条都挡。
      */
-    /**
-     * 这条原因写在整个源上 —— 自动重试因此不必把这个源剩下的线路挨个试完。
-     *
-     * 两种：规则上就给不出直链（换线路必然还是同一个答案），和对方按 IP/客户端把我们挡下
-     * （限流、拒答 —— 实测 高清点播 被连着打十几个请求会整片回 429，那时换线路只会踩得更深）。
-     */
-    private fun sourceLevel(res: StreamResolution): Boolean =
-        siteLinkOnly(res) || (res is StreamResolution.Failed && res.sourceWide)
-
-    /** 「这个源从规则上就给不出直链」：只有这一种值得停在这一格，把站点页开给用户自己走。 */
-    private fun siteLinkOnly(res: StreamResolution): Boolean = when (res) {
+    private fun sourceLevel(res: StreamResolution): Boolean = when (res) {
         is StreamResolution.NeedsClientScript, is StreamResolution.NeedsSession -> true
         is StreamResolution.Failed -> res.reason.startsWith("这个源还没有配置直链解析规则")
         else -> false
