@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
+import net.cinehub.data.model.AuthMode
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.ui.AppViewModel
@@ -91,6 +93,9 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val unreadable by vm.sourcesUnreadable.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
+    // 同一张表单也用来改：接进来的源地址写错了、要换个凭证，以前只能删了重加 ——
+    // 而删了重加会把它排在末尾、把它的启停状态一起丢了。
+    var editTarget by remember { mutableStateOf<SourceConfig?>(null) }
     // 删源要过一道确认：凭证是用户自己填的，误删一次就得重新找、重新填
     var pendingDelete by remember { mutableStateOf<SourceConfig?>(null) }
 
@@ -145,9 +150,10 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                         )
                     }
                     Row(
-                        Modifier.height(32.dp).clip(R.full)
+                        // 44dp：这颗「添加」是这一页唯一的写入口，32dp 在手里就是一下下不中
+                        Modifier.heightIn(min = 44.dp).clip(R.full)
                             .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
-                            .clickable { showAdd = true }
+                            .clickable { editTarget = null; showAdd = true }
                             .padding(horizontal = 13.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -183,7 +189,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                                 .background(T.Src500.copy(alpha = .10f))
                                 .border(1.dp, T.Src500.copy(alpha = .34f), R.full)
                                 .clickable { vm.refreshHealth(true) }
-                                .padding(horizontal = 11.dp, vertical = 5.dp),
+                                .heightIn(min = 44.dp)
+                                .padding(horizontal = 13.dp, vertical = 5.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
@@ -276,6 +283,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.clip(R.full)
                                 .border(1.dp, T.Warn.copy(alpha = .5f), R.full)
+                                .heightIn(min = 44.dp)
                                 .clickable {
                                     vm.restoreDefaultSources { n ->
                                         restored = if (n > 0) "已补回 $n 个内置源" else "内置源都在，无需补回"
@@ -354,6 +362,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                             onToggle = { vm.toggleSource(cfg.id, it) },
                             onDelete = { pendingDelete = cfg },
                             onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
+                            onEdit = { editTarget = cfg; showAdd = true },
                             onUp = if (i == 0) null else {
                                 {
                                     // 用 order 而不是 sources：界面按优先级排过，落盘那份不保证有序，
@@ -395,11 +404,15 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 
         if (showAdd) {
             AddSourceSheet(
-                onDismiss = { showAdd = false },
-                onTest = { name, url, kind, token, playPath, cb -> vm.testSource(name, url, kind, token, playPath, cb) },
+                initial = editTarget,
+                onDismiss = { showAdd = false; editTarget = null },
+                onTest = { name, url, kind, token, playPath, mode, cb ->
+                    vm.testSource(name, url, kind, token, playPath, mode, cb)
+                },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
                     showAdd = false
+                    editTarget = null
                 },
             )
         }
@@ -412,7 +425,12 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
  * 坐标一律从 [LazyListState] 的当前布局现读，不自攒一份表：滑出屏幕的行会被 LazyColumn 回收，
  * 自己记过的那份既不清理也不更新，滚到底再往回拖就会拿陈旧坐标把顺序落到不相干的位次上。
  *
- * 判据是「被抬起那一行的中心」越过了哪一行的中心 —— 越过第一条就把那一条的位次当作落点。
+ * 判据只有一条：**其它行的中心点有几个在抬起那一行的中心点之上**，那个数就是落点。
+ *
+ * 原来写的是「第一个中心点落在下面的行的位次」，这在往下拖时多算一格：中心刚好压在
+ * B、C 之间时它返回的是 C 的位次 2，而 `removeAt(0) + add(2)` 出来是 `[B,C,A]` ——
+ * 手指只挪了一格半，列表里跳了两格，看上去就像落点和手指反着走。而这个位次是当场
+ * 落盘的，松手以后错序就留下了，重开还是错的。
  */
 private fun targetIndexFor(
     dragId: String?,
@@ -424,17 +442,13 @@ private fun targetIndexFor(
     val visible = listState.layoutInfo.visibleItemsInfo
     val self = visible.firstOrNull { it.key == dragId } ?: return order.indexOf(dragId)
     val center = self.offset + self.size / 2f + dragDy
-    for (vi in visible) {
-        val pos = (vi.key as? String)?.let { order.indexOf(it) } ?: -1
-        if (pos < 0 || vi.key == dragId) continue
-        if (vi.offset + vi.size / 2f > center) return pos
+    val others = visible.filter { vi ->
+        vi.key != dragId && (vi.key as? String)?.let { order.indexOf(it) }?.let { it >= 0 } == true
     }
-    // 已经压过所有可见行的中心：落到这一批里最后一个源的位次。
-    // 这一版不做拖到边缘自动滚动，拖不出屏幕就是拖不出这一批 —— 宁可少排一位，也不要凭陈旧的
-    // 屏外坐标猜一个落点。
-    return visible.lastOrNull { (it.key as? String)?.let { k -> order.indexOf(k) }?.let { p -> p >= 0 } == true }
-        ?.let { order.indexOf(it.key as String) }
-        ?: order.indexOf(dragId)
+    // 数不到屏外去的行：这一版不做拖到边缘自动滚动，拖不出屏幕就是拖不出这一批 ——
+    // 宁可少排一位，也不要凭陈旧的屏外坐标猜一个落点。
+    val above = others.count { it.offset + it.size / 2f < center }
+    return above.coerceIn(0, others.size)
 }
 
 @Composable
@@ -455,6 +469,7 @@ private fun SourceRow(
     onDelete: () -> Unit,
     onOpenSite: () -> Unit,
     onUp: (() -> Unit)?,
+    onEdit: () -> Unit,
 ) {
     val h = report?.health ?: Health.Unknown
     val border = when {
@@ -599,6 +614,8 @@ private fun SourceRow(
             if (onUp != null) {
                 TextAction("上移", onClick = onUp)
             }
+            // 改一处地址不必删了重加：删一次就丢掉它的位次和启停，重加只能排到末尾
+            TextAction("编辑", onClick = onEdit)
             TextAction("删除", color = T.Err, onClick = onDelete)
         }
         // 不可用的原因整句留在这里，不再截成 18 个字：
@@ -619,14 +636,17 @@ private fun SourceRow(
 @Composable
 private fun AddSourceSheet(
     onDismiss: () -> Unit,
-    onTest: (String, String, SourceKind, String?, String?, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
+    onTest: (String, String, SourceKind, String?, String?, AuthMode, (Boolean, String, SourceConfig?) -> Unit) -> Unit,
     onSave: (SourceConfig) -> Unit,
+    /** 给了就是改这一个源，不是新加一个。 */
+    initial: SourceConfig? = null,
 ) {
-    var name by remember { mutableStateOf("") }
-    var url by remember { mutableStateOf("") }
-    var token by remember { mutableStateOf("") }
-    var playPath by remember { mutableStateOf("") }
-    var kind by remember { mutableStateOf(SourceKind.Html) }
+    var name by remember { mutableStateOf(initial?.name.orEmpty()) }
+    var url by remember { mutableStateOf(initial?.baseUrl.orEmpty()) }
+    var token by remember { mutableStateOf(initial?.authToken.orEmpty()) }
+    var playPath by remember { mutableStateOf(initial?.playPath.orEmpty()) }
+    var kind by remember { mutableStateOf(initial?.kind ?: SourceKind.Html) }
+    var authMode by remember { mutableStateOf(initial?.authMode ?: AuthMode.Cookie) }
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -634,10 +654,26 @@ private fun AddSourceSheet(
     // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
     // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
     // 「测试并保存」实际只测了第一次，而界面还写着「保存并启用」。
-    LaunchedEffect(name, url, kind, token, playPath) {
+    LaunchedEffect(name, url, kind, token, playPath, authMode) {
         tested = null
         result = null
     }
+
+    /**
+     * 改一个源时，探测回来的那份是**新造的配置**（新 id、排在末尾、没启停、规则退回默认）。
+     * 直接落库就等于：改个地址，这个源从第 1 位掉到最后一位、被重新启用、
+     * 身上那些内置标签和站点规则也全没了。所以身份那几样一律用原来那份。
+     */
+    fun keepIdentity(cfg: SourceConfig): SourceConfig =
+        if (initial == null) cfg
+        else cfg.copy(
+            id = initial.id,
+            priority = initial.priority,
+            enabled = initial.enabled,
+            tags = initial.tags,
+            html = initial.html,
+            api = initial.api,
+        )
 
     // 任何字段改动都让上一次的探测结果失效，否则会把旧配置存下来
     fun invalidate() {
@@ -652,6 +688,10 @@ private fun AddSourceSheet(
         )
         Column(
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                // 键盘弹出时要把整块表单顶上去。这一页有四个要打的字段，其中两个
+                // （凭证、播放页路径）键盘一盖就盖住了底部的「测试并保存」——
+                // 用户填完最后一格，按钮正在他手指底下，看着就像按钮坏了。
+                .imePadding()
                 // 表单比屏幕高时（小屏 / 横屏）按钮会被裁掉，所以整块可滚，最多占四分之三屏
                 .heightIn(max = 640.dp)
                 .verticalScroll(rememberScrollState())
@@ -666,7 +706,10 @@ private fun AddSourceSheet(
                     .align(Alignment.CenterHorizontally),
             )
             Spacer16()
-            Text("添加播放源", color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold)
+            Text(
+                if (initial == null) "添加播放源" else "编辑「${initial.name}」",
+                color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold,
+            )
             Spacer4()
             Text(
                 "填入站点地址，影枢会自动识别站点类型、抓取资源并生成统一播放列表。",
@@ -726,7 +769,7 @@ private fun AddSourceSheet(
                 }
             }
 
-            Field("站点凭证", "选填 · 需要登录的源填你自己的 Cookie") {
+            Field("站点凭证", "选填 · 需要登录的源填你自己的凭证") {
                 Box(
                     Modifier.fillMaxWidth().height(44.dp).clip(R.md)
                         .background(T.Surface2).border(1.dp, T.Border, R.md)
@@ -741,6 +784,22 @@ private fun AddSourceSheet(
                         cursorBrush = SolidColor(T.Src500),
                         modifier = Modifier.fillMaxWidth(),
                     )
+                }
+                if (token.isNotBlank()) {
+                    Spacer12()
+                    // 凭证分两种带法，而这一步以前没有：只有 Cookie 一条路时，那些认
+                    // Authorization 的站（不少聚合接口给的是 Bearer token）填了等于没填 ——
+                    // 探测照样能连上根路径，回来却什么都读不到，而界面上那句「已带上凭证」照样亮着。
+                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                        AuthModeTile(
+                            "Cookie", "放进 Cookie 头", AuthMode.Cookie, authMode,
+                            Modifier.weight(1f),
+                        ) { authMode = it; invalidate() }
+                        AuthModeTile(
+                            "Bearer", "放进 Authorization", AuthMode.Bearer, authMode,
+                            Modifier.weight(1f),
+                        ) { authMode = it; invalidate() }
+                    }
                 }
             }
 
@@ -822,12 +881,12 @@ private fun AddSourceSheet(
                             val ready = tested
                             if (ready != null) {
                                 // 已经探测通过：这一步只负责落库
-                                onSave(ready)
+                                onSave(keepIdentity(ready))
                                 return@clickable
                             }
                             busy = true
                             result = null
-                            onTest(name, url, kind, token, playPath) { ok, msg, cfg ->
+                            onTest(name, url, kind, token, playPath, authMode) { ok, msg, cfg ->
                                 busy = false
                                 result = ok to msg
                                 tested = cfg
@@ -839,7 +898,7 @@ private fun AddSourceSheet(
                     Text(
                         when {
                             busy -> "正在测试连通性…"
-                            tested != null -> "保存并启用"
+                            tested != null -> if (initial == null) "保存并启用" else "保存"
                             else -> "测试并保存"
                         },
                         color = Color.White,
@@ -863,6 +922,31 @@ private fun Field(label: String, hint: String, content: @Composable () -> Unit) 
         }
         Spacer8()
         content()
+    }
+}
+
+/** 凭证带法的选择块。样子和 [KindTile] 一致 —— 同一张表单里的同级选择必须长成一个样。 */
+@Composable
+private fun AuthModeTile(
+    title: String,
+    sub: String,
+    value: AuthMode,
+    current: AuthMode,
+    modifier: Modifier = Modifier,
+    onPick: (AuthMode) -> Unit,
+) {
+    val on = value == current
+    Column(
+        modifier.height(62.dp).clip(R.md)
+            .background(if (on) T.Play500.copy(alpha = .10f) else T.Surface2)
+            .border(1.dp, if (on) T.Play500.copy(alpha = .46f) else T.Border, R.md)
+            .clickable { onPick(value) },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(title, color = if (on) T.Play400 else T.Text, fontSize = Fs.xs, fontWeight = FontWeight.Bold)
+        Spacer4()
+        Text(sub, color = T.TextFaint, fontSize = Fs.tiny)
     }
 }
 

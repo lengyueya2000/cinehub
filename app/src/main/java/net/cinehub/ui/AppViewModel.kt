@@ -405,9 +405,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String? = null,
         playPath: String? = null,
+        authMode: net.cinehub.data.model.AuthMode = net.cinehub.data.model.AuthMode.Cookie,
         onResult: (ok: Boolean, message: String, tested: SourceConfig?) -> Unit,
     ) = viewModelScope.launch {
-        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath)
+        val cfg = buildConfig(name, baseUrl, kind, authToken, playPath, authMode)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val ms = net.cinehub.data.net.Http.probe(cfg.baseUrl)
@@ -441,6 +442,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         kind: SourceKind,
         authToken: String?,
         playPath: String? = null,
+        /** 用户选了凭证怎么带。没填凭证时这条没有意义。 */
+        authMode: net.cinehub.data.model.AuthMode = net.cinehub.data.model.AuthMode.Cookie,
     ): SourceConfig = SourceConfig(
         // 毫秒时间戳做 id 会撞：连着「探测并保存」两个站点（或者脚本一样的两个源）
         // 完全可能落在同一毫秒里，后存的那个把前一个原地覆盖 —— 界面上是
@@ -453,8 +456,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 排到最后：默认值 0/1 会和内置源撞上，界面上就同时出现两个「默认」位次
         priority = (_sources.value.maxOfOrNull { it.priority } ?: 0) + 1,
         authToken = authToken?.takeIf { it.isNotBlank() },
-        authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None
-        else net.cinehub.data.model.AuthMode.Cookie,
+        // 用户在这张表单里选的是哪种就按哪种发。以前这里写死 Cookie：
+        // 只有 Authorization 头的站点（不少 m3u8 聚合站是这个形态）填了凭证也等于没填，
+        // 而界面上那句「已带上凭证」照样亮着 —— 它带的是一个对方不收的头。
+        authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None else authMode,
         playPath = playPath?.takeIf { it.isNotBlank() },
         html = when (kind) {
             SourceKind.Html -> net.cinehub.data.source.DefaultRules.generic

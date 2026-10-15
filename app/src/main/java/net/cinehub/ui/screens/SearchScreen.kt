@@ -28,7 +28,6 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -84,11 +83,9 @@ fun SearchScreen(
     val enabled = sources.filter { it.enabled }
     val hitSources = results.flatMap { it.availability }.map { it.sourceId }.distinct().size
 
-    // 离开这一页就把搜索擦干净。四条出路（取消、系统返回、切 tab、点进结果）都从这一个
-    // 口子走，不必每一处各自记得清 —— 漏一条就是「再进来还挂着上一轮的结果」。
-    DisposableEffect(Unit) {
-        onDispose { vm.resetSearch() }
-    }
+    // 离开搜索这条线才擦干净。原来挂的是 onDispose —— 可「点进某一部片的详情」也是一次
+    // dispose，于是从详情页按返回回来，那一屏刚搜出来的结果没了，搜索框也空了：
+    // 用户刚做过的事被返回键替他撤销。现在擦除交给两个真正的出口（返回键、从首页那颗图标进来）。
 
     // 类型筛选是本页的临时状态：不写进 ViewModel、不落盘，退出搜索就没了。
     // 键在 query 上 —— 换了关键词就是另一批结果，旧筛选不该继续作用在它上面。

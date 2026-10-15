@@ -270,8 +270,21 @@ private fun Chip(text: String, active: Boolean, onClick: () -> Unit) {
     )
 }
 
-private fun Long.ofTime(): String =
-    java.text.SimpleDateFormat("HH:mm", java.util.Locale.CHINA).format(java.util.Date(this))
+/**
+ * 缓存那一刻的时间。
+ *
+ * 原来只有 HH:mm：昨天 14:03 存的那一集和上周 14:03 存的那一集写着同一句话，
+ * 而这一列就是拿来回答「这是我什么时候存的」。今天以内给时分，跨天补上日期。
+ */
+private fun Long.ofTime(): String {
+    val now = System.currentTimeMillis()
+    val sameDay = java.util.Calendar.getInstance().apply { timeInMillis = now }
+        .get(java.util.Calendar.DAY_OF_YEAR) ==
+        java.util.Calendar.getInstance().apply { timeInMillis = this@ofTime }
+            .get(java.util.Calendar.DAY_OF_YEAR)
+    val pattern = if (sameDay || now - this < 86_400_000L) "HH:mm" else "M月d日 HH:mm"
+    return java.text.SimpleDateFormat(pattern, java.util.Locale.CHINA).format(java.util.Date(this))
+}
 
 /**
  * 下载：本机已缓存的任务。

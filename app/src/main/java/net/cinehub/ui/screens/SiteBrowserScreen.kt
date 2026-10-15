@@ -94,10 +94,18 @@ fun SiteBrowserScreen(
     var totalSeen by remember { mutableIntStateOf(0) }
     val queue = remember { ConcurrentLinkedQueue<Captured>() }
     var web by remember { mutableStateOf<WebView?>(null) }
+    /** 这台 WebView 当前加载的是哪个目标；[startUrl] 或 [referer] 变了才重新加载。 */
+    var loadedFrom by remember { mutableStateOf("") }
     // 从「站点」入口进来只是为了登录，此时没有正在放的片子，接住的地址无处可交
     val playing by vm.playing.collectAsState()
 
-    BackHandler(onBack = onClose)
+    // 浏览器自己的历史优先：页面里点进了一层解析页，返回键该先退那一层。
+    // 原来这里无条件 onClose —— 用户按返回是想回到刚才那页，结果整扇门被关上、
+    // 会话页也没了，得从「播放源管理」重新进。
+    BackHandler(enabled = true) {
+        val wv = web
+        if (wv != null && wv.canGoBack()) wv.goBack() else onClose()
+    }
 
     // shouldInterceptRequest 在 WebView 自己的线程上回调，跨到主线程只能靠轮询这份队列
     LaunchedEffect(queue) {
@@ -108,7 +116,12 @@ fun SiteBrowserScreen(
                 // 按到达顺序盖序号，越新越大 —— 界面靠它认「最新接到的那条」
                 val stamped = drained.map { it.copy(seq = seq++) }
                 totalSeen += stamped.size
-                links = (links + stamped).distinctBy { it.url }.takeLast(MaxCapturedLinks)
+                // 同一条地址再看一次时，留**后面**那一份的 Referer / Cookie。
+                // 原来 distinctBy 认第一份：签名页给的地址常常同一毫秒问两次，第一次的
+                // Referer 是旧解析页的 —— 拿那份去交给播放器就是 404，而屏幕上看起来一切正常。
+                links = (links.filterNot { n -> stamped.any { it.url == n.url } } + stamped)
+                    .distinctBy { it.url }
+                    .takeLast(MaxCapturedLinks)
             }
             delay(400)
         }
@@ -148,7 +161,8 @@ fun SiteBrowserScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
-                Modifier.size(32.dp).clip(CircleShape).background(T.Surface2)
+                // 这颗是这一页唯一的出口，32dp 太小 —— 而且它旁边就是状态栏的边
+                Modifier.size(44.dp).clip(CircleShape).background(T.Surface2)
                     .clickable(onClick = onClose),
                 contentAlignment = Alignment.Center,
             ) {
@@ -211,9 +225,25 @@ fun SiteBrowserScreen(
                         }
                     }
                     web = this
+                    loadedFrom = "$startUrl|" + (referer ?: "")
                     // 源站的解析端按来源域名放行，不带 Referer 会被当成陌生域名拒掉
                     if (referer.isNullOrBlank()) loadUrl(startUrl)
                     else loadUrl(startUrl, mapOf("Referer" to referer))
+                }
+            },
+            // 换了目标却不重新加载：这一页挂着同一套 composable，只是 startUrl 变了
+            // （从另一部片的「站点页取链」进来），factory 不会再跑一次。
+            // 于是屏上显示的是上一部片的站点页面，接住的地址也是它的 —— 挑一条交出去，
+            // 播的是完全不相干的一部。
+            update = { wv ->
+                val now = "$startUrl|" + (referer ?: "")
+                if (loadedFrom != now) {
+                    loadedFrom = now
+                    links = emptyList()
+                    totalSeen = 0
+                    title = label
+                    if (referer.isNullOrBlank()) wv.loadUrl(startUrl)
+                    else wv.loadUrl(startUrl, mapOf("Referer" to referer))
                 }
             },
             modifier = Modifier.weight(1f).fillMaxWidth(),

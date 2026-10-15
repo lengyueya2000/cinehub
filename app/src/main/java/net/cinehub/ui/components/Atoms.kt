@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -149,9 +150,18 @@ fun SectionHead(
         if (trailing != null) {
             Text(
                 trailing,
-                color = T.TextFaint,
+                // 有 onTrailing 时这一句是**唯一的入口**，那它就不能是最淡的一档色、
+                // 也不能是一行刚好套住文字的点：淡到看不见 + 点不准，等于入口不存在。
+                color = if (onTrailing != null) T.TextDim else T.TextFaint,
                 fontSize = Fs.xs,
-                modifier = Modifier.clickable(enabled = onTrailing != null) { onTrailing?.invoke() },
+                modifier = Modifier
+                    .then(
+                        if (onTrailing != null)
+                            Modifier.heightIn(min = 44.dp).clip(R.sm)
+                                .padding(horizontal = Sp.s2)
+                        else Modifier
+                    )
+                    .clickable(enabled = onTrailing != null) { onTrailing?.invoke() },
             )
         }
     }

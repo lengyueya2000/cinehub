@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -193,7 +194,10 @@ fun HomeScreen(
                             color = T.Src500,
                             fontSize = Fs.sm,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clickable(onClick = onOpenSources),
+                            // 这是这一屏唯一的出路，得点得中
+                            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp)
+                                .clickable(onClick = onOpenSources)
+                                .padding(vertical = 10.dp),
                         )
                     }
                 }

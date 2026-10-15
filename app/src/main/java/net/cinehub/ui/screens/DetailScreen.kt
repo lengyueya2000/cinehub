@@ -46,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -71,6 +72,7 @@ import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.clock
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.components.ConfirmDialog
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
 import net.cinehub.ui.components.Spacer16
@@ -102,6 +104,9 @@ fun DetailScreen(
 
     var lineIdx by remember { mutableIntStateOf(0) }
     var epIdx by remember { mutableIntStateOf(0) }
+    // 长按那颗下载键是「把这一条连文件一起删掉」—— 一记误触就没了，得先问一句。
+    // （这里以前是就地删：和缓存页、收藏页的规矩也不一致，那两处都是过一道确认。）
+    var confirmDrop by remember { mutableStateOf<DownloadTask?>(null) }
 
     val d = detail
     if (d == null) {
@@ -217,7 +222,10 @@ fun DetailScreen(
                                 else -> cache(ep)
                             }
                         }
-                    } ?: ActionTile("缓存", Icons.Outlined.Download, false, Modifier.weight(1f)) {}
+                    } ?: ActionTile(
+                        // 这一条线路没给出分集：这颗格子不能长得和能按的时候一模一样。
+                        "缓存", Icons.Outlined.Download, false, Modifier.weight(1f), enabled = false,
+                    ) {}
                     ActionTile("分享", Icons.Outlined.Share, false, Modifier.weight(1f)) { doShare() }
                     ActionTile("在豆瓣看评分", Icons.Filled.MoreVert, false, Modifier.weight(1f)) { openDouban() }
                 }
@@ -392,7 +400,7 @@ fun DetailScreen(
                                 else -> curEp?.let { cache(it) }
                             }
                         },
-                        onLongClick = { curTask?.let { vm.deleteDownload(it.id) } },
+                        onLongClick = { curTask?.let { confirmDrop = it } },
                     ),
                 contentAlignment = Alignment.Center,
             ) {
@@ -406,24 +414,61 @@ fun DetailScreen(
             Spacer12()
             Row(
                 Modifier.weight(1f).height(46.dp).clip(R.md)
-                    .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
-                    .clickable { curEp?.let { onPlay(sid, d.media, it) } },
+                    .then(
+                        // 这一条线路一个分集都没给时不能还涂成能播的样子：那颗键亮着、
+                        // 写着「播放 第 1 集」，按下去什么都不发生 —— 而第 1 集并不存在。
+                        if (curEp == null) Modifier.background(T.Surface2)
+                        else Modifier.background(
+                            Brush.verticalGradient(listOf(T.Play400, T.Play500))
+                        )
+                    )
+                    .clickable(enabled = curEp != null) { curEp?.let { onPlay(sid, d.media, it) } },
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                Icon(
+                    Icons.Filled.PlayArrow,
+                    null,
+                    tint = if (curEp == null) T.TextFaint else Color.White,
+                    modifier = Modifier.size(18.dp),
+                )
                 Spacer8()
                 Text(
                     // 上次没看完这一集就把话头递回去，看完了就正常「播放 第N集」
-                    if (resumeEp != null && curEp != null && resumeEp.episodeIndex == curEp.index)
-                        "继续播放 ${curEp.name} · ${clock(resumeEp.positionSec)}"
-                    else "播放 ${curEp?.name ?: "第 1 集"}",
-                    color = Color.White,
+                    when {
+                        curEp == null -> "这一条线路没有给出分集"
+                        resumeEp != null && resumeEp.episodeIndex == curEp.index ->
+                            "继续播放 ${curEp.name} · ${clock(resumeEp.positionSec)}"
+                        else -> "播放 ${curEp.name}"
+                    },
+                    color = if (curEp == null) T.TextFaint else Color.White,
                     fontSize = Fs.body,
                     fontWeight = FontWeight.Bold,
                 )
             }
         }
+
+        confirmDrop?.let { victim ->
+            ConfirmDialog(
+                title = "删掉这条缓存？",
+                body = "「${victim.mediaTitle} · ${victim.episodeName}」这条记录，" +
+                    (if (victim.status == DownloadStatus.Done)
+                        "已经下好的 ${fmtBytesLocal(victim.bytesDone)} 会一起没掉，重新缓存得从头再取。"
+                    else "已经下载的部分也会删掉。"),
+                confirm = "删除",
+                onConfirm = { vm.deleteDownload(victim.id); confirmDrop = null },
+                onDismiss = { confirmDrop = null },
+            )
+        }
+    }
+}
+
+private fun fmtBytesLocal(b: Long): String {
+    val tenthsMb = b * 10 / (1L shl 20)
+    return when {
+        b >= 1L shl 30 -> "%.1f GB".format(b / 1073741824.0)
+        b >= 1L shl 20 -> "${tenthsMb / 10}.${tenthsMb % 10} MB"
+        else -> "%.0f KB".format(b / 1024.0)
     }
 }
 
@@ -534,26 +579,37 @@ private fun ActionTile(
     icon: ImageVector,
     active: Boolean,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Column(
         modifier.height(60.dp).clip(R.md)
             .background(if (active) T.Play500.copy(alpha = .09f) else T.Surface2)
             .border(1.dp, if (active) T.Play500.copy(alpha = .32f) else T.Border, R.md)
-            .clickable(onClick = onClick),
+            // enabled 要落到外观上：一个按下去什么也不做、看起来却随时能按的格子，
+            // 比一个明写着「现在不行」的格子更让人反复试。
+            .clickable(enabled = enabled, onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             icon,
             null,
-            tint = if (active) T.Play400 else T.TextDim,
+            tint = when {
+                !enabled -> T.TextFaint
+                active -> T.Play400
+                else -> T.TextDim
+            },
             modifier = Modifier.size(19.dp),
         )
         Spacer4()
         Text(
             label,
-            color = if (active) T.Play400 else T.TextDim,
+            color = when {
+                !enabled -> T.TextFaint
+                active -> T.Play400
+                else -> T.TextDim
+            },
             fontSize = Fs.xxs,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
