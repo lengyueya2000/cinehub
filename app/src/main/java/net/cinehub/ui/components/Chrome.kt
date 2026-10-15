@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
@@ -32,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import net.cinehub.data.model.DoubanItem
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
@@ -272,5 +274,51 @@ fun UnreadableNotice(what: String) {
         lineHeight = Fs.xxs * 1.6f,
         modifier = Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s1),
     )
+}
+
+/**
+ * 「豆瓣有这一部、手上的源对不上」那条贴在底部的说明。片库和首页共用。
+ *
+ * [why] 必须是 ViewModel 里 openFromDouban 现算出来的那一句 —— 「源里真没有」
+ * 「连上的源里没同名」「同名有但对不上年份」是三种不同的事，写成一句「找不到」
+ * 就等于拿应用的失败替源作保。这里只负责摆出来，并把去豆瓣那条路递过去。
+ */
+@Composable
+fun DoubanMissBanner(
+    item: DoubanItem,
+    why: String,
+    enabledSources: Int,
+    onOpenDoubanPage: (String) -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier.fillMaxWidth().padding(Sp.s4).clip(R.lg).background(T.Surface2)
+            .border(1.dp, T.Border, R.lg).padding(Sp.s3),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                "《${item.title}》${item.year?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""} 豆瓣有，$why",
+                color = T.Text,
+                fontSize = Fs.sm,
+            )
+            Text(
+                "在 $enabledSources 个启用的源里搜过 —— 可能是源里真没有，也可能只是片名写法不一样",
+                color = T.TextFaint,
+                fontSize = Fs.xxs,
+            )
+        }
+        Spacer8()
+        Row(
+            Modifier.height(44.dp).clip(R.full).background(T.Surface).border(1.dp, T.Border, R.full)
+                .clickable { onOpenDoubanPage(item.url) }.padding(horizontal = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) { Text("去豆瓣看", color = T.Text, fontSize = Fs.xs) }
+        Box(
+            Modifier.size(44.dp).clip(CircleShape).clickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) { Text("×", color = T.TextDim, fontSize = Fs.body) }
+    }
 }
 

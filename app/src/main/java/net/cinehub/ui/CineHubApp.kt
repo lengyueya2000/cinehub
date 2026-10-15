@@ -183,7 +183,8 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         // 从首页那颗搜索图标进来是「新开一趟」，先擦干净；
                         // 从详情页按返回回到搜索页则不擦 —— 那一屏结果本来就是用户搜出来的。
                         onOpenSearch = { vm.resetSearch(); go(Route.Search) },
-                        onOpenSources = { go(Route.Sources) },
+                        // 长按一张海报 = 去看豆瓣自己那一页（源里对不上时的出路）
+                        onOpenDoubanPage = { url -> openExternal(url) },
                     )
 
                     is Route.Search -> SearchScreen(

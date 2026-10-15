@@ -8,12 +8,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
-import net.cinehub.data.HomeRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
@@ -48,7 +46,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val mediaRepo = MediaRepository(sourceRepo)
     private val watchRepo = WatchRepository(app)
     private val doubanRepo = DoubanRepository(app)
-    private val homeRepo = HomeRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
 
     /**
@@ -89,7 +86,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 豆瓣榜单 ----------
 
-    private val _doubanChart = MutableStateFlow(DoubanChart.MOVIE.first())
+    /**
+     * 片库当前显示的那张榜。默认落在「剧集 · 热门」，和首页那一片内容同一个出处 ——
+     * 两个 Tab 冷启动看到的是同一批片，切榜只影响片库自己。
+     */
+    private val _doubanChart = MutableStateFlow(DoubanChart.TV.first())
     val doubanChart: StateFlow<DoubanChart> = _doubanChart.asStateFlow()
 
     private val _doubanItems = MutableStateFlow<List<DoubanItem>>(emptyList())
@@ -124,16 +125,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val checking: StateFlow<Boolean> = _checking.asStateFlow()
 
     // ---------- 首页 ----------
-    private val _home = MutableStateFlow<List<Media>>(emptyList())
-    val home: StateFlow<List<Media>> = _home.asStateFlow()
 
-    /** 这份首页内容是几点取回来的；0 = 还没有快照。 */
+    /**
+     * 首页那一片内容：豆瓣「剧集 · 热门」这一张榜。
+     *
+     * 它是片库状态之外**另立的一份**，不复用 [_doubanItems] —— 那个跟着片库的选榜走，
+     * 用户在片库切到「美剧」就把首页也换了脸，而首页只有一个出处。
+     */
+    private val _home = MutableStateFlow<List<DoubanItem>>(emptyList())
+    val home: StateFlow<List<DoubanItem>> = _home.asStateFlow()
+
+    /** 这份榜单是几点取回来的；0 = 还没有。 */
     private val _homeAt = MutableStateFlow(0L)
     val homeAt: StateFlow<Long> = _homeAt.asStateFlow()
-
-    /** 这一页内容来自哪个源（标题上要说它）。 */
-    private val _homeSource = MutableStateFlow<String?>(null)
-    val homeSource: StateFlow<String?> = _homeSource.asStateFlow()
 
     private val _homeLoading = MutableStateFlow(false)
     val homeLoading: StateFlow<Boolean> = _homeLoading.asStateFlow()
@@ -294,8 +298,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sourceRepo.sources.collect { _sources.value = it }
         }
         refreshHealth()
-        // 首页那一份不在这里取：什么时候该重新拉，判据是「这一页是用哪套源顺序拉回来的」，
-        // 而只有正在显示首页的那一页知道自己该不该重拉 —— 交给 HomeScreen 驱动。
+        // 首页那一份不在这里取：和片库一样，只在真的显示这一屏时才敲豆瓣的门 ——
+        // 由 HomeScreen 那边驱动，省得用户直接进「我的」也白取一趟榜单。
     }
 
     // ---------- 源管理 ----------
@@ -387,7 +391,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun restoreDefaultSources(onDone: (Int) -> Unit) = viewModelScope.launch {
         val n = sourceRepo.restoreDefaults()
         refreshHealth(true)
-        loadHome()
         onDone(n)
     }
 
@@ -433,7 +436,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun saveSource(cfg: SourceConfig) = viewModelScope.launch {
         sourceRepo.upsert(cfg)
         refreshHealth(false)
-        loadHome()
     }
 
     private fun buildConfig(
@@ -469,12 +471,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 首页 ----------
 
+    /** 首页固定用这一张榜：豆瓣的「剧集 · 热门」。 */
+    private val homeChart = DoubanChart.TV.first()
+
     /**
      * 同一时刻只让一个首页加载在跑。
      *
-     * 进首页会调一次（[HomeScreen] 按源指纹驱动），存新源、补回内置源又各调一次 ——
-     * 并发跑就是同时敲站点两遍、两份快照互相覆盖，谁后落地谁说了算。
-     * 后发起的那次把前一次顶掉：源列表都变了，上一次拉回来的内容已经是为旧的一套拉的。
+     * 进首页调一次（[HomeScreen] 驱动），那一栏的手动刷新再调一次 —— 并发跑就是同时敲
+     * 豆瓣两遍、两份结果互相覆盖，谁后落地谁说了算。后发起的那次把前一次顶掉。
      */
     private var homeJob: Job? = null
 
@@ -482,47 +486,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var homeGen = 0
 
     /**
-     * 首页那一页。
+     * 首页那一页：豆瓣「剧集 · 热门」。
      *
-     * 三件事一起做：
-     * ① 盘上有旧的就先上屏，哪怕已经过期 —— 冷启动对着空白页转圈，而失败那句
-     *    「下面还是上次取回的那一页」会对着一片空白说出来，等于骗人；
-     * ② 只跑一次，见 [homeJob]；
-     * ③ 转圈标记放在 finally 里 —— 取的过程抛异常时不能把它留在屏上。
+     * 盘上有旧的就先上屏，哪怕它是不知多久以前存的 —— 冷启动对着空白页转圈，而失败那句
+     * 「下面还是上次取回的那一页」会对着一片空白说出来，等于骗人。
+     * 没有「12 小时内不重取」这一说了：原来那一条是为了别每次进首页都重敲每个源的门，
+     * 而现在只剩豆瓣一个出处，进来取一次和片库取一次是一个代价。
      */
     fun loadHome(force: Boolean = false) {
+        if (_home.value.isEmpty()) doubanRepo.cached(homeChart.id)?.let {
+            _home.value = it.items
+            _homeAt.value = it.at
+        }
+        // 正在取的时候不排队重取：手动那颗按钮自己会变灰，这里是挡住别处同时进来的第二笔
+        if (!force && homeJob?.isActive == true) return
         val mine = ++homeGen
         homeJob?.cancel()
+        _homeLoading.value = true
         homeJob = viewModelScope.launch {
             try {
-                // 先等落盘那份读完：不等就会把「还没读到」当成「没有快照」，白敲一次站点
-                homeRepo.ready.first { it }
-                // 指纹按启用源的 id:priority 现算。读 _sources 那份内存值不行 ——
-                // 冷启动那一刻它可能还是空的，指纹就成了空串，等于每次都重拉
-                val active = sourceRepo.active()
-                val fp = active.joinToString("|") { "${it.id}:${it.priority}" }
-                val snap = homeRepo.snapshot()
-                if (snap != null && _home.value.isEmpty()) {
-                    _home.value = snap.items.map { it.toMedia() }
-                    _homeAt.value = snap.at
-                    _homeSource.value = snap.sourceId
-                }
-                if (!force && snap != null && !homeRepo.staleFor(fp)) return@launch
-                _homeLoading.value = true
-                _homeError.value = null
-                val res = mediaRepo.homeWithSource()
-                // 取空了不能把旧快照冲掉：一次抖动不该让用户对着一个空白首页
-                if (res.items.isNotEmpty()) {
-                    _home.value = res.items
-                    _homeSource.value = res.sourceId
+                val res = quietly { doubanRepo.fetch(homeChart) }
+                if (mine != homeGen) return@launch
+                res.onSuccess { items ->
+                    doubanRepo.put(homeChart, items)
+                    _home.value = items
                     _homeAt.value = System.currentTimeMillis()
-                    homeRepo.save(res.items, res.sourceId, fp)
-                } else {
-                    _homeError.value = if (_home.value.isEmpty()) {
-                        "所有播放源都没有返回内容，请在「播放源管理」里检查"
-                    } else {
-                        "最新一次没刷新成功：所有播放源都没有返回内容（下面还是上次取回的那一页）"
+                    _homeError.value = null
+                }.onFailure {
+                    // 落盘那一份是另一条协程读的，冷启动时可能比这一趟失败还晚到。
+                    // 认一次旧榜再说这句，免得对着空白页报「没取回任何内容」。
+                    if (_home.value.isEmpty()) doubanRepo.cached(homeChart.id)?.let {
+                        _home.value = it.items
+                        _homeAt.value = it.at
                     }
+                    _homeError.value = it.message ?: "没从豆瓣取到内容"
                 }
             } finally {
                 if (mine == homeGen) _homeLoading.value = false
@@ -530,7 +527,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 手动刷新：不管过没过期，现在就去取一次。 */
+    /** 手动刷新：现在就再去取一次。 */
     fun refreshHome() = loadHome(force = true)
 
     // ---------- 搜索 ----------
@@ -692,9 +689,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 按 id 对上最准；id 变了（换源、详情页另开一次）才退到同名，
      * 因为 [Media.key] 是收藏和观看记录的主键，缺了年份就会分裂成两条。
+     *
+     * 首页那一处已经不在这里了：那一份现在装的是豆瓣榜单，没有源 id 也没有条目 id，
+     * 对不上「（源 id + 条目 id）在哪儿见过」这个问题。
      */
     private fun yearKnownFor(sourceId: String, mediaId: String, title: String): String? {
-        _home.value.firstOrNull { it.sourceId == sourceId && it.id == mediaId }?.year?.let { return it }
         _results.value.forEach { agg ->
             agg.availability.firstOrNull { it.sourceId == sourceId && it.item.id == mediaId }
                 ?.item?.year?.let { return it }

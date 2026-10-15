@@ -40,10 +40,10 @@
 -keep class net.cinehub.data.model.** { *; }
 
 # 同一条理由，但这一批不在 data.model 下面，上面那条盖不到：
-# HomeRepository.Snapshot / .Entry 和 DoubanRepository.Snapshot 也是直接
-# encodeToString 落盘的，而且它们的必填字段没有默认值 —— 改名之后解不出来，
+# DoubanRepository.Snapshot（豆瓣榜单）和别处几份直接 encodeToString 落盘的快照也是这样，
+# 而且它们的必填字段没有默认值 —— 改名之后解不出来，
 # 配上 Json { ignoreUnknownKeys = true } 不会抛错，只是静静读成「没有缓存」：
-# 升级一次，首页快照和豆瓣榜全部当没存过，用户看到的是「凭空要重新联网拉一遍」。
+# 升级一次，豆瓣榜和缓存任务清单全部当没存过，用户看到的是「凭空要重新联网拉一遍」。
 # 与其数着类名写，不如直接给所有 @Serializable 兜住 —— 以后新加一份快照不会再漏。
 -if @kotlinx.serialization.Serializable class **
 -keep class <1> { *; }

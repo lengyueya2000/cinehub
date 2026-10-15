@@ -59,6 +59,7 @@ import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.components.ConfirmDialog
+import net.cinehub.ui.components.DoubanMissBanner
 import net.cinehub.ui.components.EmptyState
 import net.cinehub.ui.components.GroupCard
 import net.cinehub.ui.components.HeaderAction
@@ -77,6 +78,10 @@ import net.cinehub.ui.theme.T
  * 换成豆瓣之后这一页才有它自己的价值：先在豆瓣挑片，点一条由影枢拿片名去
  * 接的源里找 —— 找到就进详情页，找不到就明说找不到，并给一条去豆瓣的路。
  *
+ * 首页现在也是豆瓣的（固定「剧集 · 热门」那一张），两边的分工由此定下来：
+ * 首页只摆那一张榜，这一页是换榜的落脚处 —— 电影 11 张、剧集 7 张都在这儿切。
+ * 两边的状态各走各的（首页那份在 [AppViewModel] 里另立一路），切榜不会把首页换了脸。
+ *
  * 豆瓣只读公开榜单接口，不登录、不带凭证；它哪天收紧了，这里会如实写原因。
  */
 @Composable
@@ -93,7 +98,7 @@ fun LibraryScreen(
     val resolving by vm.doubanResolving.collectAsState()
     val sources by vm.sources.collectAsState()
 
-    var kindMovie by remember { mutableStateOf(true) }
+    var kindMovie by remember { mutableStateOf(chart.kind == "movie") }
     var miss by remember { mutableStateOf<Pair<DoubanItem, String>?>(null) }
     LaunchedEffect(chart) { kindMovie = chart.kind == "movie" }
     LaunchedEffect(Unit) { vm.ensureDouban() }
@@ -186,7 +191,7 @@ fun LibraryScreen(
                     items(list, key = { "${it.id}-${it.rank}" }) { d ->
                         PosterCard(
                             title = d.title,
-                            subtitle = doubanLine(d),
+                            subtitle = d.displayLine,
                             cover = d.cover,
                             rank = d.rank.takeIf { n -> n > 0 },
                             badge = if (resolving == d.id) "找片中" else null,
@@ -205,36 +210,16 @@ fun LibraryScreen(
         }
 
         // 豆瓣有这部、手上的源对不上 —— 如实说完对不上的到底是哪一种，再把去豆瓣的路递过去。
+        // 这一条首页也在用，实现挪到了 components/Chrome.kt。
         miss?.let { (m, why) ->
-            Row(
-                Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                    .padding(Sp.s4).clip(R.lg).background(T.Surface2).border(1.dp, T.Border, R.lg)
-                    .padding(Sp.s3),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "《${m.title}》${m.year?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""} 豆瓣有，$why",
-                        color = T.Text,
-                        fontSize = Fs.sm,
-                    )
-                    Text(
-                        "在 $enabledSources 个启用的源里搜过 —— 可能是源里真没有，也可能只是片名写法不一样",
-                        color = T.TextFaint,
-                        fontSize = Fs.xxs,
-                    )
-                }
-                Spacer8()
-                Row(
-                    Modifier.height(30.dp).clip(R.full).background(T.Surface).border(1.dp, T.Border, R.full)
-                        .clickable { onOpenDoubanPage(m.url) }.padding(horizontal = 11.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) { Text("去豆瓣看", color = T.Text, fontSize = Fs.xs) }
-                Box(
-                    Modifier.size(30.dp).clip(CircleShape).clickable { miss = null },
-                    contentAlignment = Alignment.Center,
-                ) { Text("×", color = T.TextDim, fontSize = Fs.body) }
-            }
+            DoubanMissBanner(
+                item = m,
+                why = why,
+                enabledSources = enabledSources,
+                onOpenDoubanPage = onOpenDoubanPage,
+                onDismiss = { miss = null },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
     }
 }
@@ -246,10 +231,6 @@ private fun CenterNote(text: String) {
         contentAlignment = Alignment.Center,
     ) { Text(text, color = T.TextDim, fontSize = Fs.sm) }
 }
-
-/** 卡片副标题：先给豆瓣评分，没有分再给类型 · 地区。两个都空就留空。 */
-private fun doubanLine(d: DoubanItem): String? =
-    (if (d.rate.isNullOrBlank()) d.whereFrom else "豆瓣 ${d.rate}").takeIf { it.isNotBlank() }
 
 @Composable
 private fun Chip(text: String, active: Boolean, onClick: () -> Unit) {

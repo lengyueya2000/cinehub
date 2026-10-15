@@ -28,6 +28,14 @@ data class DoubanItem(
             kinds.take(2).joinToString("/"),
             regions.take(2).joinToString("/"),
         ).filter { it.isNotBlank() }.joinToString(" · ")
+
+    /**
+     * 海报下面那一行：有分先给分，没分给类型 · 地区，两个都没有就留空。
+     *
+     * 首页和片库同一张卡片要说同一句话，规则放在这儿，免得两边各写一份然后慢慢说得不一样。
+     */
+    val displayLine: String?
+        get() = (if (rate.isNullOrBlank()) whereFrom else "豆瓣 $rate").takeIf { it.isNotBlank() }
 }
 
 /**

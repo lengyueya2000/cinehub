@@ -161,28 +161,6 @@ class MediaRepository(private val sources: SourceRepository) {
         )
     }
 
-    /** [homeWithSource] 的两部分：内容，和它是哪个源给的 —— 首页标题要说这个名字。 */
-    data class HomeFeed(val items: List<Media>, val sourceId: String)
-
-    /**
-     * 首页 / 片库那一页：取优先级最高的、真给了内容的那个源的那一页。
-     *
-     * 之前 logic 只从一个源取，导致「片库」整页都空着、且聚合不出别的源。
-     * 现在按优先级依次试，至少把命中的那一个铺满，并把它是谁带回去
-     * ——「均来自〈源名〉」这句话得有依据。
-     */
-    suspend fun homeWithSource(): HomeFeed = withContext(Dispatchers.IO) {
-        coroutineScope {
-            val active = sources.active()
-            for (cfg in active) {
-                // 同样不按健康度跳过：探根路径失败的源照样可能给出内容，取不到自然会落到下一个
-                val list = quietly { SourceAdapters.create(cfg).browse(1) }.getOrNull().orEmpty()
-                if (list.isNotEmpty()) return@coroutineScope HomeFeed(list, cfg.id)
-            }
-            HomeFeed(emptyList(), "")
-        }
-    }
-
     suspend fun detail(cfg: SourceConfig, id: String): MediaDetail =
         withContext(Dispatchers.IO) { SourceAdapters.create(cfg).detail(id) }
 
