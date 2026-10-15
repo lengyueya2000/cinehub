@@ -23,13 +23,11 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.GridView
@@ -147,14 +145,6 @@ fun HomeScreen(
                     Icon(Icons.Filled.Search, null, tint = T.TextFaint, modifier = Modifier.size(14.dp))
                     Spacer8()
                     Text("搜索影片、演员、播放源", color = T.TextFaint, fontSize = Fs.sm)
-                }
-                Spacer8()
-                Box(
-                    Modifier.size(36.dp).clip(CircleShape).background(T.Surface2)
-                        .clickable(onClick = onOpenSources),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(Icons.Filled.Settings, null, tint = T.TextDim, modifier = Modifier.size(17.dp))
                 }
             }
         }
