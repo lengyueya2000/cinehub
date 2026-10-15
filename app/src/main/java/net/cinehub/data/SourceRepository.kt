@@ -171,11 +171,20 @@ object Seed {
             tags = listOf("1080P", "AI 找片"),
         ),
         SourceConfig(
+            id = "hqvod",
+            name = "高清点播",
+            baseUrl = "https://www.hqvod.com",
+            kind = net.cinehub.data.model.SourceKind.Html,
+            priority = 4,
+            tags = listOf("片库全", "地址要问解析站"),
+            html = net.cinehub.data.source.DefaultRules.hq,
+        ),
+        SourceConfig(
             id = "demo_m3u",
             name = "演示源",
             baseUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
             kind = net.cinehub.data.model.SourceKind.M3u,
-            priority = 4,
+            priority = 5,
             tags = listOf("公开测试流", "可验证播放"),
         ),
     )

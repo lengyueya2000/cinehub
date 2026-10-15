@@ -5,6 +5,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -103,20 +104,34 @@ object Http {
         readTimeout(timeoutSec, TimeUnit.SECONDS)
             .callTimeout(timeoutSec * 3, TimeUnit.SECONDS)
 
+    /**
+     * 一条请求的头：UA 由这里统一给，调用方只补站点真正要看的那几个头。
+     *
+     * `[k, v]` 用 `header()` 而不是 `addHeader()`：用户在源配置里填的凭证要覆盖同名默认头，
+     * 发两颗 Cookie 出去等于把凭证抄给下一个能读日志的东西。
+     *
+     * Accept-Language 没有放在这里：接口型源（懂片帝AI 那种）一直是「UA + 自己那几个头」的形态，
+     * 一个站能用、另一个站不能用的差别往往就在头集合上，不顺手改已经跑通的那几路。
+     */
+    private fun builder(url: String, referer: String?, headers: Map<String, String>): Request.Builder =
+        Request.Builder()
+            .url(url)
+            .header("User-Agent", UA)
+            .apply { referer?.let { header("Referer", it) } }
+            .apply { headers.forEach { (k, v) -> header(k, v) } }
+
+    /** 浏览器导航页面时会发的那组头里，站点真正会看的就是 Accept-Language 这一条。 */
+    private const val ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
+
     suspend fun get(
         url: String,
         referer: String? = null,
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
     ): String = withContext(Dispatchers.IO) {
-        val b = Request.Builder()
-            .url(url)
-            .header("User-Agent", UA)
-            .header("Accept-Language", "zh-CN,zh;q=0.9")
-        referer?.let { b.header("Referer", it) }
-        headers.forEach { (k, v) -> b.header(k, v) }
         client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(b.build()).await().use { r ->
+            .newCall(builder(url, referer, headers).header("Accept-Language", ACCEPT_LANGUAGE).build())
+            .await().use { r ->
                 val body = r.bodyText()
                 if (!r.isSuccessful) error(failureReason(r.code, body))
                 body.ifBlank { error("空响应") }
@@ -135,20 +150,51 @@ object Http {
         referer: String? = null,
         timeoutSec: Long = 20,
     ): ResponseBody = withContext(Dispatchers.IO) {
-        val b = Request.Builder().url(url)
-        b.header("User-Agent", UA)
-        referer?.let { b.header("Referer", it) }
-        headers.forEach { (k, v) -> b.header(k, v) }
         client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(b.build()).await().use { r ->
+            .newCall(builder(url, referer, headers).build()).await().use { r ->
                 val body = r.bodyText()
                 if (!r.isSuccessful) error(failureReason(r.code, body))
                 ResponseBody(
                     body = body.ifBlank { error("空响应") },
-                    setCookie = r.headers("Set-Cookie").joinToString("; ") {
-                        it.substringBefore(';')
-                    }.takeIf { it.isNotBlank() },
+                    setCookie = setCookieOf(r),
                 )
+            }
+    }
+
+    /**
+     * 取一页，状态码与 Set-Cookie 一起带回，**非 2xx 不抛**。
+     *
+     * [getWithHeaders] 一到非 2xx 就抛，等于把「这张错误页也带着 cookie」整件事丢掉。
+     * 而有些站的会话恰恰是从一张错误页开始的：实测 高清点播 的播放页会先发回 403，
+     * 正文只有 132 字节、一句 `window.location.href = 同一个地址`，同时 Set-Cookie 落下会话 ——
+     * 浏览器是「重走一次并带上那颗 cookie」，第二次就一直是 200。
+     * 要复现这个动作就得看得见状态码、还得读得到那张 403 页的 cookie，所以单独开这一条。
+     */
+    suspend fun getKeepStatus(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        referer: String? = null,
+        timeoutSec: Long = 20,
+    ): ResponseBody = withContext(Dispatchers.IO) {
+        client.newBuilder().withBudget(timeoutSec).build()
+            .newCall(builder(url, referer, headers).header("Accept-Language", ACCEPT_LANGUAGE).build())
+            .await().use { r ->
+                ResponseBody(body = r.bodyText(), status = r.code, setCookie = setCookieOf(r))
+            }
+    }
+
+    /** POST 一份表单；状态码与 Set-Cookie 一起带回（解析站那类接口收的是表单而不是 JSON）。 */
+    suspend fun postForm(
+        url: String,
+        form: Map<String, String>,
+        headers: Map<String, String> = emptyMap(),
+        timeoutSec: Long = 20,
+    ): ResponseBody = withContext(Dispatchers.IO) {
+        val body = FormBody.Builder().apply { form.forEach { (k, v) -> add(k, v) } }.build()
+        val b = builder(url, headers["Referer"], headers).post(body)
+        client.newBuilder().withBudget(timeoutSec).build()
+            .newCall(b.build()).await().use { r ->
+                ResponseBody(body = r.bodyText(), status = r.code, setCookie = setCookieOf(r))
             }
     }
 
@@ -160,21 +206,23 @@ object Http {
         timeoutSec: Long = 20,
     ): ResponseBody = withContext(Dispatchers.IO) {
         val mediaType = "application/json; charset=utf-8".toMediaType()
-        val b = Request.Builder().url(url).header("User-Agent", UA).post(json.toRequestBody(mediaType))
-        headers.forEach { (k, v) -> b.header(k, v) }
+        val b = builder(url, headers["Referer"], headers).post(json.toRequestBody(mediaType))
         client.newBuilder().withBudget(timeoutSec).build()
             .newCall(b.build()).await().use { r ->
                 ResponseBody(
                     body = r.bodyText(),
                     status = r.code,
-                    setCookie = r.headers("Set-Cookie").joinToString("; ") {
-                        it.substringBefore(';')
-                    }.takeIf { it.isNotBlank() },
+                    setCookie = setCookieOf(r),
                 )
             }
     }
 
-    /** 响应正文 + 服务端下发的会话 Cookie（没有则为 null）。 */
+    /** 服务端这次下发的 cookie（只要 name=value，属性它自己管不着我们）。 */
+    private fun setCookieOf(r: Response): String? = r.headers("Set-Cookie")
+        .joinToString("; ") { it.substringBefore(';') }
+        .takeIf { it.isNotBlank() }
+
+    /** 响应正文 + 状态码 + 服务端下发的会话 Cookie（没有则为 null）。 */
     data class ResponseBody(
         val body: String,
         val status: Int = 200,

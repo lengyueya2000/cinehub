@@ -154,13 +154,15 @@ app/src/main/java/net/cinehub/
 | `Html` | `HtmlAdapter` | 网页解析：按 CSS 选择器抓列表页与详情页，选择器存在 `SourceConfig.html` 里，用户可改 |
 | `AiMovie` | `AiMovieAdapter` | 带签名鉴权的前端应用（如 dongpiandi.ai）。静态页没有内容，必须按站点自己的接口协议取数据：请求要 HMAC 签名、取播放地址要带站点下发的匿名会话。密钥是站点前端公开分发给每一个访客的常量，影枢照同一套协议把请求算出来发过去 |
 
-### 内置的三个源
+### 内置的五个源
 
 | 优先级 | 名称 | 地址 | 类型 | 说明 |
 |---|---|---|---|---|
 | 1 | 北觅影视 | `https://v.luttt.com` | 网页解析 | 用户提供。苹果 CMS 模板站，走 `player_aaaa` 直链解析 |
-| 2 | 懂片帝AI | `https://dongpiandi.ai` | 签名接口 | 用户提供。带签名鉴权的前端应用：照它的协议取数据，不按 CSS 选择器抓 |
-| 3 | 演示源 | `https://test-streams.mux.dev/.../x36xhzz.m3u8` | M3U 列表 | 公开测试流，用来验证「本机解码」这条链路真的通 |
+| 2 | 4kku | `https://www.4kku.com` | 网页解析 | 苹果 CMS 的地址规则配 Tailwind 皮：三条线路，分集锚点不带线路标记，按播放地址尾段拆 |
+| 3 | 懂片帝AI | `https://dongpiandi.ai` | 签名接口 | 用户提供。带签名鉴权的前端应用：照它的协议取数据，不按 CSS 选择器抓 |
+| 4 | 高清点播 | `https://www.hqvod.com` | 网页解析 | 片库最全的一条，13 条线路。静态页里没有地址：那串凭据要拿去问它自己的解析站（见下文第 3 节） |
+| 5 | 演示源 | `https://test-streams.mux.dev/.../x36xhzz.m3u8` | M3U 列表 | 公开测试流，用来验证「本机解码」这条链路真的通 |
 
 曾经内置过的 `4kvm.net` 与 `xiguazx.cc` 已撤下（见 `Seed.retiredIds`：老用户列表里的那两条会按 id 清掉，你自己手动加的源不受影响）。撤下的原因分别是：前者对匿名用户根本不给直链、后者接口里根本没有直链（见下文两节）。
 
@@ -187,11 +189,12 @@ var player_aaaa = { "flag":"...", "url":"https://.../index.m3u8", ... }
 ```kotlin
 val resolveMode: String = MODE_NONE            // 默认不解析
 const val MODE_MACCMS_PLAYER = "maccmsPlayer"  // 声明了才去读 player_aaaa
+const val MODE_MACCMS_PARSE = "maccmsParse"    // player_aaaa 给的是凭据，拿去问它自己的解析站
 const val MODE_CLIENT_SCRIPT = "clientScript"  // 地址由站点脚本现算，不解析
 const val MODE_SESSION = "session"             // 只对登录用户开放，要凭证自己填
 ```
 
-只有 `DefaultRules.maccms` / `indexPhp` 声明了 `MODE_MACCMS_PLAYER`，`DefaultRules.k4` 声明 `MODE_CLIENT_SCRIPT`。没配规则的站点留在 `none`。
+只有 `DefaultRules.maccms` / `indexPhp` / `tailwind` 声明了 `MODE_MACCMS_PLAYER`，`DefaultRules.hq` 声明 `MODE_MACCMS_PARSE`，`DefaultRules.k4` 声明 `MODE_CLIENT_SCRIPT`。没配规则的站点留在 `none`。
 
 ### 2. 「拿不到直链」分几种，不是一个可空字符串
 
@@ -213,7 +216,7 @@ const val MODE_SESSION = "session"             // 只对登录用户开放，要
 
 `MaccmsAdapter` 只放行媒体后缀的地址（`.m3u8 .mp4 .mkv .flv .ts .mpd .mov`），所以 `xiguazx.cc` 返回的第三方播放页 URL 永远不会被当作流交给播放器（那只会让 ExoPlayer 抛一个用户看不懂的错）。
 
-### 3. 「4K影视」那一类：直链是站点用 WASM 现算的（已撤下内置）
+### 3. 地址不在 HTML 里的两种站：4K影视 现算签名，高清点播 交给解析站
 
 排查「点了播放没反应」时查清的机制，记录在此以免下次重复踩。4kvm 已不再内置，但这一类站点的判断（`resolveMode = clientScript`）仍然留着：
 
@@ -223,6 +226,15 @@ const val MODE_SESSION = "session"             // 只对登录用户开放，要
 - 即使把地址正确构造出来，服务端仍然回 `{"code":401,"message":"请先登录并开通VIP会员"}`。**所以这个源对匿名用户本来就不给直链**，不是影枢的解析器写错了。
 
 影枢不执行对方的脚本：那是别人的页面逻辑，跑不跑得住全看它哪天改版。应用做的是把成因说清楚（`NeedsClientScript`），并让用户能一键切到能给出直链的源。
+
+内置的**高清点播**（`www.hqvod.com`）是另一形态。它和 4kvm 的区别值得写清楚，因为「读 `player_aaaa`」这条看着通用的路正是在这里断的：
+
+- 它的播放页**有** `player_aaaa`，`encrypt` 还是 `0`，`url` 字段也确实有值 —— 照 `MODE_MACCMS_PLAYER` 读，字段一个都不缺。
+- 但那个值不是地址。一部片 13 条线路逐条实测：`from` 为 `qq` / `youku` 的给的是平台播放页，剩下的 `PK` / `PJ` / `PD` / `lzm3u8` 之类给的全是一串 base64url 样子的凭据（`tMdfce8tdq93oJKE2…`），没有一条以 `http` 开头。
+- 站点自己怎么用这串凭据：`/static/js/player.js` 见 `player_list[from].ps == "1"` 就把线路名改写成 `parse`，于是加载的是 `/static/player/parse.js`（`PA.js`、`PK.js` 这些实测 404 —— 它们从来不被请求）。`parse.js` 明写着那张解析站的 iframe：`?url=<凭据>&next=//<域名><下一集路径>&title=<页面标题第一段>`。iframe 里那颗 344 KB、jsjiami.com.v7 混淆过的脚本把**自己 query string 去掉开头 `url=` 之后的整串**当签名原文，POST 给同站 `player/api.php`；响应的 `url` 还是密文，AES 的 key/iv 由同一次响应下发（各自再套一层 RC4）。
+- `MaccmsParseResolver` 走的就是这条链，`resolveMode = maccmsParse`：MD5 + RC4 + AES-128-CBC 全是 JDK 自带的，没为它加任何依赖。三处容易抄错的地方都拿 node 探针按「中间某集 / 最后一集 / 只有一集的电影」三种页面对过 —— 最难发现的一处是：脚本会把原文里第一个 `.html` 之后全砍掉，剧集因此切在下一集的路径上，而**最后一集和电影**没有东西可砍，`&title=<片名>` 就留在原文里参与签名，少了它恰恰只在这两种页面上签错。解析站的域名也不写死在 APK 里，运行时从 `parse.js` 读（那是个 punycode 中文域名，这类站换域名是常事）。
+- 它的反爬形态记一条，别误判成「源接不进来」：`/bofang/` 那一页会随机先回 403，正文只有一句 `window.location.href = "<同一条地址>"` 并 `Set-Cookie`；带着这份 Cookie 再要同一条地址就是 200（实测同一集不带 cookie 连要两次都是 403，带着就一直 200）。分类页 / 搜索页 / 详情页没有这道题。
+- 还有一条实测到的量：**同一个 IP 连着打十几个请求，站点会整片改回 429**。所以自动重试碰到 403 / 429 / 5xx 这一类「写在整个源上的拒绝」时不再把这个源的剩下线路试完（`StreamResolution.Failed.sourceWide`），直接换源 —— 一是那时换线路只会踩得更深，二是没必要让屏幕上出现 13 条一模一样的原因。
 
 `Http.failureReason()` 同样把状态码翻成人话：`567 → 安全策略拦截`、`403 → 拒绝访问`、`404 → 地址不存在`、`429 → 请求过于频繁`、`5xx → 站点异常 N`。源卡片上的红色标签因此是有信息量的，不是一句「连接失败」了事。
 
@@ -269,7 +281,7 @@ v1.0.4 之前它按「网页解析」接入，但它是带签名鉴权的前端�
   搜不到就明说「豆瓣有这部，接的源里没搜到同名」，并把去豆瓣的路递过去，不拿一部名字相近的片糊上去。
   它哪天收紧这些接口，界面就如实写原因，不会装成「这个榜没片」。
 
-应用本身不托管、不存储、不分发任何视频内容，也不内置任何资源站：仓库里带的三个源地址都是用户提供的公开站点，或公开测试流（`test-streams.mux.dev`）。加什么源、看什么内容，由使用者自己决定。
+应用本身不托管、不存储、不分发任何视频内容，也不内置任何资源站：仓库里带的五个源地址都是用户提供的公开站点，或公开测试流（`test-streams.mux.dev`）。加什么源、看什么内容，由使用者自己决定。
 
 ---
 

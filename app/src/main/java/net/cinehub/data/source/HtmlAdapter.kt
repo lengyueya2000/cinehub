@@ -1,8 +1,5 @@
 package net.cinehub.data.source
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonObject
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.HtmlRules
 import net.cinehub.data.model.Media
@@ -25,7 +22,6 @@ import org.jsoup.nodes.Element
 class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
 
     private val rules = config.html ?: DefaultRules.generic
-    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     private fun abs(path: String): String = when {
         path.startsWith("http") -> path
@@ -116,12 +112,17 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         // 分集：同一部剧的多个线路会各有自己的分集锚点
         val epAnchors = doc.select(rules.episodeSelector)
         val byLine = epAnchors.groupBy { it.attr("data-line").ifBlank { it.playLine() ?: "1" } }
+        val tabs = doc.lineTabs()
         val lines = if (byLine.isEmpty()) {
             listOf(PlayLine("默认线路", listOf(Episode("正片", 1, url))))
         } else {
-            byLine.map { (line, anchors) ->
+            byLine.entries.mapIndexed { ordinal, (line, anchors) ->
+                // 第 ordinal 组分集 ↔ 第 ordinal 个线路标签（这套皮就按文档顺序排）。
+                // 标签上写着这一组有几集，所以数量对不上就当没读到：宁可叫「线路 7」，
+                // 也不要拿别人的名字安在这一组头上 —— 那是句看起来更可信的假话。
+                val tab = tabs.getOrNull(ordinal)?.takeIf { it.episodes == null || it.episodes == anchors.size }
                 PlayLine(
-                    name = doc.lineName(line),
+                    name = doc.lineName(line, tab),
                     episodes = anchors.mapIndexed { i, a ->
                         Episode(
                             name = a.text().trim().ifBlank { "第 ${i + 1} 集" },
@@ -167,7 +168,7 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
     /**
      * 解析真实播放地址。
      *
-     * 四条分支各对应一种真实成因，按「先看是不是别人的页面，再看本站怎么取」的顺序判断：
+     * 每条分支各对应一种真实成因，按「先看是不是别人的页面，再看本站怎么取」的顺序判断：
      * 第三方平台的播放页是确定性事实，任何模式下都该如实说明，而不是硬塞给播放器。
      */
     override suspend fun resolveStream(episodeUrl: String): StreamResolution {
@@ -179,72 +180,33 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         // 2. 苹果 CMS 模板：地址写在播放页的 player_aaaa 里
         if (rules.resolveMode == HtmlRules.MODE_MACCMS_PLAYER) {
             val html = Http.get(episodeUrl, referer = config.baseUrl, headers = Http.authHeaders(config))
-            return macPlayerUrl(html)
+            return MacPlayerJson.read(html)?.field("url")?.trim()
+                ?.takeIf { it.startsWith("http") }
                 ?.let { StreamResolution.Ready(it) }
                 ?: StreamResolution.Failed(
                     "播放页里没有 player_aaaa 数据，这个模板可能改版了",
                 )
         }
 
-        // 3. 地址由站点脚本现算（如 4kvm.net 的 WASM 签名）
+        // 3. 苹果 CMS 的另一形态：player_aaaa 里那串不是地址，要拿去问解析站（见 MaccmsParseResolver）
+        if (rules.resolveMode == HtmlRules.MODE_MACCMS_PARSE) {
+            return MaccmsParseResolver.resolve(episodeUrl, config)
+        }
+
+        // 4. 地址由站点脚本现算（如 4kvm.net 的 WASM 签名）
         if (rules.resolveMode == HtmlRules.MODE_CLIENT_SCRIPT) {
             return StreamResolution.NeedsClientScript
         }
 
-        // 4. 直链只对登录用户开放 —— 填用户自己的凭证可能走通
+        // 5. 直链只对登录用户开放 —— 填用户自己的凭证可能走通
         if (rules.resolveMode == HtmlRules.MODE_SESSION) {
             return StreamResolution.NeedsSession
         }
 
-        // 5. 没配规则 —— 如实说规则不足，而不是猜一个原因
+        // 6. 没配规则 —— 如实说规则不足，而不是猜一个原因
         return StreamResolution.Failed(
             "这个源还没有配置直链解析规则，影枢只能拿到它的播放页地址",
         )
-    }
-
-    /**
-     * 苹果 CMS 模板把播放地址写在页面的 `player_aaaa` 里。
-     *
-     * 这是页面自身的公开数据，不是绕过登录；站点若把它藏起来，这里就拿不到。
-     *
-     * 原来用一条 `(\{.*?\})\s*[;<]` 加 DOT_MATCHES_ALL 去抓那段 JSON —— 这是会把
-     * 一个页面变成一场等待的写法：`\s*[;<]` 只要往后出现一次「不像结尾」的片段，
-     * 引擎就要把花括号里的每一个位置重数一遍，页面一大（模板里几十个 script 很常见）
-     * 就是指数级回溯，界面表现为「详情页转圈转到天荒地老」。
-     * 改成从 `player_xxx =` 这个锚点起做一次配对括号扫描：只看它自己那一段，一遍走完。
-     */
-    private fun macPlayerUrl(html: String): String? {
-        val raw = extractPlayerJson(html) ?: return null
-        val obj = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull() ?: return null
-        val url = (obj["url"] as? JsonPrimitive)?.content?.trim().orEmpty()
-        return url.takeIf { it.startsWith("http") }
-    }
-
-    /** 从 `player_<名字> = { … }` 里按配对括号切出那段对象。 */
-    private fun extractPlayerJson(html: String): String? {
-        val anchor = Regex("""player_[A-Za-z0-9_]+\s*=\s*\{""").find(html) ?: return null
-        val open = html.indexOf('{', anchor.range.first)
-        if (open < 0) return null
-        var depth = 0
-        var inString = false
-        var escaped = false
-        for (i in open until html.length) {
-            val c = html[i]
-            when {
-                inString && escaped -> escaped = false
-                inString && c == '\\' -> escaped = true
-                inString && c == '"' -> inString = false
-                !inString && c == '"' -> inString = true
-                !inString && c == '{' -> depth++
-                !inString && c == '}' -> {
-                    depth--
-                    if (depth == 0) return html.substring(open, i + 1)
-                }
-            }
-            // 一坨超过 256 KB 的「脚本」不是站点给播放地址的那份数据，别陪着它耗内存
-            if (i - open > 256_000) return null
-        }
-        return null
     }
 
     /**
@@ -329,14 +291,37 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         return null
     }
 
-    /** 线路名：优先取线路标签，取不到就退回「线路 N」。 */
-    private fun Document.lineName(line: String): String =
+    /**
+     * 线路名：先看锚点自己标了没有，再看按位置对上的标签，都取不到才退回「线路 N」。
+     *
+     * 站点给线路起的名字是「②蓝光」「推荐K」「稳定③」这种，跟地址尾段那个线路号
+     * 没有任何可推的对应关系 —— 只能从页面的标签栏读，或者干脆不猜。
+     */
+    private fun Document.lineName(line: String, tab: LineTab?): String =
         // 这套皮的线路名写在 #source-tabs 的按钮上（data-source="3" → 「TT线路」），
         // 用 ownText 是为了不把图标元素那些空文本一起带进来
         selectFirst("[data-source=$line],[data-sid=$line]")?.ownText()?.trim()
             ?.takeIf { it.isNotBlank() && it.length <= 12 }
+            ?: tab?.name
             ?: selectFirst(".hl-plays-from a[alt],a[alt]")?.attr("alt")?.takeIf { it.isNotBlank() }
             ?: "线路 $line"
+
+    /**
+     * 分集区上方那排线路标签：名字 + 标签上写明的集数（没有集数则为 null）。
+     *
+     * 「/fenlei + /bofang」这套皮（如 www.hqvod.com）把 13 条线路的名字只写在这里，
+     * 分集锚点上不带任何线路属性；标签与下面的分集块按文档顺序一一对应。
+     */
+    private fun Document.lineTabs(): List<LineTab> =
+        select(".anthology-tab a")
+            .mapNotNull { a ->
+                val name = a.ownText().replace('\u00A0', ' ').trim()
+                if (name.isBlank() || name.length > 12) return@mapNotNull null
+                LineTab(name, a.selectFirst(".badge")?.text()?.trim()?.toIntOrNull())
+            }
+
+    /** 一条线路标签：显示名，和它自己声明的集数（用来核对位置对不对得上）。 */
+    private class LineTab(val name: String, val episodes: Int?)
 
     private companion object {
         /** 播放地址尾段的「-线路-集号」；前面那段是站点自己的片 id，不参与。 */
@@ -412,6 +397,30 @@ object DefaultRules {
         detailPath = "/index.php/vod/detail/id/{id}.html",
         episodeSelector = ".stui-content__playlist a, a[href*=/vod/play/]",
         resolveMode = HtmlRules.MODE_MACCMS_PLAYER,
+    )
+
+    /**
+     * 「/fenlei + /xiangqing + /bofang」这一套苹果 CMS 皮（如 www.hqvod.com）。
+     *
+     * 路径规则和上面几套都不一样：分类 /fenlei/{类型}-{页}.html、详情 /xiangqing/{id}.html、
+     * 分集 /bofang/{片id}-{线路}-{集}.html —— 尾段那对数字正是线路号与集号，
+     * [Element.playLine] 按它把 13 条线路拆开（这套皮不给锚点标任何线路属性）。
+     * 搜索页 /sousuo/{词}-------------，末尾那一串横线是模板写死的空条件位。
+     *
+     * 直链走 [HtmlRules.MODE_MACCMS_PLAYER] 的 [MaccmsParseResolver]。这一套皮里
+     * `player_aaaa.url` 那串**不是地址**：一部片 13 条线路没有一条给地址，给的全是一串
+     * base64url 样子的凭据（`from` 是 PK / PJ / PD / lzm3u8 这类线路名，或 qq / youku 那种
+     * 平台页），照读出来塞给播放器只会得到一个看不懂的错。站点自己怎么用它、影枢又怎么跟着走，
+     * 都写在 [MaccmsParseResolver] 的注释里（那条链路 2026-10-15 用 node 探针在三种页面上逐环验过：
+     * 中间某集、最后一集、只有一集的电影）。
+     */
+    val hq = HtmlRules(
+        listPath = "/sousuo/{q}-------------.html",
+        browsePath = "/fenlei/1-{page}.html",
+        itemSelector = "a.public-list-exp",
+        detailPath = "/xiangqing/{id}.html",
+        episodeSelector = "a[href*=/bofang/]",
+        resolveMode = HtmlRules.MODE_MACCMS_PARSE,
     )
 
     /**

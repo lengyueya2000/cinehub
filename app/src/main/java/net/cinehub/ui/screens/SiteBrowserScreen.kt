@@ -1,10 +1,12 @@
 package net.cinehub.ui.screens
 
 import android.annotation.SuppressLint
+import android.graphics.Bitmap
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
@@ -47,7 +49,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.activity.compose.BackHandler
 import kotlinx.coroutines.delay
 import net.cinehub.data.model.StreamUrls
-import net.cinehub.data.net.Http
 import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.theme.Fs
@@ -78,6 +79,8 @@ fun SiteBrowserScreen(
 ) {
     var title by remember { mutableStateOf(label) }
     var progress by remember { mutableIntStateOf(0) }
+    /** 主框架这一轮导航失败的原因；每次开始加载都清空，成功出画面就不该再留着。 */
+    var pageError by remember { mutableStateOf<String?>(null) }
     /**
      * 站点页面请求过的媒体地址，留着让用户自己挑。
      *
@@ -194,6 +197,18 @@ fun SiteBrowserScreen(
             }
         }
 
+        // 页面没出来时得有一句话。这颗 WebView 以前只会黑着：站点拒了、题没过、网络断了，
+        // 屏上都是同一个黑屏，而「黑着」在用户眼里和「卡住了」分不出来 —— 他会一直等。
+        if (pageError != null && links.isEmpty()) {
+            Text(
+                "${pageError} —— 这一页在影枢里没打开。" +
+                    "页面里要是让你登录或点一下播放，做完这一步它自己会重来。",
+                color = T.TextDim,
+                fontSize = Fs.tiny,
+                modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, bottom = Sp.s2),
+            )
+        }
+
         AndroidView(
             factory = { c ->
                 WebView(c).apply {
@@ -203,7 +218,17 @@ fun SiteBrowserScreen(
                     settings.useWideViewPort = true
                     // 站点的播放器要点一下才开始请求地址，这里不替用户设卡
                     settings.mediaPlaybackRequiresUserGesture = false
-                    settings.userAgentString = Http.UA
+                    // UA 用 WebView 自己那一份，只把「我是一颗嵌入式 WebView」这个标记抹掉。
+                    //
+                    // 原来这里写死成 [Http.UA]（给 OkHttp 那种纯 HTTP 客户端用的 Chrome/120 串），
+                    // 而引擎其实是 Chrome/146 —— UA 与引擎指纹不一致，正是按指纹放行那道题
+                    // 最爱判死的一种请求。改成不覆盖之后仍然打不开（同一台模拟器、同一个网络出口，
+                    // 系统浏览器把 高清点播 的页面正常渲染出来了，这颗 WebView 却连首页都是黑的），
+                    // 剩下的差别就是默认 UA 里那段 `; wv`：它明摆着告诉对方「这不是浏览器，
+                    // 是别人 App 里嵌的一颗 WebView」，而 Cloudflare 那一类正是按这一条给分数的。
+                    // 这一页的语义本来就是「按浏览器的方式打开它」，所以这里只去掉这个自报家门的标记，
+                    // 其余原样交给引擎自己。
+                    settings.userAgentString = settings.userAgentString?.replace("; wv", "")
                     CookieManager.getInstance().setAcceptCookie(true)
                     webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(
@@ -213,6 +238,35 @@ fun SiteBrowserScreen(
                             val u = request.url.toString()
                             if (StreamUrls.isMediaUrl(u)) queue.add(capturedOf(u, request))
                             null
+                        }
+
+                        // 每一次重新导航都先把上一轮的错擦掉：站点那道题就是靠「先拒一次、
+                        // 再放行一次」过的（高清点播 的播放页实测如此），
+                        // 留着第一条拒绝信息报「打不开」同样是假话。
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                            pageError = null
+                        }
+
+                        // 主框架被拒时把原因留在屏幕上。原来这一页只会黑着：
+                        // 页面没出来、没有一条地址、也没有一句话，用户只能猜是网断了还是站点不给。
+                        override fun onReceivedHttpError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            errorResponse: WebResourceResponse?,
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                pageError = "这一页回了 HTTP ${errorResponse?.statusCode ?: "?"}"
+                            }
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: android.webkit.WebResourceError?,
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                pageError = error?.description?.toString() ?: "这一页没打开"
+                            }
                         }
                     }
                     webChromeClient = object : WebChromeClient() {

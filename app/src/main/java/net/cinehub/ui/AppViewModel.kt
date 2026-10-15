@@ -923,8 +923,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 往下走时先在**当前这个源**里换线路，线路走完了才换源：换线路不用重取详情（那份
      * `MediaDetail` 就在手上，懂片帝那种连线路包都缓存好了），换源每次都要重新拉一遍详情。
      * 便宜的先试。
+     *
+     * [wholeSource] 是这一条的例外：那个原因属于整个源（地址由站点脚本现算 / 要凭证 / 没配解析规则），
+     * 换线路不会有任何变化，直接跳到下一个源，别把流水写成「换过 13 次」。
      */
-    fun reportPlaybackFailure(reason: String, url: String? = null) {
+    fun reportPlaybackFailure(reason: String, url: String? = null, wholeSource: Boolean = false) {
         val r = round ?: return
         val p = _playing.value ?: return
         if (p.episodeIndex != r.episodeIndex) return
@@ -935,7 +938,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _resumePosition.value.takeIf { it > 0L }?.let { r.anchorSec = it }
         r.accounted = true
         r.tried += Attempt(cand.sourceName, lineNameOf(r), reason)
-        if (nextLine(r)) return
+        // [wholeSource] 时跳过这一段：那个原因写在整个源的规则上（见 [sourceLevel]），
+        // 它的 13 条线路会给出 13 个一模一样的答案，挨个试完只是把流水写成「换过 13 次」。
+        if (!wholeSource && nextLine(r)) return
         if (r.candidates.size > 1) {
             advance(r)
             return
@@ -1207,15 +1212,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (mine != playGen) return@launch
                 _resolving.value = false
 
+                val why = noteOf(res) ?: "这个源给不出可播地址"
+                val page = sitePageFor(cfg, mediaId, episodeIndex, episodeUrl)
                 _playing.value = _playing.value?.copy(
                     streamUrl = (res as? StreamResolution.Ready)?.url,
-                    note = noteOf(res),
-                    sitePageUrl = sitePageFor(cfg, mediaId, episodeIndex, episodeUrl),
+                    note = why,
+                    sitePageUrl = page,
                 )
                 // 拿不到可播地址就是「这个源放不出来这一集」，交给自动换源往下走。
                 // 另开一个协程去汇报：这里正跑在本轮的 playJob 里，就地切换会把它取消掉。
                 if (res !is StreamResolution.Ready) {
-                    reportAndContinue(noteOf(res) ?: "这个源给不出可播地址")
+                    // 例外：**用户自己按下的这一格**，而这个源从规则上就给不出直链
+                    // （地址要由它自己的页面现算）。这种时候把它判给「下一个源」等于把这一格
+                    // 白白扔掉 —— 高清点播实测就是如此：13 条线路全部同一个原因，一路空转，
+                    // 最后从 4kku 播起来，而它自己那一页从没被打开过。
+                    // 所以这里停在这一格，直接把这一集的站点页开给他，让站点把地址算给它自己的播放器。
+                    // 自动换源走到这一格时不走这条路：那是「这个源不行，换一个」，不该顺手开一扇窗。
+                    if (!autoAdvance && siteLinkOnly(res) && page != null) {
+                        _playing.value = _playing.value?.copy(note = siteLinkNote(name))
+                        openSiteBrowser(page, "$name · $mediaTitle $episodeName", cfg?.baseUrl?.let { "$it/" })
+                    } else {
+                        reportAndContinue(why, sourceLevel(res))
+                    }
                 }
             } finally {
                 if (mine == playGen) _resolving.value = false
@@ -1224,14 +1242,43 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 这个「拿不到」是整个源的性质，不是这一条线路的。
+     *
+     * 这几种都在**发出任何请求之前**就定下来了（`resolveMode` 写在源规则里，13 条线路共用一份），
+     * 所以换线路不会有任何变化 —— 该跳的是整个源，而不是把它的线路挨个试一遍再跳。
+     * 反过来，「播放页里没有 player_aaaa」「这条地址不是媒体文件」这类是逐条线路的，照旧一条一报。
+     */
+    /**
+     * 这条原因写在整个源上 —— 自动重试因此不必把这个源剩下的线路挨个试完。
+     *
+     * 两种：规则上就给不出直链（换线路必然还是同一个答案），和对方按 IP/客户端把我们挡下
+     * （限流、拒答 —— 实测 高清点播 被连着打十几个请求会整片回 429，那时换线路只会踩得更深）。
+     */
+    private fun sourceLevel(res: StreamResolution): Boolean =
+        siteLinkOnly(res) || (res is StreamResolution.Failed && res.sourceWide)
+
+    /** 「这个源从规则上就给不出直链」：只有这一种值得停在这一格，把站点页开给用户自己走。 */
+    private fun siteLinkOnly(res: StreamResolution): Boolean = when (res) {
+        is StreamResolution.NeedsClientScript, is StreamResolution.NeedsSession -> true
+        is StreamResolution.Failed -> res.reason.startsWith("这个源还没有配置直链解析规则")
+        else -> false
+    }
+
+    /** 停在「等站点自己的页面把地址算出来」这一格上时，屏幕上该写的那句话。 */
+    private fun siteLinkNote(sourceName: String): String =
+        "「$sourceName」不给直链：这一集的地址要由它自己的页面现算出来。" +
+            "已经替你打开那一页 —— 等页面下面列出接住的地址，挑一条点「播放」，影枢就在本机把它播起来。" +
+            "关掉那一页也不算丢：播放器上那颗「在站点页面里解析」随时能再打开它。"
+
+    /**
      * 起播这一步就地失败，也要把这一轮推下去。
      *
      * 不汇报的话这一轮就停在「正在试第 N 个」不动了 —— 横幅说它在换源，屏上却再没有任何动作，
      * 用户看到的就是「点了没反应」。另开一个协程汇报：这里正跑在本轮的 playJob 里，
      * 就地切源会把自己取消掉，取消掉的那一半又会被当成一次新的失败。
      */
-    private fun reportAndContinue(reason: String) {
-        viewModelScope.launch { reportPlaybackFailure(reason) }
+    private fun reportAndContinue(reason: String, wholeSource: Boolean = false) {
+        viewModelScope.launch { reportPlaybackFailure(reason, wholeSource = wholeSource) }
     }
 
     /**

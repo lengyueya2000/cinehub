@@ -120,6 +120,14 @@ data class HtmlRules(
         const val MODE_MACCMS_PLAYER = "maccmsPlayer"
 
         /**
+         * 苹果 CMS 的另一形态：player_aaaa 里的 url 是一串凭据，要拿去问站点自己的解析站。
+         *
+         * 见 [net.cinehub.data.source.MaccmsParseResolver] —— 签名原文、三个签名值、
+         * 响应里下发的 AES 钥匙，都按站点自己那段脚本的样子复现。
+         */
+        const val MODE_MACCMS_PARSE = "maccmsParse"
+
+        /**
          * 直链由站点自己的页面脚本现算（WASM 签名 / JS 拼地址）。
          */
         const val MODE_CLIENT_SCRIPT = "clientScript"
