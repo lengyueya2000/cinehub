@@ -793,20 +793,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 播放失败自动换源 ----------
 
-    /** 一次尝试：哪个源、为什么没成。 */
-    data class Attempt(val sourceName: String, val reason: String)
+    /** 一次尝试：哪个源的哪条线路、为什么没成。[lineName] 在只有一条线路的源上是 null。 */
+    data class Attempt(val sourceName: String, val lineName: String?, val reason: String)
 
     /**
-     * 这一轮自动换源的样子，播放器照它说话。
+     * 这一轮自动重试的样子，播放器照它说话。
      *
      * 「取链没拿到地址」「播放器报错」「地址通了却 20 秒不出第一帧」对用户是同一句话 ——
-     * 这个源放不出来这一集 —— 所以三条都汇到这里，界面上也只有一种说法。
+     * 这一条线路放不出来这一集 —— 所以三条都汇到这里，界面上也只有一种说法。
+     *
+     * 一格 = 一个「源 · 线路」组合，不是「一个源」。同一个源有两条线路时，
+     * 先把它的第二条试掉再换下一个源：换线路不重取详情（懂片帝的线路包本来就在缓存里），
+     * 换源却每次都要重新拉一遍详情，先试便宜的。
      */
     data class FallbackUi(
-        /** 正在试候选里的第几个（1 起）。 */
+        /** 这是这一轮的第几次尝试（1 起）。 */
         val step: Int,
-        val total: Int,
+        /** 候选里源有几个（线路数走一步才知道一步，所以不报「总共几次」）。 */
+        val sourceCount: Int,
         val tryingSourceName: String,
+        /** 正在试的那条线路叫什么；这个源只有一条线路时为 null。 */
+        val tryingLineName: String?,
         val failures: List<Attempt>,
         /** 候选全试完了：停下说话，不再自己动。 */
         val exhausted: Boolean,
@@ -820,20 +827,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 一轮之内试过些什么。
      *
-     * [anchorSec] 是这一轮的位置锚点。**不能**直接读 [_resumePosition]：换源时媒体源重建会
-     * 先 `player.stop()`，那一刻轮询会把 0 写回去，级联到第三个源时进度就归零了 ——
+     * [anchorSec] 是这一轮的位置锚点。**不能**直接读 [_resumePosition]：换源换线路时媒体源
+     * 重建会先 `player.stop()`，那一刻轮询会把 0 写回去，级联到第三个源时进度就归零了 ——
      * 只有真的听到过 >0 的位置才配更新它。
      *
      * [candidates] 会长大：从首页直接进播放器时手上没有这份跨源列表，
      * 等真的失败了才去别的源里找这一部片（见 [reportPlaybackFailure]）。
+     *
+     * [attemptUrl] 与 [accounted] 是这一轮的认账凭据：`Playing` 上没有线路 id，
+     * 而区分「第 1 条线路失败」和「第 2 条线路失败」的只有那条 `episodeUrl`
+     * （懂片帝是 `aiep:` 的第三段不同，苹果 CMS 与网页解析每条线路各一个地址）。
+     * 迟到的播放器回调说的是上一笔，凭这两条把它挡在外面。
      */
     private class Round(
         val episodeIndex: Int,
         var candidates: List<SourceAvailability>,
         var cursor: Int = 0,
-        val reasons: LinkedHashMap<Int, String> = LinkedHashMap(),
+        /** 当前这个源试到第几条线路。0 = 详情页默认那条。 */
+        var lineCursor: Int = 0,
+        val tried: MutableList<Attempt> = mutableListOf(),
         var anchorSec: Long = 0L,
         var findingSiblings: Boolean = false,
+        var attemptUrl: String? = null,
+        var accounted: Boolean = false,
+        /** 当前这个源那份多线路详情。换线路靠它，不用重新拉详情。 */
+        var detail: MediaDetail? = null,
     )
 
     private var round: Round? = null
@@ -841,10 +859,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 起播时开一轮：当前源打头，后面接其它源（就是「播放源管理」里拖出来的那个顺序）。
      *
-     * 手上没有跨源列表时也照样开这一轮：只有一个候选时什么都不会自动发生，
-     * 真失败了再去查别的源（见 [reportPlaybackFailure]）—— 首页点「立即播放」那条路才有的救。
+     * 手上没有跨源列表时也照样开这一轮：只有一个候选、且这个源只有一条线路时什么都不会
+     * 自动发生，真失败了再去查别的源（见 [reportPlaybackFailure]）—— 首页点「找这一部」那条路才有的救。
+     *
+     * [detail] 是这一次起播手上那份多线路详情。留着它，第一条线路失败时才能就地换第二条，
+     * 不必回头再拉一次详情。
      */
-    private fun beginRound(p: Playing, siblings: List<SourceAvailability>) {
+    private fun beginRound(
+        p: Playing,
+        siblings: List<SourceAvailability>,
+        detail: MediaDetail?,
+    ) {
         val self = SourceAvailability(
             sourceId = p.sourceId,
             sourceName = p.sourceName,
@@ -859,24 +884,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         )
         val cands = (listOf(self) + siblings.filter { it.sourceId != p.sourceId && it.item.id.isNotEmpty() })
             .distinctBy { it.sourceId }
-        round = Round(p.episodeIndex, cands, anchorSec = p.resumeFrom)
+        val d = detail?.takeIf { it.media.sourceId == p.sourceId }
+        round = Round(
+            episodeIndex = p.episodeIndex,
+            candidates = cands,
+            // 从用户手上这一条线路往后接着试，而不是从第 1 条重来：
+            // 在详情页转过线路再点播放，第 1 条他已经看不上眼了。
+            lineCursor = lineIndexOf(d, p.episodeIndex, p.episodeUrl),
+            anchorSec = p.resumeFrom,
+            attemptUrl = p.episodeUrl,
+            detail = d,
+        )
         _fallback.value = null
     }
 
     /**
-     * 一个源在这一集上放不出来。
+     * 手上这一笔放不出来这一集。
      *
-     * 只认「现在播的确实是这一轮游标指着的那个源」的汇报 —— 换源之后旧播放器还是会晚一拍
-     * 把它的错误回调送上来，那条属于上一个源，放它进来就会跳过本该试的源。
+     * 认账要过三道闸：集号对得上（换过集就是另一轮）、源对得上游标、那条 `episodeUrl` 对得上
+     * 这一笔。最后那道是这一轮里最难处理的：换了线路之后，旧播放器还会晚一拍把上一条线路的错误
+     * 送上来，而它和新一笔同源同集，只有那条地址能分辨 —— 放它进来就会跳过本该试的线路。
+     * 所以**播放器报上来的那一笔要带上它自己当时在放哪条地址**（[url]）：拿 `_playing` 现值去比
+     * 是分不出来的，迟到的回调送进来时，屏上写的已经是新一笔了。
+     *
+     * 往下走时先在**当前这个源**里换线路，线路走完了才换源：换线路不用重取详情（那份
+     * `MediaDetail` 就在手上，懂片帝那种连线路包都缓存好了），换源每次都要重新拉一遍详情。
+     * 便宜的先试。
      */
-    fun reportPlaybackFailure(reason: String) {
+    fun reportPlaybackFailure(reason: String, url: String? = null) {
         val r = round ?: return
         val p = _playing.value ?: return
         if (p.episodeIndex != r.episodeIndex) return
-        if (r.candidates.getOrNull(r.cursor)?.sourceId != p.sourceId) return
-        if (r.reasons.containsKey(r.cursor)) return
+        val cand = r.candidates.getOrNull(r.cursor) ?: return
+        if (cand.sourceId != p.sourceId) return
+        if ((url ?: p.episodeUrl) != r.attemptUrl) return
+        if (r.accounted) return
         _resumePosition.value.takeIf { it > 0L }?.let { r.anchorSec = it }
-        r.reasons[r.cursor] = reason
+        r.accounted = true
+        r.tried += Attempt(cand.sourceName, lineNameOf(r), reason)
+        if (nextLine(r)) return
         if (r.candidates.size > 1) {
             advance(r)
             return
@@ -896,15 +942,77 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 往下一个候选源走；没有下一个了就把这一轮的账摊开说清楚。 */
+    /**
+     * 当前这个源还有没试过的线路就换一条，返回有没有换成。
+     *
+     * 某条线路没给这一集时直接跳过去看下一条 —— 那不算一次失败，它压根没有这一格，
+     * 记进流水里就成了「这个源试过了、不行」的假账。
+     */
+    private fun nextLine(r: Round): Boolean {
+        val d = r.detail ?: return false
+        val av = r.candidates.getOrNull(r.cursor) ?: return false
+        var i = r.lineCursor + 1
+        while (i < d.lines.size) {
+            val ep = d.lines[i].episodes.firstOrNull { it.index == r.episodeIndex }
+                ?.takeIf { !it.playUrl.isNullOrBlank() }
+            if (ep != null) {
+                r.lineCursor = i
+                dispatchLine(r, av, ep, d)
+                return true
+            }
+            i++
+        }
+        return false
+    }
+
+    /**
+     * 在当前这个源里把某一条线路递出去。集号没变，所以走 [play] 的 `autoAdvance` 那一条 ——
+     * 整张候选表和已经记下的原因都得留着，换集才等于重开一轮。
+     */
+    private fun dispatchLine(r: Round, av: SourceAvailability, ep: Episode, detail: MediaDetail) {
+        r.attemptUrl = ep.playUrl
+        r.accounted = false
+        play(
+            sourceId = av.sourceId,
+            mediaTitle = av.item.title,
+            episodeName = ep.name,
+            episodeIndex = ep.index,
+            episodeUrl = ep.playUrl,
+            resumeFrom = r.anchorSec,
+            mediaId = av.item.id,
+            mediaKey = av.item.key,
+            mediaYear = av.item.year,
+            mediaCover = av.item.cover,
+            detail = detail,
+            autoAdvance = true,
+        )
+        publish(r, exhausted = false)
+    }
+
+    /** 这一格的线路名。只有一条线路的源不出现「线路」这两个字 —— 它没有得选。 */
+    private fun lineNameOf(r: Round): String? {
+        val lines = r.detail?.lines ?: return null
+        return if (lines.size < 2) null else lines.getOrNull(r.lineCursor)?.name
+    }
+
+    /** 手上这条地址是这个源的第几条线路。对不上就当第 1 条。 */
+    private fun lineIndexOf(d: MediaDetail?, episodeIndex: Int, url: String?): Int =
+        d?.lines?.indexOfFirst { l ->
+            url != null && l.episodes.any { it.index == episodeIndex && it.playUrl == url }
+        }?.takeIf { it >= 0 } ?: 0
+
+    /** 当前这个源的线路走完了：往下一个候选源走；没有下一个了就把这一轮的账摊开说清楚。 */
     private fun advance(r: Round) {
         if (r.cursor + 1 >= r.candidates.size) {
-            // 从头到尾就一个源时不弹「第 1/1 个也失败」那种废话：
-            // 下方「这个源拿不到直链」那块说的已经是同一件事，而且它还留着站点页取链那个出口
-            if (r.candidates.size > 1) publish(r, exhausted = true)
+            // 只试过一次、又只有一个源时不弹横幅：下方「这个源拿不到直链」那块说的已是同一件事，
+            // 而且它还留着站点页取链那个出口。但只要真走过第二格（同一个源的下一条线路也算），
+            // 这张流水就有话要说了。
+            if (r.candidates.size > 1 || r.tried.size > 1) publish(r, exhausted = true)
             return
         }
         r.cursor++
+        r.lineCursor = 0
+        r.detail = null
         publish(r, exhausted = false)
         switchWithinRound(r)
     }
@@ -927,27 +1035,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId }
             val d = cfg?.let { c -> runCatching { mediaRepo.detail(c, av.item.id) }.getOrNull() }
             if (!roundAlive(r, genAtAsk)) return@launch
-            val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == r.episodeIndex }
-            if (ep == null) {
-                r.reasons[r.cursor] =
-                    if (d == null) "这个源取不到详情" else "这个源没有第 ${r.episodeIndex} 集"
+            r.detail = d
+            r.lineCursor = 0
+            // 「取不到详情」和「这个源没有这一集」是**这个源**整体不行，不占线路名额：
+            // 它连一格能播的地址都没有，后面几条线路也就无从谈起，直接换下一个源。
+            // 从第一条**真有这一集**的线路起跳 —— 苹果 CMS 那种会塞一条空地址的占位线路在前面。
+            val at0 = d?.lines?.indexOfFirst { l ->
+                l.episodes.any { it.index == r.episodeIndex && !it.playUrl.isNullOrBlank() }
+            } ?: -1
+            val ep = if (at0 < 0) null else d?.lines?.get(at0)?.episodes?.first {
+                it.index == r.episodeIndex && !it.playUrl.isNullOrBlank()
+            }
+            if (d == null || ep == null) {
+                r.tried += Attempt(
+                    av.sourceName, null,
+                    if (d == null) "这个源取不到详情" else "这个源没有第 ${r.episodeIndex} 集",
+                )
                 advance(r)
                 return@launch
             }
-            play(
-                sourceId = av.sourceId,
-                mediaTitle = av.item.title,
-                episodeName = ep.name,
-                episodeIndex = ep.index,
-                episodeUrl = ep.playUrl,
-                resumeFrom = r.anchorSec,
-                mediaId = av.item.id,
-                mediaKey = av.item.key,
-                mediaYear = av.item.year,
-                mediaCover = av.item.cover,
-                detail = d,
-                autoAdvance = true,
-            )
+            r.lineCursor = at0
+            dispatchLine(r, av, ep, d)
         }
     }
 
@@ -969,22 +1077,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissFallbackNotice() { _fallback.value = null }
 
-    /** 「再试一轮」：游标回到开头、原因清空，位置仍用这一轮听到的最后一个有效值。 */
+    /** 「再试一轮」：游标回到开头、流水清空，位置仍用这一轮听到的最后一个有效值。 */
     fun retryFallbackRound() {
         val r = round ?: return
         r.cursor = 0
-        r.reasons.clear()
+        r.lineCursor = 0
+        r.detail = null
+        r.tried.clear()
+        r.accounted = false
         _fallback.value = null
         switchWithinRound(r, 0)
     }
 
     private fun publish(r: Round, exhausted: Boolean) {
+        val cand = r.candidates.getOrNull(r.cursor) ?: return
         _fallback.value = FallbackUi(
-            step = r.cursor + 1,
-            total = r.candidates.size,
-            tryingSourceName = r.candidates[r.cursor].sourceName,
-            failures = r.reasons.entries.sortedBy { it.key }
-                .map { Attempt(r.candidates[it.key].sourceName, it.value) },
+            step = r.tried.size + 1,
+            sourceCount = r.candidates.size,
+            tryingSourceName = cand.sourceName,
+            tryingLineName = if (exhausted) null else lineNameOf(r),
+            failures = r.tried.toList(),
             exhausted = exhausted,
         )
     }
@@ -1048,7 +1160,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // 自动换源走到这里是同一轮里的下一次尝试，流水和游标都不能动；
                 // 用户自己点的播/换集/续播才开新的一轮。
                 val keepRound = autoAdvance && round?.episodeIndex == episodeIndex
-                if (!keepRound) _playing.value?.let { beginRound(it, _playingSiblings.value) }
+                if (keepRound) {
+                    // 这一轮的账得跟着挪到刚递出去的这一格上：换线路是同一个源同一个集，
+                    // 只有那条地址能分辨是哪一笔。不挪的话，用户在播放器里手动换的线路
+                    // 失败时会因为「地址对不上」被当成迟到的回调丢掉 —— 那一轮就此停住。
+                    round?.let {
+                        it.detail = _playingDetail.value?.takeIf { d -> d.media.sourceId == sourceId }
+                            ?: it.detail
+                        it.lineCursor = lineIndexOf(it.detail, episodeIndex, episodeUrl)
+                        it.attemptUrl = episodeUrl
+                        it.accounted = false
+                    }
+                } else _playing.value?.let { beginRound(it, _playingSiblings.value, _playingDetail.value) }
                 _resumePosition.value = start
                 // 上一部的时长不能跟到这一部上：「看不看完」是拿它算的
                 lastDurationSec = 0L

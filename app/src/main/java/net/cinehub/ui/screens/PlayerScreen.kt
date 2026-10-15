@@ -154,6 +154,13 @@ fun PlayerScreen(
     var wantsPlay by remember { mutableStateOf(true) }
     var buffering by remember { mutableStateOf(true) }
     var errText by remember { mutableStateOf<String?>(null) }
+    /**
+     * 播放器手里这一条媒体属于哪一次尝试（就是那一条 `episodeUrl`）。
+     *
+     * 报错时要拿它去汇报，不能用屏上现值：换线路之后旧播放器还会晚一拍把上一条线路的错误
+     * 送上来，那时候 `playing` 已经翻到新一笔，用现值去认账就会把新那一笔冤枉掉。
+     */
+    var attemptUrl by remember { mutableStateOf<String?>(null) }
     /** 这一次播放渲染过第一帧没有 —— 起播看门狗只看这一位。 */
     var firstFrame by remember { mutableStateOf(false) }
     /** 常驻告知上的「一路试过哪些源」展开没有。 */
@@ -209,8 +216,9 @@ fun PlayerScreen(
                     override fun onPlayerError(e: PlaybackException) {
                         val why = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
                         errText = why
-                        // 交给自动换源：还有没试过的源就往下走，界面这条错误只是它没走通时的结果
-                        vm.reportPlaybackFailure(why)
+                        // 交给自动换源：还有没试过的线路或源就往下走，界面这条错误只是它没走通时的结果。
+                        // 报的是「当时在放哪条地址」，不是屏上现值 —— 见 attemptUrl 那段。
+                        vm.reportPlaybackFailure(why, attemptUrl)
                     }
 
                     override fun onRenderedFirstFrame() {
@@ -222,9 +230,22 @@ fun PlayerScreen(
             }
     }
 
-    // 换源 / 换集时重建媒体源；用 resumeFrom 保证进度接续
-    LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
+    // 换源 / 换集 / 换线路时重建媒体源；用 resumeFrom 保证进度接续
+    LaunchedEffect(playing?.streamUrl, playing?.episodeUrl, playing?.episodeIndex, playing?.sourceId) {
         val url = playing?.streamUrl
+        // 从这一刻起，播放器报错就算在这条地址头上（见 attemptUrl）
+        attemptUrl = playing?.episodeUrl
+        // 右侧那栏「线路 N/M」得跟着换：自动换源现在会在同一个源里换线路，
+        // 不跟着挪的话屏上写的是第 1 条、实际播的是第 2 条 —— 和当年换源不重置 lineIndex 是同一类谎。
+        // 认不出这条地址属于哪一条线路时回到第 1 条（本地缓存那种就没有线路可选）。
+        run {
+            val d = vm.playingDetail.value
+            val u = playing?.episodeUrl
+            val at = d?.lines?.indexOfFirst { l ->
+                u != null && l.episodes.any { it.playUrl == u }
+            } ?: -1
+            lineIndex = if (at >= 0) at else 0
+        }
         errText = null
         firstFrame = false
         buffering = true
@@ -295,20 +316,16 @@ fun PlayerScreen(
     // 从第 18 分钟续起来的这一笔，位置一上来就不是 0，看门狗于是永远不开火，
     // 而恰恰是这类源最需要在起不来时换走。纯音频流不回首帧回调是真的，
     // 但它会进 READY，那正是「确实播开了」的证据。
-    LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
+    LaunchedEffect(playing?.streamUrl, playing?.episodeUrl, playing?.episodeIndex, playing?.sourceId) {
         if (playing?.streamUrl.isNullOrBlank()) return@LaunchedEffect
         delay(STARTUP_GRACE_MS)
         val st = player.playbackState
         if (!firstFrame && wantsPlay && errText == null &&
             st != Player.STATE_READY && st != Player.STATE_ENDED
         ) {
-            vm.reportPlaybackFailure("一直缓冲，没能开播")
+            vm.reportPlaybackFailure("一直缓冲，没能开播", attemptUrl)
         }
     }
-
-    // 换了源就是换了另一套线路列表：本地那个 lineIndex 属于上一个源，
-    // 留着它，屏幕上写的线路名指的是另一条流 —— 自动换源会把这一步走得很频繁。
-    LaunchedEffect(playing?.sourceId) { lineIndex = 0 }
 
     // 轮询播放位置；顺带把这一条流里真实存在的视频高度取出来给「画质」用 ——
     // 只有 Media3 解出 master playlist 之后才知道有几档，不能凭空列。
@@ -459,6 +476,10 @@ fun PlayerScreen(
             mediaKey = p.mediaKey,
             mediaYear = p.mediaYear,
             mediaCover = p.mediaCover,
+            // 集号没变就等于还在同一集里换线路：那一轮自动重试的账得留着。
+            // 原来这里一律重开一轮，于是手动换一次线路，
+            // 「哪个源为什么不行」那张流水和剩下的候选就一起没了。
+            autoAdvance = e.index == p.episodeIndex,
         )
     }
 
@@ -655,11 +676,19 @@ fun PlayerScreen(
                         .padding(horizontal = Sp.s3, vertical = Sp.s2),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        // 一格 = 一个「源 · 线路」组合，不是「一个源」：同一个源有两条线路时
+                        // 先把它的第二条试掉再换源，所以这里报的次数会比源多。
+                        // 只有一条线路的源不带线路名 —— 它没有得选，写上就是凑话。
                         Text(
                             when {
-                                fb.exhausted -> "${fb.total} 个源都放不出来这一集"
-                                fb.settled -> "换过 ${fb.failures.size} 个源才播起来 · 现在是 ${playing?.sourceName ?: ""}"
-                                else -> "正在换源 · 第 ${fb.step}/${fb.total} 个 · ${fb.tryingSourceName}"
+                                fb.exhausted ->
+                                    if (fb.failures.any { it.lineName != null })
+                                        "试了 ${fb.failures.size} 次 · ${fb.sourceCount} 个源，都放不出来这一集"
+                                    else "${fb.sourceCount} 个源都放不出来这一集"
+                                fb.settled -> "换过 ${fb.failures.size} 次才播起来 · 现在是 " +
+                                    fb.tryingSourceName + (fb.tryingLineName?.let { " · $it" } ?: "")
+                                else -> "正在试 · 第 ${fb.step} 次 · ${fb.tryingSourceName}" +
+                                    (fb.tryingLineName?.let { " · $it" } ?: "")
                             },
                             color = Color.White,
                             fontSize = Fs.xs,
@@ -677,7 +706,7 @@ fun PlayerScreen(
                     }
                     if (!fb.settled && !fb.exhausted && last != null) {
                         Text(
-                            "刚才 ${last.sourceName}：${last.reason}",
+                            "刚才 ${last.sourceName}${last.lineName?.let { " · $it" } ?: ""}：${last.reason}",
                             color = T.TextDim,
                             fontSize = Fs.tiny,
                             maxLines = 1,
@@ -687,7 +716,7 @@ fun PlayerScreen(
                     if (fbExpanded) {
                         fb.failures.forEach { a ->
                             Text(
-                                "· ${a.sourceName} —— ${a.reason}",
+                                "· ${a.sourceName}${a.lineName?.let { " · $it" } ?: ""} —— ${a.reason}",
                                 color = T.TextDim,
                                 fontSize = Fs.tiny,
                                 lineHeight = Fs.tiny * 1.5f,
