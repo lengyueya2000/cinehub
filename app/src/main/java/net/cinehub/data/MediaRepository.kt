@@ -229,7 +229,10 @@ class MediaRepository(private val sources: SourceRepository) {
         }.map { it.await() }
 
         Siblings(
-            items = per.flatMap { it.component2() },
+            // 一个源只留一条：同一个源可能既给「烬中欢」又给「烬中欢(2026)」这类重复条目，
+            // 年份没写的那条也过得去 sameWork —— 于是「播放源」里会出现两张一模一样的 4kku 徽标，
+            // 用户分不清自己切的是哪一张（自动换源也照着这个列表往下走）。
+            items = per.flatMap { it.component2() }.distinctBy { it.sourceId },
             failures = per.mapNotNull { (cfg, _, err) ->
                 err?.let { SearchOutcome.Failure(cfg.name, it.shortReason()) }
             },

@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -145,6 +146,7 @@ fun PlayerScreen(
     val detail by vm.playingDetail.collectAsState()
     val resumeFrom by vm.resumePosition.collectAsState()
     val resolving by vm.resolving.collectAsState()
+    val fallback by vm.fallback.collectAsState()
 
     var pos by remember { mutableLongStateOf(resumeFrom) }
     var dur by remember { mutableLongStateOf(0L) }
@@ -152,6 +154,10 @@ fun PlayerScreen(
     var wantsPlay by remember { mutableStateOf(true) }
     var buffering by remember { mutableStateOf(true) }
     var errText by remember { mutableStateOf<String?>(null) }
+    /** 这一次播放渲染过第一帧没有 —— 起播看门狗只看这一位。 */
+    var firstFrame by remember { mutableStateOf(false) }
+    /** 常驻告知上的「一路试过哪些源」展开没有。 */
+    var fbExpanded by remember { mutableStateOf(false) }
 
     // 点播放就进全屏，不用用户再找按钮
     var fullscreen by remember { mutableStateOf(true) }
@@ -201,7 +207,16 @@ fun PlayerScreen(
                     }
 
                     override fun onPlayerError(e: PlaybackException) {
-                        errText = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
+                        val why = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
+                        errText = why
+                        // 交给自动换源：还有没试过的源就往下走，界面这条错误只是它没走通时的结果
+                        vm.reportPlaybackFailure(why)
+                    }
+
+                    override fun onRenderedFirstFrame() {
+                        // 第一帧是「这一轮可以收工」的唯一硬证据：缓冲计数、isPlaying 都骗得过人
+                        firstFrame = true
+                        vm.playbackStarted()
                     }
                 })
             }
@@ -211,6 +226,7 @@ fun PlayerScreen(
     LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
         val url = playing?.streamUrl
         errText = null
+        firstFrame = false
         buffering = true
         if (url.isNullOrBlank()) {
             // 没有地址可播（解析失败、还在解析）—— 这时候才真的停
@@ -271,6 +287,20 @@ fun PlayerScreen(
         if (from > 0) player.seekTo(from * 1000)
         player.play()
     }
+
+    // 起播看门狗：地址是通的，但 20 秒还不出第一帧，就当作这个源放不出来这一集。
+    // 只管起播这一段 —— 播到一半卡顿和用户自己拖进度条长得一模一样，误判的代价比救回来的收益大。
+    LaunchedEffect(playing?.streamUrl, playing?.episodeIndex, playing?.sourceId) {
+        if (playing?.streamUrl.isNullOrBlank()) return@LaunchedEffect
+        delay(STARTUP_GRACE_MS)
+        if (!firstFrame && wantsPlay && errText == null) {
+            vm.reportPlaybackFailure("一直缓冲，没能开播")
+        }
+    }
+
+    // 换了源就是换了另一套线路列表：本地那个 lineIndex 属于上一个源，
+    // 留着它，屏幕上写的线路名指的是另一条流 —— 自动换源会把这一步走得很频繁。
+    LaunchedEffect(playing?.sourceId) { lineIndex = 0 }
 
     // 轮询播放位置；顺带把这一条流里真实存在的视频高度取出来给「画质」用 ——
     // 只有 Media3 解出 master playlist 之后才知道有几档，不能凭空列。
@@ -586,6 +616,82 @@ fun PlayerScreen(
                                 Icons.Filled.Refresh, null,
                                 tint = Color.White,
                                 modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // ---------- 自动换源的常驻告知 ----------
+            // 不跟着 controls 收起来：源是被系统换掉的，不是用户自己点的，
+            // 收掉就等于悄悄换了个源 —— 画面、清晰度、甚至片名写法都变了却没人说明。
+            fallback?.let { fb ->
+                val last = fb.failures.lastOrNull()
+                Column(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .padding(
+                            start = Sp.s4,
+                            end = Sp.s4,
+                            top = if (!fullscreen || controls) 92.dp else Sp.s4,
+                        )
+                        .widthIn(max = 460.dp)
+                        .clip(R.md)
+                        .background(Color.Black.copy(alpha = .74f))
+                        .border(1.dp, if (fb.exhausted) T.Err.copy(alpha = .45f) else T.Border, R.md)
+                        .clickable { fbExpanded = !fbExpanded }
+                        .padding(horizontal = Sp.s3, vertical = Sp.s2),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            when {
+                                fb.exhausted -> "${fb.total} 个源都放不出来这一集"
+                                fb.settled -> "换过 ${fb.failures.size} 个源才播起来 · 现在是 ${playing?.sourceName ?: ""}"
+                                else -> "正在换源 · 第 ${fb.step}/${fb.total} 个 · ${fb.tryingSourceName}"
+                            },
+                            color = Color.White,
+                            fontSize = Fs.xs,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer4()
+                        Text(
+                            "×",
+                            color = T.TextDim,
+                            fontSize = Fs.sm,
+                            modifier = Modifier.size(20.dp).clip(CircleShape)
+                                .clickable { vm.dismissFallbackNotice() },
+                        )
+                    }
+                    if (!fb.settled && !fb.exhausted && last != null) {
+                        Text(
+                            "刚才 ${last.sourceName}：${last.reason}",
+                            color = T.TextDim,
+                            fontSize = Fs.tiny,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (fbExpanded) {
+                        fb.failures.forEach { a ->
+                            Text(
+                                "· ${a.sourceName} —— ${a.reason}",
+                                color = T.TextDim,
+                                fontSize = Fs.tiny,
+                                lineHeight = Fs.tiny * 1.5f,
+                            )
+                        }
+                        if (fb.exhausted) {
+                            Spacer4()
+                            Text(
+                                "再试一轮",
+                                color = T.Src500,
+                                fontSize = Fs.xs,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clip(R.full)
+                                    .border(1.dp, T.Src500.copy(alpha = .5f), R.full)
+                                    .clickable { vm.retryFallbackRound() }
+                                    .padding(horizontal = 10.dp, vertical = 4.dp),
                             )
                         }
                     }
@@ -1359,3 +1465,10 @@ private fun fmt(sec: Long): String {
 
 private fun fmtSpeed(s: Float): String =
     if (s % 1f == 0f) "%.1f".format(s) else "%.2f".format(s).trimEnd('0')
+
+/**
+ * 起播宽限：地址拿到之后，这么久还渲染不出第一帧就当一个源放不出来，交给自动换源。
+ *
+ * 20 秒是照着「慢但能起」的下限挑的 —— 再短就会把一次正常的蜂窝网抖动误判成坏源。
+ */
+private const val STARTUP_GRACE_MS = 20_000L

@@ -668,6 +668,160 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var playGen = 0
     private var playJob: Job? = null
 
+    // ---------- 播放失败自动换源 ----------
+
+    /** 一次尝试：哪个源、为什么没成。 */
+    data class Attempt(val sourceName: String, val reason: String)
+
+    /**
+     * 这一轮自动换源的样子，播放器照它说话。
+     *
+     * 「取链没拿到地址」「播放器报错」「地址通了却 20 秒不出第一帧」对用户是同一句话 ——
+     * 这个源放不出来这一集 —— 所以三条都汇到这里，界面上也只有一种说法。
+     */
+    data class FallbackUi(
+        /** 正在试候选里的第几个（1 起）。 */
+        val step: Int,
+        val total: Int,
+        val tryingSourceName: String,
+        val failures: List<Attempt>,
+        /** 候选全试完了：停下说话，不再自己动。 */
+        val exhausted: Boolean,
+        /** 已经播开了：横幅留着说明刚才发生了什么，但不再表示「还在试」。 */
+        val settled: Boolean = false,
+    )
+
+    private val _fallback = MutableStateFlow<FallbackUi?>(null)
+    val fallback: StateFlow<FallbackUi?> = _fallback.asStateFlow()
+
+    /**
+     * 一轮之内试过些什么。
+     *
+     * [anchorSec] 是这一轮的位置锚点。**不能**直接读 [_resumePosition]：换源时媒体源重建会
+     * 先 `player.stop()`，那一刻轮询会把 0 写回去，级联到第三个源时进度就归零了 ——
+     * 只有真的听到过 >0 的位置才配更新它。
+     *
+     * [candidates] 会长大：从首页直接进播放器时手上没有这份跨源列表，
+     * 等真的失败了才去别的源里找这一部片（见 [reportPlaybackFailure]）。
+     */
+    private class Round(
+        val episodeIndex: Int,
+        var candidates: List<SourceAvailability>,
+        var cursor: Int = 0,
+        val reasons: LinkedHashMap<Int, String> = LinkedHashMap(),
+        var anchorSec: Long = 0L,
+        var findingSiblings: Boolean = false,
+    )
+
+    private var round: Round? = null
+
+    /**
+     * 起播时开一轮：当前源打头，后面接其它源（就是「播放源管理」里拖出来的那个顺序）。
+     *
+     * 手上没有跨源列表时也照样开这一轮：只有一个候选时什么都不会自动发生，
+     * 真失败了再去查别的源（见 [reportPlaybackFailure]）—— 首页点「立即播放」那条路才有的救。
+     */
+    private fun beginRound(p: Playing, siblings: List<SourceAvailability>) {
+        val self = SourceAvailability(
+            sourceId = p.sourceId,
+            sourceName = p.sourceName,
+            item = Media(
+                id = p.mediaId ?: "",
+                title = p.mediaTitle,
+                cover = p.mediaCover,
+                year = p.mediaYear,
+                sourceId = p.sourceId,
+            ),
+            health = Health.Unknown,
+        )
+        val cands = (listOf(self) + siblings.filter { it.sourceId != p.sourceId && it.item.id.isNotEmpty() })
+            .distinctBy { it.sourceId }
+        round = Round(p.episodeIndex, cands, anchorSec = p.resumeFrom)
+        _fallback.value = null
+    }
+
+    /**
+     * 一个源在这一集上放不出来。
+     *
+     * 只认「现在播的确实是这一轮游标指着的那个源」的汇报 —— 换源之后旧播放器还是会晚一拍
+     * 把它的错误回调送上来，那条属于上一个源，放它进来就会跳过本该试的源。
+     */
+    fun reportPlaybackFailure(reason: String) {
+        val r = round ?: return
+        val p = _playing.value ?: return
+        if (p.episodeIndex != r.episodeIndex) return
+        if (r.candidates.getOrNull(r.cursor)?.sourceId != p.sourceId) return
+        if (r.reasons.containsKey(r.cursor)) return
+        _resumePosition.value.takeIf { it > 0L }?.let { r.anchorSec = it }
+        r.reasons[r.cursor] = reason
+        if (r.candidates.size > 1) {
+            advance(r)
+            return
+        }
+        // 手上只有当前这一个源：先去看看别的源里有没有这一部，有了才谈得上换
+        if (r.findingSiblings) return
+        r.findingSiblings = true
+        viewModelScope.launch {
+            val self = r.candidates.firstOrNull()?.item ?: return@launch
+            val found = mediaRepo.siblingsOf(self)
+            // 这一趟是全源扇出，回来时用户早可能换集甚至退出了 —— 认一次代再说
+            if (round !== r || _playing.value?.episodeIndex != r.episodeIndex) return@launch
+            r.candidates = (r.candidates + found.items.filter {
+                it.sourceId != self.sourceId && it.item.id.isNotEmpty()
+            }).distinctBy { it.sourceId }
+            advance(r)
+        }
+    }
+
+    /** 往下一个候选源走；没有下一个了就把这一轮的账摊开说清楚。 */
+    private fun advance(r: Round) {
+        if (r.cursor + 1 >= r.candidates.size) {
+            // 从头到尾就一个源时不弹「第 1/1 个也失败」那种废话：
+            // 下方「这个源拿不到直链」那块说的已经是同一件事，而且它还留着站点页取链那个出口
+            if (r.candidates.size > 1) publish(r, exhausted = true)
+            return
+        }
+        r.cursor++
+        publish(r, exhausted = false)
+        val next = r.candidates[r.cursor]
+        viewModelScope.launch { switchPlayingSource(next, r.episodeIndex, r.anchorSec, autoAdvance = true) }
+    }
+
+    /**
+     * 第一帧出来了：横幅从此只作说明。
+     *
+     * **不清这一轮**。播了二十分钟后 CDN 把流掐了，`onPlayerError` 一样是该换源 ——
+     * 那属于用户选的「播放器报错」，和被排除的「播到一半卡住」不是一回事：
+     * 报错是硬证据，卡顿和用户自己拖进度条长得一样。看门狗只盯首帧之前，自己会收手。
+     */
+    fun playbackStarted() {
+        val cur = _fallback.value
+        if (cur != null && !cur.exhausted) _fallback.value = cur.copy(settled = true)
+    }
+
+    fun dismissFallbackNotice() { _fallback.value = null }
+
+    /** 「再试一轮」：游标回到开头、原因清空，位置仍用这一轮听到的最后一个有效值。 */
+    fun retryFallbackRound() {
+        val r = round ?: return
+        r.cursor = 0
+        r.reasons.clear()
+        _fallback.value = null
+        val first = r.candidates.firstOrNull() ?: return
+        viewModelScope.launch { switchPlayingSource(first, r.episodeIndex, r.anchorSec, autoAdvance = true) }
+    }
+
+    private fun publish(r: Round, exhausted: Boolean) {
+        _fallback.value = FallbackUi(
+            step = r.cursor + 1,
+            total = r.candidates.size,
+            tryingSourceName = r.candidates[r.cursor].sourceName,
+            failures = r.reasons.entries.sortedBy { it.key }
+                .map { Attempt(r.candidates[it.key].sourceName, it.value) },
+            exhausted = exhausted,
+        )
+    }
+
     /**
      * 起播。
      *
@@ -689,6 +843,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         mediaCover: String? = null,
         /** 这一集所属那部片的分集与线路；见 [playingDetail]。 */
         detail: MediaDetail? = null,
+        /** 自动换源走这一条：不换集，就不该重开一轮流水。 */
+        autoAdvance: Boolean = false,
     ) {
         val mine = ++playGen
         playJob?.cancel()
@@ -722,6 +878,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _playingSiblings.value =
                     if (_playingDetail.value != null && _siblingsOf == mediaKey) _siblings.value
                     else emptyList()
+                // 自动换源走到这里是同一轮里的下一次尝试，流水和游标都不能动；
+                // 用户自己点的播/换集/续播才开新的一轮。
+                val keepRound = autoAdvance && round?.episodeIndex == episodeIndex
+                if (!keepRound) _playing.value?.let { beginRound(it, _playingSiblings.value) }
                 _resumePosition.value = start
                 // 上一部的时长不能跟到这一部上：「看不看完」是拿它算的
                 lastDurationSec = 0L
@@ -747,6 +907,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     note = noteOf(res),
                     sitePageUrl = sitePageFor(cfg, mediaId, episodeIndex, episodeUrl),
                 )
+                // 拿不到可播地址就是「这个源放不出来这一集」，交给自动换源往下走。
+                // 另开一个协程去汇报：这里正跑在本轮的 playJob 里，就地切换会把它取消掉。
+                if (res !is StreamResolution.Ready) {
+                    val why = noteOf(res) ?: "这个源给不出可播地址"
+                    viewModelScope.launch { reportPlaybackFailure(why) }
+                }
             } finally {
                 if (mine == playGen) _resolving.value = false
             }
@@ -812,10 +978,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun noteOf(res: StreamResolution): String? = res.userNote()
 
-    /** 播放器里切源：保持进度。 */
-    fun switchPlayingSource(av: SourceAvailability, episodeIndex: Int) {
+    /**
+     * 播放器里切源：保持进度。
+     *
+     * [resumeFrom] 给 null 时用当前听到的位置（手动切源就是这一种）；自动换源必须把这一轮的
+     * 锚点显式传进来 —— 那一刻 `_resumePosition` 可能已经被新播放器的 `stop()` 冲成 0。
+     * 线路一律取新源的第一条：[lineIndex] 是播放器界面自己的状态，拿它去指另一套源线路列表
+     * 的第 N 条，屏幕上写的线路名就是假的。
+     */
+    fun switchPlayingSource(
+        av: SourceAvailability,
+        episodeIndex: Int,
+        resumeFrom: Long? = null,
+        autoAdvance: Boolean = false,
+    ) {
         viewModelScope.launch {
-            val pos = _resumePosition.value
+            val pos = resumeFrom ?: _resumePosition.value
             val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
             val d = runCatching { mediaRepo.detail(cfg, av.item.id) }.getOrNull()
             val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == episodeIndex }
@@ -832,6 +1010,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 mediaYear = av.item.year,
                 mediaCover = av.item.cover,
                 detail = d,
+                autoAdvance = autoAdvance,
             )
         }
     }
@@ -967,6 +1146,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_resumePosition.value > 0L) recordWatch(_resumePosition.value, lastDurationSec)
         _playing.value = null
         _resolving.value = false
+        // 这一轮的流水跟着这一次播放一起结束：回详情页再进来该看到干净的面板
+        round = null
+        _fallback.value = null
     }
 
     // ---------- 收藏与观看记录 ----------
