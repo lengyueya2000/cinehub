@@ -25,7 +25,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -132,7 +131,7 @@ fun LibraryScreen(
                     )
                 }
                 Box(
-                    Modifier.align(Alignment.CenterEnd).size(30.dp).clip(CircleShape)
+                    Modifier.align(Alignment.CenterEnd).size(44.dp).clip(CircleShape)
                         .clickable(enabled = !loading) { vm.refreshDouban() },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -149,8 +148,16 @@ fun LibraryScreen(
                 Modifier.fillMaxWidth().padding(horizontal = Sp.s4),
                 horizontalArrangement = Arrangement.spacedBy(Sp.s2),
             ) {
-                Chip("电影", kindMovie) { kindMovie = true; vm.selectDoubanChart(DoubanChart.MOVIE.first()) }
-                Chip("剧集", !kindMovie) { kindMovie = false; vm.selectDoubanChart(DoubanChart.TV.first()) }
+                // 换大类也要清 miss：下面那排榜名芯片换榜时清了（163 行），这一处原来没清 ——
+                // 上一部「源里没有」的横幅会跟着人跨到大类另一头，说的还是刚才那一部
+                Chip("电影", kindMovie) {
+                    kindMovie = true; miss = null
+                    vm.selectDoubanChart(DoubanChart.MOVIE.first())
+                }
+                Chip("剧集", !kindMovie) {
+                    kindMovie = false; miss = null
+                    vm.selectDoubanChart(DoubanChart.TV.first())
+                }
             }
             Spacer8()
             Row(
@@ -188,7 +195,11 @@ fun LibraryScreen(
                     horizontalArrangement = Arrangement.spacedBy(11.dp),
                     verticalArrangement = Arrangement.spacedBy(Sp.s4),
                 ) {
-                    items(list, key = { "${it.id}-${it.rank}" }) { d ->
+                    // 键只用 id：rank 是数据不是身份 —— 豆瓣的标签榜 rank 恒为 0，
+                    // 键实际只剩 id，那一份列表又不保证不重复，撞键会当场崩给
+                    // 「Key was already used」看；而 Top250 刷新后名次一变就换键，
+                    // 整行销毁重建、海报重新加载闪一下。
+                    items(list, key = { it.id }) { d ->
                         PosterCard(
                             title = d.title,
                             subtitle = d.displayLine,
@@ -247,6 +258,8 @@ private fun Chip(text: String, active: Boolean, onClick: () -> Unit) {
             )
             .border(1.dp, if (active) Color.Transparent else T.Border, R.full)
             .clickable(onClick = onClick)
+            // 44dp：这一排是切榜单唯一的门，视觉上 ~30dp 的手指按不准
+            .heightIn(min = 44.dp)
             .padding(horizontal = Sp.s3, vertical = 7.dp),
     )
 }
@@ -256,14 +269,15 @@ private fun Chip(text: String, active: Boolean, onClick: () -> Unit) {
  *
  * 原来只有 HH:mm：昨天 14:03 存的那一集和上周 14:03 存的那一集写着同一句话，
  * 而这一列就是拿来回答「这是我什么时候存的」。今天以内给时分，跨天补上日期。
+ *
+ * 「是不是今天」按**完整日期**比（yyyyMMdd），不是只比 DAY_OF_YEAR：原来那样比，
+ * 去年 10-14 落盘的那一榜会被认成今天那一榜，显示成「HH:mm」和刚取回的一模一样。
+ * 也不外加「24 小时之内」那半句 —— 既然按日历天算，昨天 23:50 就不是今天。
  */
 private fun Long.ofTime(): String {
-    val now = System.currentTimeMillis()
-    val sameDay = java.util.Calendar.getInstance().apply { timeInMillis = now }
-        .get(java.util.Calendar.DAY_OF_YEAR) ==
-        java.util.Calendar.getInstance().apply { timeInMillis = this@ofTime }
-            .get(java.util.Calendar.DAY_OF_YEAR)
-    val pattern = if (sameDay || now - this < 86_400_000L) "HH:mm" else "M月d日 HH:mm"
+    fun dayKey(t: Long): String =
+        java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.CHINA).format(java.util.Date(t))
+    val pattern = if (dayKey(this) == dayKey(System.currentTimeMillis())) "HH:mm" else "M月d日 HH:mm"
     return java.text.SimpleDateFormat(pattern, java.util.Locale.CHINA).format(java.util.Date(this))
 }
 
@@ -574,7 +588,10 @@ fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                 )
                 Spacer8()
                 Text(
-                    "最多同时缓存 3 集，所以这一档是每集各开：调到 8 路时总共会有 24 条连接在飞。",
+                    // 这两个数从仓库拿：以前写死「3 集」「8 路」，常量一改这一句就说谎了
+                    "最多同时缓存 ${vm.downloadMaxParallel} 集，所以这一档是每集各开：" +
+                        "调到 ${vm.downloadMaxSegParallel} 路时总共会有 " +
+                        "${vm.downloadMaxParallel * vm.downloadMaxSegParallel} 条连接在飞。",
                     color = T.TextDim,
                     fontSize = Fs.xs,
                     lineHeight = Fs.xs * 1.7f,
@@ -604,11 +621,14 @@ fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
         }
 
         Text(
+            // inFlight 里含排队中的那些，所以这句不能说「正在下」—— 那一格还在队里等着呢
             when {
-                inFlight > 0 -> "现在正有 $inFlight 个任务在下：改动不会作用到它们身上，" +
+                inFlight > 0 -> "现在正有 $inFlight 个任务在排队或下着：改动不会作用到它们身上，" +
                     "要等这条结束后新开始的才会按 $parallel 路取。"
                 else -> "改动从下一个开始的任务生效，正在下的不受影响。"
-            } + if (parallel == 8) " 8 路是最快的一档，也最容易被片源拒绝。" else "",
+            } + if (parallel == vm.downloadMaxSegParallel)
+                " ${vm.downloadMaxSegParallel} 路是最快的一档，也最容易被片源拒绝。"
+            else "",
             color = T.TextDim,
             fontSize = Fs.xs,
             lineHeight = Fs.xs * 1.7f,

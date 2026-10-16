@@ -148,6 +148,15 @@ class DownloadRepository(
     /** 单集内同时下多少个分片（用户在「下载设置」里调，对正在下的任务不生效）。 */
     val segParallel: StateFlow<Int> = _segParallel.asStateFlow()
 
+    /**
+     * 「同时在跑几集」「一档最多给到几路」这两个数。
+     *
+     * 下载设置那一页要把它俩写进话里（「最多同时缓存 3 集」「8 路最快」）。
+     * 抄一份字面量在界面上，常量一改那句话就开始说谎 —— 所以从仓库里取。
+     */
+    val maxParallelEpisodes: Int get() = MAX_PARALLEL
+    val maxSegParallel: Int get() = MAX_SEG_PARALLEL
+
     private val root: File
         get() = File(context.getExternalFilesDir(null) ?: context.filesDir, "downloads")
 
@@ -1020,6 +1029,8 @@ class DownloadRepository(
      *
      * AES-128 的密钥是站点随列表一起发给任何播放器的，取来解密就是 HLS 客户端的标准动作。
      * SAMPLE-AES 那类要把对方的条件解密方案复刻一遍才成文件 —— 那是 DRM，不是缓存。
+     * AES-256 这一档是**影枢自己没做**（密钥文件可能是 clearkey 打包格式，不是直接能用的 32 字节），
+     * 别把这句话推给 Android —— 系统那层的 AES/CBC 并没有拦这一档。
      */
     private fun requirePlainOrAes128(playlist: String) {
         val bad = playlist.lineSequence()
@@ -1029,7 +1040,7 @@ class DownloadRepository(
             .firstOrNull { it.isNotEmpty() && it != "NONE" && it != "AES-128" }
         if (bad != null) {
             error(
-                if (bad == "AES-256") "这条线路用的是 AES-256，本机 Android 版本不支持解密。换一条线路试试。"
+                if (bad == "AES-256") "这条线路用的是 AES-256，影枢的缓存只做到 AES-128 这一档，解不了它。换一条线路试试。"
                 else "这条线路是 $bad 加密（DRM 那一类），影枢不还原对方的解密方案，缓存不了。换一条不加密的线路试试。"
             )
         }

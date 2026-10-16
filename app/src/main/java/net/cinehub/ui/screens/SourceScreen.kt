@@ -30,7 +30,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragIndicator
 import androidx.compose.material.icons.filled.Refresh
@@ -119,9 +118,20 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     // 滚到底再往回拖就会拿陈旧坐标算落点，把顺序落到完全不相干的位次上。
     val listState = rememberLazyListState()
 
-    val ok = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Ok }
-    val slow = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Slow }
-    val down = sources.count { (health[it.id]?.health ?: Health.Unknown) == Health.Down }
+    // 「补回了几个」记在这一屏，不记在那个 item 里：那块横幅挂在未键控的 item 上，
+    // 滚出屏幕就被回收，回来时那句交代没了 —— 用户刚做完的事，界面不认账。
+    var restored by remember { mutableStateOf<Int?>(null) }
+
+    // 数字口径要和别处一致。首页、搜索、我的三处都按**启用的**源说话，而这一页原来把
+    // 停用的一起数进去 —— 同一时刻屏幕上能同时出现「已接入 8 个 · 正常 6」和
+    // 「全部 5 个源正常」，两句都对，合起来就是在骗人。
+    val live = sources.filter { it.enabled }
+    val ok = live.count { (health[it.id]?.health ?: Health.Unknown) == Health.Ok }
+    val slow = live.count { (health[it.id]?.health ?: Health.Unknown) == Health.Slow }
+    val down = live.count { (health[it.id]?.health ?: Health.Unknown) == Health.Down }
+    // 「测过」和「没测过」是两件事：原来 5 个里测出 3 个、2 个从没测过时，
+    // 别处照样整句写「还没检测过」—— 测过就是测过。
+    val unknown = live.count { (health[it.id]?.health ?: Health.Unknown) == Health.Unknown }
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -135,11 +145,12 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
-                        Modifier.size(28.dp).clip(CircleShape)
+                        // 44dp：这一颗是这一页唯一的退出口，28dp 在手里就是点不中
+                        Modifier.size(44.dp).clip(CircleShape)
                             .clickable(onClick = onBack),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(Icons.Filled.ArrowBack, null, tint = T.Text, modifier = Modifier.size(19.dp))
+                        Icon(Icons.Filled.ArrowBack, "返回", tint = T.Text, modifier = Modifier.size(19.dp))
                     }
                     Spacer8()
                     Column(Modifier.weight(1f)) {
@@ -180,7 +191,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                         Text("源健康状态", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
                         Spacer8()
                         Text(
-                            "已接入 ${sources.size} 个源",
+                            // 「接入几个」和「在用几个」是两个数，只报一个就会和别处的对不上
+                            "已接入 ${sources.size} 个源 · 启用 ${live.size} 个",
                             color = T.TextFaint,
                             fontSize = Fs.xxs,
                         )
@@ -189,7 +201,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                             Modifier.clip(R.full)
                                 .background(T.Src500.copy(alpha = .10f))
                                 .border(1.dp, T.Src500.copy(alpha = .34f), R.full)
-                                .clickable { vm.refreshHealth(true) }
+                                .clickable(enabled = !checking) { vm.refreshHealth(true) }
                                 .heightIn(min = 44.dp)
                                 .padding(horizontal = 13.dp, vertical = 5.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -213,6 +225,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                         Stat(ok.toString(), "正常", T.Ok, Modifier.weight(1f))
                         Stat(slow.toString(), "较慢", T.Warn, Modifier.weight(1f))
                         Stat(down.toString(), "不可用", T.Err, Modifier.weight(1f))
+                        Stat(unknown.toString(), "未检测", T.TextFaint, Modifier.weight(1f))
                     }
                     Spacer12()
                     Text(
@@ -287,7 +300,6 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
             }
             if (missing > 0) {
                 item {
-                    var restored by remember { mutableStateOf<String?>(null) }
                     Row(
                         Modifier.fillMaxWidth().clip(R.md)
                             .background(T.Warn.copy(alpha = .07f))
@@ -304,7 +316,13 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                             )
                             Spacer4()
                             Text(
-                                restored ?: "删掉的内置源可以补回来，你自己添加的源不受影响。",
+                                restored?.let {
+                                    // 这句话是挂在「有 N 个不在列表里」下面说的，
+                                    // 原来补回 0 个时会写出「内置源都在，无需补回」—— 上下两句自相矛盾。
+                                    // 走到这一支只可能是点下去的那一瞬间列表已经被别的改动补上了。
+                                    if (it == 0) "这几个刚刚已经回到列表里了，这一趟没补新的。"
+                                    else "已补回 $it 个内置源"
+                                } ?: "删掉的内置源可以补回来，你自己添加的源不受影响。",
                                 color = T.TextFaint,
                                 fontSize = Fs.xxs,
                                 lineHeight = Fs.xxs * 1.6f,
@@ -320,9 +338,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                                 .border(1.dp, T.Warn.copy(alpha = .5f), R.full)
                                 .heightIn(min = 44.dp)
                                 .clickable {
-                                    vm.restoreDefaultSources { n ->
-                                        restored = if (n > 0) "已补回 $n 个内置源" else "内置源都在，无需补回"
-                                    }
+                                    vm.restoreDefaultSources { n -> restored = n }
                                 }
                                 .padding(horizontal = 14.dp, vertical = 7.dp),
                         )

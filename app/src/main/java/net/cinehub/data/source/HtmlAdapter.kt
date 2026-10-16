@@ -372,20 +372,6 @@ object DefaultRules {
     )
 
     /**
-     * 4kvm.net 这类站点：详情页即播放页，直链由页面里的 WASM 现算签名。
-     *
-     * 静态 HTML 里没有 player_aaaa，也没有任何 m3u8 / mp4 —— 实测过。
-     * 所以标成 [HtmlRules.MODE_CLIENT_SCRIPT]，让提示语说清「签名在站点脚本里」，
-     * 而不是含糊地说「需要登录」（填凭证也没用）或「第三方播放页」（那是另一回事）。
-     */
-    val k4 = generic.copy(
-        itemSelector = "a[href*=/play/]",
-        detailPath = "/play/{id}",
-        episodeSelector = "a.episode-link",
-        resolveMode = HtmlRules.MODE_CLIENT_SCRIPT,
-    )
-
-    /**
      * 苹果 CMS 默认模板（如 v.luttt.com）。
      *
      * 列表在 /voddetail/{id}.html，分集在 #hl-plays-list，
@@ -397,16 +383,6 @@ object DefaultRules {
         itemSelector = "a.hl-item-thumb",
         detailPath = "/voddetail/{id}.html",
         episodeSelector = "#hl-plays-list a",
-        resolveMode = HtmlRules.MODE_MACCMS_PLAYER,
-    )
-
-    /** 详情路径形如 /index.php/vod/detail/id/123.html 的苹果 CMS 站（如 xiguazx.cc）。 */
-    val indexPhp = HtmlRules(
-        listPath = "/index.php/vod/search.html?wd={q}&page={page}",
-        browsePath = "/index.php/vod/show/id/1/page/{page}.html",
-        itemSelector = "a[href*=/vod/detail/id/]",
-        detailPath = "/index.php/vod/detail/id/{id}.html",
-        episodeSelector = ".stui-content__playlist a, a[href*=/vod/play/]",
         resolveMode = HtmlRules.MODE_MACCMS_PLAYER,
     )
 

@@ -1,7 +1,6 @@
 package net.cinehub.ui.screens
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,7 +10,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -45,6 +43,8 @@ import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.components.GroupCard
+import net.cinehub.ui.components.GroupDivider
 import net.cinehub.ui.components.PosterCard
 import net.cinehub.ui.components.SectionHead
 import net.cinehub.ui.components.StatusDot
@@ -165,10 +165,11 @@ fun MineScreen(
         // ---------- 离线缓存 ----------
         if (cached.isNotEmpty()) {
             item {
+                // 这一栏不再挂「管理 ›」：下面设置组里那行「离线缓存」去的就是同一页，
+                // 而底部导航那颗「下载」也去那一页 —— 同一件事的三个入口留一个就够，
+                // 留在这页里的是带数字的那一行（它还能说出几集可播、几集在下）。
                 SectionHead(
                     "离线缓存",
-                    trailing = "管理 ›",
-                    onTrailing = onOpenDownloads,
                     modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, top = Sp.s5, bottom = Sp.s2),
                 )
             }
@@ -196,10 +197,7 @@ fun MineScreen(
             )
         }
         item {
-            Column(
-                Modifier.padding(horizontal = Sp.s4)
-                    .fillMaxWidth().clip(R.lg).background(T.Surface2).border(1.dp, T.Border, R.lg),
-            ) {
+            GroupCard {
                 SettingRow(
                     icon = Icons.Filled.Settings,
                     tint = T.Src500,
@@ -208,7 +206,7 @@ fun MineScreen(
                     extra = { SourceHealthStrip(enabled, health, ok, slow, down) },
                     onClick = onOpenSourceManage,
                 )
-                Divider()
+                GroupDivider(rowTextStart)
                 SettingRow(
                     icon = Icons.Outlined.Download,
                     tint = T.Ok,
@@ -219,7 +217,7 @@ fun MineScreen(
                     } 集下载中",
                     onClick = onOpenDownloads,
                 )
-                Divider()
+                GroupDivider(rowTextStart)
                 SettingRow(
                     icon = Icons.Outlined.Tune,
                     tint = T.Gold,
@@ -236,8 +234,8 @@ fun MineScreen(
                     if (version != null) append("影枢 v$version")
                     append(" · 收藏、进度与凭证只存这台设备")
                 },
-                color = T.TextFaint,
-                fontSize = Fs.tiny,
+                color = T.TextDim,
+                fontSize = Fs.xs,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(start = Sp.s4, end = Sp.s4, top = Sp.s6),
             )
@@ -255,12 +253,12 @@ private fun PosterRail(content: LazyListScope.() -> Unit) {
     )
 }
 
-/** 组内分隔线：从文字起笔处开始，不穿图标。 */
-@Composable
-private fun Divider() = Box(
-    Modifier.fillMaxWidth().padding(start = Sp.s4 + 30.dp + Sp.s3).height(1.dp)
-        .background(T.BorderFaint)
-)
+/**
+ * 设置那一组里，标题文字离卡片左边的距离：行的内边距 + 图标 + 图标与文字的间距。
+ *
+ * 分隔线要正好起笔在这里，所以这个数得和 [SettingRow] 的内边距一同维护。
+ */
+private val rowTextStart = Sp.s4 + 30.dp + Sp.s3
 
 @Composable
 private fun SettingRow(
@@ -327,13 +325,20 @@ private fun SourceHealthStrip(
     val shown = enabled.take(6)
     val worst = enabled.firstOrNull { health[it.id]?.health == Health.Down }
         ?: enabled.firstOrNull { health[it.id]?.health == Health.Slow }
+    val unknown = enabled.count {
+        val h = health[it.id]?.health
+        h == null || h == Health.Unknown
+    }
     Column(Modifier.padding(start = indent, end = Sp.s4, bottom = Sp.s3)) {
         Text(
             when {
                 down > 0 && worst != null -> "$down 个不可用（${worst.name}）· $slow 个较慢"
                 slow > 0 -> "$slow 个较慢 · $ok 个正常"
                 ok == enabled.size -> "全部 $ok 个源正常"
-                else -> "还没检测过，点进去测一次"
+                // 「5 个里测出 3 个、还有 2 个没测」不能整句写成「还没检测过」——
+                // 测过就是测过，而这两句话给的下一步根本不是同一件事
+                unknown == enabled.size -> "还没检测过，点进去测一次"
+                else -> "$ok 个正常 · 另有 $unknown 个还没测过"
             },
             color = when {
                 down > 0 -> T.Err

@@ -3,7 +3,6 @@ package net.cinehub.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -28,9 +27,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import net.cinehub.data.model.DoubanItem
@@ -140,11 +139,16 @@ fun GroupCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.()
     )
 }
 
-/** 组内分隔线：默认从文字起笔处开始，不穿过左侧图标。 */
+/**
+ * 组内分隔线：默认从文字起笔处开始，不穿过左侧图标。
+ *
+ * 起点按各行自己的内边距给（默认那套行是 66dp）—— 别在页面里再写一条同样粗细的线，
+ * 两条线迟早会分出两种颜色。
+ */
 @Composable
-fun GroupDivider(indent: Boolean = true) {
+fun GroupDivider(indent: Dp = 66.dp) {
     Box(
-        Modifier.fillMaxWidth().padding(start = if (indent) 66.dp else 0.dp)
+        Modifier.fillMaxWidth().padding(start = indent)
             .height(1.dp).background(T.BorderFaint)
     )
 }
@@ -228,13 +232,12 @@ fun ConfirmDialog(
     )
 }
 
-/** 空态：一句标题、一句「为什么是空的 / 下一步做什么」，可选动作。 */
+/** 空态：一句标题、一句「为什么是空的 / 下一步做什么」。 */
 @Composable
 fun EmptyState(
     title: String,
     body: String,
     modifier: Modifier = Modifier,
-    actions: (@Composable RowScope.() -> Unit)? = null,
 ) {
     Column(
         modifier.fillMaxWidth().padding(horizontal = Sp.s5, vertical = Sp.s5),
@@ -249,10 +252,6 @@ fun EmptyState(
             lineHeight = Fs.xs * 1.7f,
             textAlign = TextAlign.Center,
         )
-        if (actions != null) {
-            Spacer12()
-            Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2), content = actions)
-        }
     }
 }
 

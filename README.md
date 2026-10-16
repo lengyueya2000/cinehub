@@ -199,7 +199,7 @@ const val MODE_CLIENT_SCRIPT = "clientScript"  // 地址由站点脚本现算，
 const val MODE_SESSION = "session"             // 只对登录用户开放，要凭证自己填
 ```
 
-只有 `DefaultRules.maccms` / `indexPhp` / `tailwind` 声明了 `MODE_MACCMS_PLAYER`，`DefaultRules.hq` 声明 `MODE_MACCMS_PARSE`，`DefaultRules.k4` 声明 `MODE_CLIENT_SCRIPT`。没配规则的站点留在 `none`。
+只有 `DefaultRules.maccms` / `tailwind` 声明了 `MODE_MACCMS_PLAYER`，`DefaultRules.hq` 声明 `MODE_MACCMS_PARSE`。`clientScript` 与 `session` 两档现在没有内置源在用（用过的那条已撤下），规则里留着是给手动添加的站点声明用。没配规则的站点留在 `none`。
 
 ### 2. 「拿不到直链」分几种，不是一个可空字符串
 

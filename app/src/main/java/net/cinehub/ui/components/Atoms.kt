@@ -5,7 +5,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -84,44 +83,6 @@ fun Pill(
             .border(1.dp, bd, R.full)
             .padding(horizontal = 8.dp, vertical = 3.dp),
     )
-}
-
-/** 主按钮（播放红渐变）。 */
-@Composable
-fun PrimaryButton(
-    text: String,
-    modifier: Modifier = Modifier,
-    icon: (@Composable () -> Unit)? = null,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = modifier
-            .height(46.dp)
-            .clip(R.md)
-            .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
-            .clickable(onClick = onClick),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        icon?.invoke()
-        if (icon != null) Spacer4()
-        Text(text, color = Color.White, fontSize = Fs.body, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-fun SecondaryButton(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    Box(
-        modifier = modifier
-            .height(46.dp)
-            .clip(R.md)
-            .background(T.Surface2)
-            .border(1.dp, T.Border, R.md)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text, color = T.TextDim, fontSize = Fs.body, fontWeight = FontWeight.SemiBold)
-    }
 }
 
 @Composable
@@ -279,20 +240,4 @@ fun PosterCard(
             )
         }
     }
-}
-
-/** 通用卡片容器。 */
-@Composable
-fun CardBox(
-    modifier: Modifier = Modifier,
-    border: Color = T.Border,
-    bg: Color = T.Surface,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        modifier
-            .clip(R.lg)
-            .background(bg)
-            .border(1.dp, border, R.lg)
-    ) { content() }
 }

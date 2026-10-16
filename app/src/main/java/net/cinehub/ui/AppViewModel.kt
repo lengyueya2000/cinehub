@@ -28,6 +28,7 @@ import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.HistoryEntry
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
+import net.cinehub.data.model.qualityTagOf
 import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
@@ -75,6 +76,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 单集内同时下几个分片（「我的 → 下载设置」里调，对正在下的任务不生效）。 */
     val segParallel: StateFlow<Int> = downloadRepo.segParallel
 
+    /** 那两个上限要说实话就得从仓库拿，别在界面上抄第二份写死的字。 */
+    val downloadMaxParallel: Int get() = downloadRepo.maxParallelEpisodes
+    val downloadMaxSegParallel: Int get() = downloadRepo.maxSegParallel
+
     fun setSegParallel(n: Int) = downloadRepo.setSegParallel(n)
 
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
@@ -110,6 +115,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 正在按片名去源里找的那一条的 id，用来在卡片上给个反馈。 */
     private val _doubanResolving = MutableStateFlow<String?>(null)
     val doubanResolving: StateFlow<String?> = _doubanResolving.asStateFlow()
+
+    /** 正在找的那一片叫什么 —— 只用来给「被这一闸门挡住」那一句说出挡的是谁。 */
+    private var doubanResolvingTitle: String? = null
 
     /** 落盘那份源列表这一版读不通了（[net.cinehub.data.SourceRepository.unreadable]）。 */
     val sourcesUnreadable: StateFlow<Boolean> = sourceRepo.unreadable
@@ -171,6 +179,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _detailError = MutableStateFlow<String?>(null)
     val detailError: StateFlow<String?> = _detailError.asStateFlow()
+
+    /**
+     * 「换源没换成」这一件专门的事。
+     *
+     * 以前详情页把 [_detailError] 同时当两件事用：整页加载失败、和换源失败。后果是
+     * 换源失败一次之后，再点「重新检测」就算成功了，那一栏还挂着「还在原来这个源上：
+     * 〈上一笔换源的错误〉」—— 而这一句说的是刚发生的事，不是历史。分开记，
+     * 换源这一笔一开始就清、成功就清。
+     */
+    private val _switchError = MutableStateFlow<String?>(null)
+    val switchError: StateFlow<String?> = _switchError.asStateFlow()
 
     private val _siblings = MutableStateFlow<List<SourceAvailability>>(emptyList())
     val siblings: StateFlow<List<SourceAvailability>> = _siblings.asStateFlow()
@@ -365,6 +384,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         val mine = ++detailGen
         detailJob?.cancel()
+        // 重新检测跑通了，上一笔「换源没换成」那句话就该跟着收回去 —— 它原来会一直挂在面板上
+        _switchError.value = null
         // 这一趟本身就在探所有源，所以把并发的那轮普通探测顶掉：
         // 两趟同时扇出等于挨着把每个站打两遍，而且谁先结束不好说，转圈标记会先灭。
         healthJob?.cancel()
@@ -760,6 +781,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun switchDetailSource(av: SourceAvailability) {
         val mine = ++detailGen
         detailJob?.cancel()
+        _switchError.value = null
         detailJob = viewModelScope.launch {
             try {
                 val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
@@ -802,7 +824,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         // 换不过去就退回原来那一页：把人手上正在看的详情整个撤掉，
                         // 等于让他为了换一个源而丢掉刚才那半屏
                         _detail.value = prev
-                        _detailError.value = it.message ?: "该源没有这部片"
+                        _switchError.value = it.message ?: "该源没有这部片"
                     }
             } finally {
                 if (mine == detailGen) _detailLoading.value = false
@@ -1824,9 +1846,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         onHit: (Media) -> Unit,
         onMiss: (DoubanItem, String) -> Unit,
     ) {
-        // 连点两次会并发跑两份搜索、回来两笔导航 —— 先占住，正在找的时候点不动
-        if (_doubanResolving.value != null) return
+        // 连点两次会并发跑两份搜索、回来两笔导航 —— 先占住，正在找的时候点不动。
+        // 但这一闸门得说一句：只挡住、不给说法，用户看到的就是「这张卡片按下去没反应」，
+        // 而且「找片中」那枚标记只挂在正在找的那一张上，别的卡片看起来完全是活的。
+        if (_doubanResolving.value != null) {
+            showNotice("正在源里找《${doubanResolvingTitle ?: "那一片"}》，这一条回来之前别的点不动")
+            return
+        }
         viewModelScope.launch {
+            doubanResolvingTitle = item.title
             _doubanResolving.value = item.id
             try {
                 val want = titleFingerprint(item.title)
@@ -1858,6 +1886,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (match == null) onMiss(item, why!!) else onHit(match.media)
             } finally {
                 // 占位标记必须在任何退出路径上放开，否则整张榜单从此点不动
+                doubanResolvingTitle = null
                 _doubanResolving.value = null
             }
         }
@@ -1923,16 +1952,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun qualityOf(m: Media): String? {
-        val t = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")
-        return when {
-            Regex("4k", RegexOption.IGNORE_CASE).containsMatchIn(t) -> "4K"
-            Regex("hdr", RegexOption.IGNORE_CASE).containsMatchIn(t) -> "HDR"
-            Regex("1080").containsMatchIn(t) -> "1080P"
-            Regex("720").containsMatchIn(t) -> "720P"
-            else -> null
-        }
-    }
+    /** 判法全仓一份（见 [qualityTagOf]）：这里和详情页封面旁问的是同一件事，以前各写一套。 */
+    private fun qualityOf(m: Media): String? = qualityTagOf(m)
 }
 
 /**

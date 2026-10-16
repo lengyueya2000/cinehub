@@ -10,11 +10,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -88,7 +88,13 @@ fun FavoritesScreen(
 
     val sorted = when (sort) {
         1 -> favorites.sortedBy { it.title }
-        2 -> favorites.sortedByDescending { it.year?.filter(Char::isDigit)?.toIntOrNull() ?: 0 }
+        // 年份这一档只认四位数年份。原来写的是「把数字全滤出来再转 int」：
+        // 站点把 `2024-05-01` 这种整串日期塞进 year 时，它滤成 20240501 —— 一个写法不对的
+        // 值于是沉到最前面，把真年份全挤下去。按规矩来：认不出的当没有年份，一律排到最后，
+        // 不拿它参与比较。
+        2 -> favorites.sortedWith(
+            compareBy<Fav> { yearOf(it.year) == null }.thenByDescending { yearOf(it.year) ?: 0 },
+        )
         else -> favorites.sortedByDescending { it.addedAt }
     }
 
@@ -154,6 +160,8 @@ private fun SortChip(text: String, active: Boolean, onClick: () -> Unit) {
             .background(if (active) T.Play500.copy(alpha = .14f) else Color.Transparent)
             .border(1.dp, if (active) T.Play500.copy(alpha = .32f) else T.Border, R.full)
             .clickable(onClick = onClick)
+            // 44dp：这一排是这一页唯一的排序门，视觉上 ~30dp 的手指按不准
+            .heightIn(min = 44.dp)
             .padding(horizontal = Sp.s3, vertical = Sp.s2),
     ) {
         Text(
@@ -393,12 +401,17 @@ private fun HistoryRow(e: HistoryEntry, onResume: () -> Unit, onDrop: () -> Unit
     }
 }
 
+/** 本地历法「今天 0 点」那一毫秒。[bucket] 与 [ago] 共用这把尺，别说成两种话。 */
+private fun todayStartLocal(): Long {
+    val dayMs = 86_400_000L
+    val now = System.currentTimeMillis()
+    return (now + TimeZoneOffsetMs) / dayMs * dayMs - TimeZoneOffsetMs
+}
+
 /** 分组：0 今天 / 1 本周更早 / 2 更早。按日历天算，不按「24 小时内」。 */
 private fun bucket(ts: Long): Int {
-    val now = System.currentTimeMillis()
     val dayMs = 86_400_000L
-    // 用本地时区的「今天 0 点」为界，否则跨零点看的那一部会被归到昨天
-    val todayStart = (now + TimeZoneOffsetMs) / dayMs * dayMs - TimeZoneOffsetMs
+    val todayStart = todayStartLocal()
     return when {
         ts >= todayStart -> 0
         ts >= todayStart - 6 * dayMs -> 1
@@ -409,17 +422,29 @@ private fun bucket(ts: Long): Int {
 private val TimeZoneOffsetMs: Long
     get() = java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()).toLong()
 
-/** 相对时间：记录列表要的是「多近」，不是精确时间戳。 */
+/**
+ * 相对时间：记录列表要的是「多近」，不是精确时间戳。
+ *
+ * 「天」这一档和 [bucket] 用同一条历法日界线。原来它按 24 小时的倍数算，
+ * 于是昨天 23:50 看的那一部在同一行里被写成「本周更早 · 40 分钟前」——
+ * 分组说「上周之前那些天」，右边说「一小时内」，两句话指的是同一条记录。
+ */
 private fun ago(ts: Long): String {
-    val d = System.currentTimeMillis() - ts
-    val m = d / 60_000
-    val h = m / 60
-    val day = h / 24
+    val dayMs = 86_400_000L
+    val minutes = ((System.currentTimeMillis() - ts) / 60_000L).coerceAtLeast(0L)
+    val d0 = todayStartLocal()
+    val days = if (ts >= d0) 0L else (d0 - ts + dayMs - 1) / dayMs
     return when {
-        m < 1 -> "刚刚"
-        m < 60 -> "${m} 分钟前"
-        h < 24 -> "${h} 小时前"
-        day < 7 -> "${day} 天前"
-        else -> "${day / 7} 周前"
+        days == 0L && minutes < 1 -> "刚刚"
+        days == 0L && minutes < 60 -> "$minutes 分钟前"
+        days == 0L -> "${minutes / 60} 小时前"
+        days == 1L -> "昨天"
+        days < 7 -> "$days 天前"
+        else -> "${days / 7} 周前"
     }
 }
+
+/** 从站点给的 year 里认那个四位数字。认不出返回 null（不拿坏值参与排序）。 */
+private val FourDigitYear = Regex("\\d{4}")
+
+private fun yearOf(raw: String?): Int? = raw?.let { FourDigitYear.find(it)?.value?.toIntOrNull() }

@@ -468,15 +468,6 @@ object Http {
         }
         String(out.toByteArray(), charsetOf(b.contentType()?.toString()))
     }.getOrNull().orEmpty()
-
-    /** 解析站点 baseUrl 是否可用，返回最终生效的 baseUrl（可能被重定向）。 */
-    suspend fun resolveBase(base: String): String = withContext(Dispatchers.IO) {
-        client.newCall(builder(base, null, emptyMap()).build()).await().use { r ->
-            remember(base, r)
-            if (!r.isSuccessful) error(failureReason(r.code, errorSnippet(r)))
-            r.request.url.toString().trimEnd('/')
-        }
-    }
 }
 
 /**

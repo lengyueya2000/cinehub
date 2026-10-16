@@ -210,7 +210,7 @@ fun SiteBrowserScreen(
                 "${pageError} —— 这一页在影枢里没打开。" +
                     "页面里要是让你登录或点一下播放，做完这一步它自己会重来。",
                 color = T.TextDim,
-                fontSize = Fs.tiny,
+                fontSize = Fs.xs,
                 modifier = Modifier.padding(start = Sp.s4, end = Sp.s4, bottom = Sp.s2),
             )
         }
@@ -369,8 +369,8 @@ fun SiteBrowserScreen(
                     Text(
                         "以上按「最新接到 / 最像正片」列出 ${shown.size} 条，" +
                             "还有 ${links.size - shown.size} 条没列出（最多只留最近 $MaxCapturedLinks 条）。",
-                        color = T.TextFaint,
-                        fontSize = Fs.tiny,
+                        color = T.TextDim,
+                        fontSize = Fs.xs,
                     )
                 }
             }

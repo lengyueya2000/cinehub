@@ -9,6 +9,7 @@ import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
+import net.cinehub.data.model.qualityTagOf
 import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
@@ -324,16 +325,8 @@ class MediaRepository(private val sources: SourceRepository) {
     /** [Media.key] 尾上那四位年份；这一条没带年份就是 null。 */
     private fun yearOf(m: Media): String? = m.key.substringAfter('|', "").takeIf { it.isNotBlank() }
 
-    private fun qualityTag(m: Media): String? {
-        val text = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")
-        return when {
-            Regex("4k", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "4K"
-            Regex("hdr", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "HDR"
-            Regex("1080").containsMatchIn(text) -> "1080P"
-            Regex("720").containsMatchIn(text) -> "720P"
-            else -> null
-        }
-    }
+    /** 判法一份（见 [qualityTagOf]）。这一处以前是自己一套：不认 2160、也不认「蓝光」。 */
+    private fun qualityTag(m: Media): String? = qualityTagOf(m)
 
     private companion object {
         const val DOWN_RETRY_MS = 60_000L

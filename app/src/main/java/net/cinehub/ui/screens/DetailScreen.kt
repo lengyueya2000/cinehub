@@ -13,11 +13,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,16 +27,14 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -68,6 +65,7 @@ import net.cinehub.data.model.Health
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
 import net.cinehub.data.model.PlayLine
+import net.cinehub.data.model.qualityTagOf
 import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.clock
@@ -75,7 +73,6 @@ import net.cinehub.ui.AppViewModel
 import net.cinehub.ui.components.ConfirmDialog
 import net.cinehub.ui.components.Pill
 import net.cinehub.ui.components.Spacer12
-import net.cinehub.ui.components.Spacer16
 import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.components.StatusDot
@@ -94,6 +91,7 @@ fun DetailScreen(
     val detail by vm.detail.collectAsState()
     val loading by vm.detailLoading.collectAsState()
     val error by vm.detailError.collectAsState()
+    val switchError by vm.switchError.collectAsState()
     val siblings by vm.siblings.collectAsState()
     val siblingFailures by vm.siblingFailures.collectAsState()
     val activeSourceId by vm.activeSourceId.collectAsState()
@@ -135,14 +133,38 @@ fun DetailScreen(
     val curEp = eps.getOrNull(epIdx.coerceIn(0, (eps.size - 1).coerceAtLeast(0)))
     val sid = activeSourceId ?: d.media.sourceId
     val fav = favorites.any { it.key == d.media.key }
-    /** 这部片上次看到哪；只有正播到这一集时才提示续播。 */
-    val seen = vm.historyOf(d.media.key)
+    /**
+     * 这部片上次看到哪；只有正播到这一集时才提示续播。
+     *
+     * 订阅着读，别用 vm.historyOf()：那是 StateFlow 的此刻值，组合里读它挂不上订阅。
+     * 不订阅的后果是同一屏两个答案 —— 记录在首帧之后才落盘时选集格子还落在第 1 集，
+     * 而右下角那个续播点已经画在第 7 集。
+     */
+    val history by vm.watchHistory.collectAsState()
+    val seen = d.media.key?.let { k -> history.firstOrNull { it.key == k } }
     val resumeEp = seen?.takeIf { it.resumable }
 
-    // 打开一部看过的片，选集默认落在上次那一集，而不是永远从第一集开始
-    LaunchedEffect(d.media.id, eps.size) {
+    /**
+     * 线路与选集落在哪 —— 一个 effect 说清两种「换了」。
+     *
+     * ① 换了一部片：线路回第一条，选集落在上次看到的那一集（没记录就第 1 集）。
+     *    这两格是记在这一屏上的普通状态，换一部片它们不会跟着走 —— 上一部挑到第 20 集，
+     *    进来一部只有 12 集的片就停在第 12 集，还一句解释都没有。
+     * ② 同一部片换到另一个源：同样归零，但**只能在源真的换过来之后**。
+     *    原来是在「点击换源」那一刻清的，而换源失败时仓库会退回原来那份详情 ——
+     *    用户挑的线路和那一集被无声抹掉，界面上只说「还在原来这个源上」。
+     *
+     * 已经落过点的（这一部 + 这个源）不再动：换线路时 `eps.size` 也会变，
+     * 每次都重落一遍的话，用户刚挑的那条线路会被拽回第一条。
+     */
+    val landed = remember { mutableStateOf<Pair<String, String?>?>(null) }
+    LaunchedEffect(d.media.id, activeSourceId, eps.size, seen?.episodeIndex) {
+        val key = d.media.id to activeSourceId
+        if (landed.value == key || eps.isEmpty()) return@LaunchedEffect
+        landed.value = key
+        lineIdx = 0
         val at = seen?.let { s -> eps.indexOfFirst { it.index == s.episodeIndex } } ?: -1
-        if (at > 0) epIdx = at
+        epIdx = if (at > 0) at else 0
     }
 
     val ctx = LocalContext.current
@@ -196,38 +218,20 @@ fun DetailScreen(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 96.dp),
         ) {
-            item { Backdrop(d, fav, onBack, { vm.toggleFavorite(sid, d.media) }, { openDouban() }) }
+            item { Backdrop(d, fav, onBack, { vm.toggleFavorite(sid, d.media) }) }
 
             item {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s4),
                     horizontalArrangement = Arrangement.spacedBy(Sp.s2),
                 ) {
-                    ActionTile(
-                        if (fav) "已收藏" else "收藏",
-                        if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                        fav,
-                        Modifier.weight(1f),
-                    ) { vm.toggleFavorite(sid, d.media) }
-                    curEp?.let { ep ->
-                        val t = taskFor(ep)
-                        ActionTile(
-                            cacheLabel(t),
-                            Icons.Outlined.Download,
-                            t?.status == DownloadStatus.Done,
-                            Modifier.weight(1f),
-                        ) {
-                            when (t?.status) {
-                                DownloadStatus.Paused, DownloadStatus.Failed -> vm.resumeDownload(t.id)
-                                else -> cache(ep)
-                            }
-                        }
-                    } ?: ActionTile(
-                        // 这一条线路没给出分集：这颗格子不能长得和能按的时候一模一样。
-                        "缓存", Icons.Outlined.Download, false, Modifier.weight(1f), enabled = false,
-                    ) {}
+                    // 这一行只剩两件别处没有的事。原来四格并排里：「收藏」和封面下面那颗心
+                    // 是同一个动作的两个入口，「缓存」和底部那颗下载键也是同一个动作
+                    //（连「暂停之后点继续」那套分支都重复了一份），而「在豆瓣看评分」
+                    // 在封面上还另有一颗星形图标 —— 同级重复入口一律砍掉。
+                    // 缓存进度本来就有地方说：选集格子右上角那一格。
                     ActionTile("分享", Icons.Outlined.Share, false, Modifier.weight(1f)) { doShare() }
-                    ActionTile("在豆瓣看评分", Icons.Filled.MoreVert, false, Modifier.weight(1f)) { openDouban() }
+                    ActionTile("在豆瓣看评分", Icons.Outlined.OpenInNew, false, Modifier.weight(1f)) { openDouban() }
                 }
             }
 
@@ -240,14 +244,16 @@ fun DetailScreen(
                         failures = siblingFailures,
                         // 换源没成时页面会退回原来那份详情（不撤，用户就不白丢一屏），
                         // 所以「没换成」这件事只能在这一行里说 —— 否则点下去毫无动静。
-                        switchError = error,
+                        switchError = switchError,
                         health = health,
                         checking = checking,
                         onRescan = { vm.rescanDetail() },
                         onPick = { av ->
+                            // 这里只递需求，不动 lineIdx/epIdx：换源没成时仓库会退回原来那份详情，
+                            // 而我们刚把用户选的线路和集数清成 0 —— 一句「还在原来这个源上」
+                            // 背后藏着「你刚才挑的那条线路也没了」。源真的换了以后再归零，
+                            // 见下面那个 LaunchedEffect(activeSourceId)。
                             vm.switchDetailSource(av)
-                            lineIdx = 0
-                            epIdx = 0
                         },
                     )
                 }
@@ -272,8 +278,10 @@ fun DetailScreen(
                             color = T.Src500,
                             fontSize = Fs.xs,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clip(R.sm).clickable { vm.cacheLine(sid, d.media, eps) }
-                                .padding(horizontal = 6.dp, vertical = 3.dp),
+                            // 这一行原来只有 ~20dp 高：它是整条线路唯一的批量入口，点不准就等于没有
+                            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp).clickable {
+                                vm.cacheLine(sid, d.media, eps)
+                            }.padding(horizontal = 8.dp, vertical = 8.dp),
                         )
                         Spacer8()
                     }
@@ -286,10 +294,11 @@ fun DetailScreen(
                             color = T.Src500,
                             fontSize = Fs.xs,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clickable {
+                            // 这是详情页唯一的换线路入口，原来连内边距都没有（~16dp 高）
+                            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp).clickable {
                                 lineIdx = (lineIdx + 1) % lines.size
                                 epIdx = 0
-                            },
+                            }.padding(horizontal = 8.dp, vertical = 8.dp),
                         )
                     }
                 }
@@ -390,8 +399,8 @@ fun DetailScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val curTask = curEp?.let { taskFor(it) }
-            Box(
-                Modifier.size(46.dp).clip(R.md).background(T.Surface2)
+            Column(
+                Modifier.width(60.dp).height(46.dp).clip(R.md).background(T.Surface2)
                     .border(1.dp, T.Border, R.md)
                     .combinedClickable(
                         onClick = {
@@ -402,13 +411,30 @@ fun DetailScreen(
                         },
                         onLongClick = { curTask?.let { confirmDrop = it } },
                     ),
-                contentAlignment = Alignment.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
             ) {
                 Icon(
                     Icons.Outlined.Download,
-                    null,
+                    "缓存这一集",
                     tint = if (curTask?.status == DownloadStatus.Done) T.Play400 else T.TextDim,
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer4()
+                // 动作行那一格删掉之后，这一格就是这一集唯一的缓存入口 —— 光一颗图标
+                // 说不出它现在到底处在哪一步，进度得跟着任务真实状态写
+                Text(
+                    when {
+                        curTask == null -> "缓存"
+                        curTask.status == DownloadStatus.Done -> "已缓存"
+                        curTask.status == DownloadStatus.Running ->
+                            if (curTask.hasPercent) "${(curTask.progress * 100).toInt()}%" else "缓存中"
+                        curTask.status == DownloadStatus.Queued -> "排队中"
+                        curTask.status == DownloadStatus.Paused -> "继续"
+                        else -> "重试"
+                    },
+                    color = if (curTask?.status == DownloadStatus.Done) T.Play400 else T.TextDim,
+                    fontSize = Fs.xxs,
                 )
             }
             Spacer12()
@@ -478,7 +504,6 @@ private fun Backdrop(
     fav: Boolean,
     onBack: () -> Unit,
     onFav: () -> Unit,
-    onDouban: () -> Unit,
 ) {
     Box(Modifier.fillMaxWidth().height(240.dp)) {
         if (!d.media.cover.isNullOrBlank()) {
@@ -502,11 +527,10 @@ private fun Backdrop(
             Modifier.fillMaxWidth().padding(Sp.s4),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            CircleIcon(Icons.Filled.ArrowBack, onBack)
-            Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                CircleIcon(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, onFav)
-                CircleIcon(Icons.Filled.Star, onDouban)
-            }
+            CircleIcon(Icons.Filled.ArrowBack, "返回", onBack)
+            // 只留这一颗心：封面下面那颗心就是收藏的入口（「收藏」那页的空状态也是这么指路的），
+            // 底下动作行里再来一格「收藏」是同一件事的两个入口
+            CircleIcon(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, "收藏", onFav)
         }
         Row(
             Modifier.align(Alignment.BottomStart).padding(horizontal = Sp.s4),
@@ -546,7 +570,7 @@ private fun Backdrop(
                     Spacer8()
                     // 画质徽标只写元数据里真的有的那一项。以前硬写「4K HDR」，
                     // 站点明明给的是「高清」，界面上却替它吹成 4K —— 用户点进去才发现不是。
-                    qualityBadge(d.media)?.let { Pill(it, cyan = true) }
+                    qualityTagOf(d.media)?.let { Pill(it, cyan = true) }
                 }
                 if (!d.media.score.isNullOrBlank()) {
                     Spacer8()
@@ -563,13 +587,19 @@ private fun Backdrop(
 }
 
 @Composable
-private fun CircleIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+private fun CircleIcon(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    desc: String,
+    onClick: () -> Unit,
+) {
     Box(
-        Modifier.size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = .50f))
+        // 44dp：这三颗是这一屏最主要的手指去处（返回、收藏），比图标本身还小一点就点不准
+        Modifier.size(44.dp).clip(CircleShape).background(Color.Black.copy(alpha = .50f))
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, null, tint = Color.White, modifier = Modifier.size(17.dp))
+        // contentDescription 不能是 null：这三颗全是纯图标，读屏念出来就只有「标签」
+        Icon(icon, desc, tint = Color.White, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -703,15 +733,21 @@ private fun SourcePanel(
                                 Pill(av.quality, cyan = true)
                                 Spacer8()
                             }
+                            // 数字要和上面那颗状态点取同一份来源：点用的是活表（health[av.sourceId]），
+                            // 数字原来却优先用比对时的旧快照 —— 在源管理里「全部重测」把某源从
+                            // 1200ms 测成 200ms 以后，回到这一栏就成了「绿点 + 1200ms」。
+                            // 另外拿不到数时写「已连通」，不拼出 "-ms" 这种不可能的字。
+                            val ms = health[av.sourceId]?.latencyMs ?: av.latencyMs
                             Text(
                                 when (h) {
-                                    Health.Ok -> "${av.latencyMs ?: health[av.sourceId]?.latencyMs ?: "-"}ms"
+                                    Health.Ok -> if (ms != null) "${ms}ms" else "已连通"
                                     Health.Slow -> "较慢"
                                     Health.Down -> "不可用"
-                                    Health.Unknown -> "—"
+                                    Health.Unknown -> "未检测"
                                 },
-                                color = T.TextFaint,
-                                fontSize = Fs.tiny,
+                                // 这一格承载的是事实，不该用最小最弱的那一号字
+                                color = T.TextDim,
+                                fontSize = Fs.xs,
                             )
                         }
                     }
@@ -742,22 +778,6 @@ private fun SourcePanel(
  * 影枢在详情页还不知道实际分辨率（要等播放器解出 master playlist 才有几档高度），
  * 所以这里不能替站点吹 —— 站点写「高清」就显示「高清」本来该显示的样子，没写就不显示。
  */
-private fun qualityBadge(m: Media): String? {
-    val t = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")
-    val fourK = t.contains("4k", true) || t.contains("2160")
-    val hdr = t.contains("hdr", true)
-    val blue = t.contains("蓝光")
-    return when {
-        fourK && hdr -> "4K HDR"
-        fourK -> "4K"
-        hdr -> "HDR"
-        blue -> "蓝光"
-        t.contains("1080") -> "1080P"
-        t.contains("720") -> "720P"
-        else -> null
-    }
-}
-
 /** 源站简介里常见的 HTML 实体。`&amp;` 不在表里 —— 它要最后单独解，否则会二次解码。 */
 private val ENTITIES = mapOf(
     "&nbsp;" to " ", "&ensp;" to " ", "&emsp;" to " ", "&thinsp;" to " ",

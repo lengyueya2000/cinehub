@@ -65,7 +65,8 @@ import net.cinehub.ui.theme.T
 private sealed interface Route {
     data object Home : Route
     data object Search : Route
-    data class Detail(val sourceId: String, val mediaId: String) : Route
+    /** 详情页挂的是哪一部由 `vm.detail` 说，路由本身不带身份 —— 这两个字段以前没人读。 */
+    data object Detail : Route
     data object Player : Route
     data object Library : Route
     data object Sources : Route
@@ -126,7 +127,7 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
 
     fun openDetail(sourceId: String, mediaId: String) {
         vm.openDetail(sourceId, mediaId)
-        go(Route.Detail(sourceId, mediaId))
+        go(Route.Detail)
     }
 
     /** 交给系统浏览器 —— 影枢不去替豆瓣渲染页面，那已经是它自己的地盘。 */
@@ -146,7 +147,7 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                 // 只有详情页上挂着的就是刚才播的那一部才回得去。从「继续观看」或下载页
                 // 直接起播时没人打开过详情页，那时回 Detail 等于把上一部的页面当成这一部摆出来。
                 if (d != null && playedId != null && d.media.id == playedId) {
-                    Route.Detail(vm.activeSourceId.value ?: d.media.sourceId, d.media.id)
+                    Route.Detail
                 } else {
                     backStack.removeLastOrNull() ?: Route.Home
                 }
@@ -231,10 +232,9 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                             vm.stopPlaying()
                             val d = vm.detail.value
                             route = if (d != null && playedId != null && d.media.id == playedId) {
-                                Route.Detail(vm.activeSourceId.value ?: d.media.sourceId, d.media.id)
+                                Route.Detail
                             } else Route.Home
                         },
-                        onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
                     is Route.Sources -> MineScreen(

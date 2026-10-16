@@ -136,9 +136,7 @@ data class HealthReport(
 data class AggregatedMedia(
     val media: Media,
     val availability: List<SourceAvailability>,
-) {
-    val playableCount: Int get() = availability.count { it.health == Health.Ok || it.health == Health.Slow }
-}
+)
 
 data class SourceAvailability(
     val sourceId: String,
@@ -149,6 +147,29 @@ data class SourceAvailability(
     val latencyMs: Long? = null,
     val note: String? = null,
 )
+
+/**
+ * 元数据里能认出的画质档，认不出来返回 null。
+ *
+ * 只留这一份判法：详情页封面旁、源芯片、播放器「源」面板三处问的是同一件事
+ * ——「站点自己说这部片是几档」。以前各写一套（一份认 2160 和「蓝光」、另一份不认），
+ * 同一部片在同一屏上能给出两种答案。
+ * 只读站点给的字段，绝不写死一个上限：没有依据就宁可不写。
+ */
+fun qualityTagOf(m: Media): String? {
+    val t = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")
+    val fourK = t.contains("4k", true) || t.contains("2160")
+    val hdr = t.contains("hdr", true)
+    return when {
+        fourK && hdr -> "4K HDR"
+        fourK -> "4K"
+        hdr -> "HDR"
+        t.contains("蓝光") -> "蓝光"
+        t.contains("1080") -> "1080P"
+        t.contains("720") -> "720P"
+        else -> null
+    }
+}
 
 /**
  * 一次跨源搜索的成果：归并好的条目，加上**没查动的源和它的原因**。

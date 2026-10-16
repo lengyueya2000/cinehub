@@ -56,7 +56,15 @@ class DoubanRepository(private val context: Context) {
         scope.launch { runCatching { load() } }
     }
 
-    fun cached(chartId: String): Snapshot? = snapshots[chartId]
+    /**
+     * 落盘那一份也可能带着重复 id（去重这一条是后加的，老用户的盘上正是去重之前存的那份），
+     * 而片库那一格拿 id 当列表键 —— 撞键会当场崩。读这一道口上再洗一遍，比在每一处显示
+     * 之前各洗一遍便宜，也不会漏。
+     */
+    fun cached(chartId: String): Snapshot? = snapshots[chartId]?.let { s ->
+        val items = s.items.distinctBy { it.id }
+        if (items.size == s.items.size) s else s.copy(items = items)
+    }
 
     /** 拉一个榜。失败时抛出的是给用户看的话，不是异常栈。 */
     suspend fun fetch(chart: DoubanChart): List<DoubanItem> {
@@ -64,7 +72,10 @@ class DoubanRepository(private val context: Context) {
         val items = runCatching { if (chart.topList) parseTopList(body) else parseSubjects(body) }
             .getOrElse { throw IllegalStateException("豆瓣回的不是列表，多半是收紧了或者改了接口") }
         if (items.isEmpty()) throw IllegalStateException("豆瓣这个榜这次一条都没回")
-        return items
+        // 按 id 去重：豆瓣同一份列表里回两条同样的片子是有的（列表页翻页重叠、榜单本身重复收录）。
+        // 片库那一格用 id 当 LazyVerticalGrid 的键，撞键会当场崩在「Key was already used」上；
+        // 首页那份走 chunked(3) 的普通行不崩，但同一条片会摆两遍。
+        return items.distinctBy { it.id }
     }
 
     /** 取回成功后存一份，顺带落盘。 */

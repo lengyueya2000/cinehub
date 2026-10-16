@@ -12,10 +12,10 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -110,7 +110,8 @@ fun SearchScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Row(
-                Modifier.weight(1f).height(38.dp).clip(R.full).background(T.Surface2)
+                // 44dp：这是输入框，手指要在里面点定位光标
+                Modifier.weight(1f).height(44.dp).clip(R.full).background(T.Surface2)
                     .border(1.dp, T.Play500.copy(alpha = .42f), R.full).padding(horizontal = 14.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -138,16 +139,22 @@ fun SearchScreen(
                 // 清空只在有字时出现：空框里挂一个按了没反应的 × 比不挂更吵
                 if (query.isNotEmpty()) {
                     Spacer8()
+                    // 看得见的那颗圆保持 22dp，但把它的命中区铺满 44×44：
+                    // 原来按那一个 × 要点得很准，而它是这一行唯一的出口
                     Box(
-                        Modifier.size(22.dp).clip(CircleShape)
-                            .background(Color.White.copy(alpha = .10f))
-                            .clickable { vm.clearQuery() },
+                        Modifier.size(44.dp).clip(CircleShape).clickable { vm.clearQuery() },
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            Icons.Filled.Close, "清空搜索框",
-                            tint = T.TextDim, modifier = Modifier.size(12.dp),
-                        )
+                        Box(
+                            Modifier.size(22.dp).clip(CircleShape)
+                                .background(Color.White.copy(alpha = .10f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Filled.Close, "清空搜索框",
+                                tint = T.TextDim, modifier = Modifier.size(12.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -156,7 +163,10 @@ fun SearchScreen(
                 "取消",
                 color = T.TextDim,
                 fontSize = Fs.sm,
-                modifier = Modifier.clickable { vm.clearQuery(); onBack() },
+                // 44dp：这一颗和输入框并排，行高已经撑到 44 了，它自己那点字却只有 ~18dp 可点
+                modifier = Modifier.clip(R.full).heightIn(min = 44.dp)
+                    .clickable { vm.clearQuery(); onBack() }
+                    .padding(horizontal = 4.dp, vertical = 10.dp),
             )
         }
 
@@ -326,9 +336,11 @@ fun SearchScreen(
                     Text(
                         "另有 ${failures.size} 个源没答上话：" +
                             failures.joinToString("；") { "${it.sourceName} ${it.reason}" },
-                        color = T.TextFaint,
-                        fontSize = Fs.tiny,
-                        lineHeight = Fs.tiny * 1.6f,
+                        // 这一句承载的是「少了哪几个源、为什么少」这个事实，
+                        // 用最小最弱的那一号字（9.5sp + 黑底约 3.5:1）等于不想让人看见
+                        color = T.TextDim,
+                        fontSize = Fs.xs,
+                        lineHeight = Fs.xs * 1.6f,
                         modifier = Modifier.padding(top = Sp.s3),
                     )
                 }
@@ -422,7 +434,10 @@ private fun NoResultBlock(
             color = T.Play400,
             fontSize = Fs.sm,
             fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.clickable(onClick = onRetry),
+            // 44dp：这是这一屏唯一的出口，点不中就等于没有出口
+            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp)
+                .clickable(onClick = onRetry)
+                .padding(horizontal = 6.dp, vertical = 10.dp),
         )
     }
 }
@@ -453,7 +468,10 @@ private fun FilteredOutBlock(cat: String?, hidden: Int, onClear: () -> Unit) {
             color = T.Play400,
             fontSize = Fs.sm,
             fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.clickable(onClick = onClear),
+            // 同上：这一屏唯一的出口
+            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp)
+                .clickable(onClick = onClear)
+                .padding(horizontal = 6.dp, vertical = 10.dp),
         )
     }
 }
@@ -480,7 +498,6 @@ private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
     )
 }
 
-private fun Modifier.flex(f: Float): Modifier = this
 
 @Composable
 private fun ResultRow(agg: AggregatedMedia, onClick: (net.cinehub.data.model.SourceAvailability) -> Unit) {

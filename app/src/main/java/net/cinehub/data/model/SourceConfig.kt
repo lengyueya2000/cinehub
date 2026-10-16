@@ -116,11 +116,8 @@ data class HtmlRules(
      */
     val browsePath: String = "",
     val itemSelector: String = "a[href*=/play/]",
-    val titleSelector: String = "img@alt",
-    val coverSelector: String = "img@src",
     val detailPath: String = "/play/{id}",
     val episodeSelector: String = "a.episode-link",
-    val episodeNameAttr: String = "text",
     val episodeUrlAttr: String = "href",
     /**
      * 名字正好等于其中某一项的线路，**根本不列出来**。

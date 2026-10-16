@@ -127,7 +127,7 @@ private fun msToSec(ms: Long): Long = if (ms < 0L || ms == androidx.media3.commo
  * 源只是背后的一个数据来源，进度通过 ViewModel 跨源携带。
  *
  * 交互分两层：底下是一整块手势层（拖进度、双击快进退、竖滑音量/亮度、单击显隐），
- * 上面是会自动隐藏的控件。全屏时只留这两层 —— 渲染层徽标、右侧切源栏、选集抽屉
+ * 上面是会自动隐藏的控件。全屏时只留这两层 —— 右侧切源栏、选集抽屉
  * 都让位给画面，否则用户看到的是界面而不是片子。
  */
 @OptIn(UnstableApi::class)
@@ -135,7 +135,6 @@ private fun msToSec(ms: Long): Long = if (ms < 0L || ms == androidx.media3.commo
 fun PlayerScreen(
     vm: AppViewModel,
     onBack: () -> Unit,
-    onOpenDetail: (sourceId: String, mediaId: String) -> Unit,
 ) {
     val ctx = LocalContext.current
     val playing by vm.playing.collectAsState()
@@ -536,7 +535,10 @@ fun PlayerScreen(
 
     fun stepEpisode(delta: Int) {
         val i = episodes.indexOfFirst { it.index == playing?.episodeIndex }
-        val next = episodes.getOrNull((i + delta).coerceAtLeast(0)) ?: return
+        // 当前这一集在本条线路的清单里找不到（线路之间集号对不上）时不动。
+        // 以前 -1 加一挡就落到清单第一集，用户按「下一集」看到的是第 1 集。
+        if (i < 0) return
+        val next = episodes.getOrNull(i + delta) ?: return
         playEpisode(next)
     }
 
@@ -666,28 +668,8 @@ fun PlayerScreen(
                         Text(
                             "正在播放 · ${playing?.sourceName ?: ""}",
                             color = T.TextDim,
-                            fontSize = Fs.tiny,
+                            fontSize = Fs.xs,
                         )
-                        // 渲染层标识挂在标题下面而不是另起一层：
-                        // 之前它按固定 top 定位，退出全屏时正好压在「正在播放」那一行上。
-                        if (!fullscreen) {
-                            Spacer4()
-                            Row(
-                                Modifier.clip(R.full).background(Color.Black.copy(alpha = .58f))
-                                    .border(1.dp, T.Src500.copy(alpha = .30f), R.full)
-                                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text("◈", color = T.Src500, fontSize = Fs.tiny)
-                                Spacer4()
-                                Text(
-                                    "影枢渲染层 · 画面由本机解码",
-                                    color = T.Src500,
-                                    fontSize = Fs.tiny,
-                                    fontWeight = FontWeight.SemiBold,
-                                )
-                            }
-                        }
                     }
                     if (!fullscreen) {
                         Box(
@@ -759,7 +741,7 @@ fun PlayerScreen(
                         Text(
                             "刚才 ${last.sourceName}${last.lineName?.let { " · $it" } ?: ""}：${last.reason}",
                             color = T.TextDim,
-                            fontSize = Fs.tiny,
+                            fontSize = Fs.xs,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -769,8 +751,8 @@ fun PlayerScreen(
                             Text(
                                 "· ${a.sourceName}${a.lineName?.let { " · $it" } ?: ""} —— ${a.reason}",
                                 color = T.TextDim,
-                                fontSize = Fs.tiny,
-                                lineHeight = Fs.tiny * 1.5f,
+                                fontSize = Fs.xs,
+                                lineHeight = Fs.xs * 1.5f,
                             )
                         }
                         if (fb.exhausted) {
@@ -1148,16 +1130,6 @@ fun PlayerScreen(
                                     fontWeight = FontWeight.Bold,
                                 )
                             }
-                            Spacer8()
-                            Text(
-                                "跨源续播",
-                                color = T.Src500,
-                                fontSize = Fs.xxs,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clip(R.sm)
-                                    .border(1.dp, T.Src500.copy(alpha = .5f), R.sm)
-                                    .padding(horizontal = 7.dp, vertical = 3.dp),
-                            )
                         }
                     }
                 }
@@ -1389,7 +1361,7 @@ fun PlayerScreen(
                                     Spacer8()
                                     Text(
                                         "其它源里没对上这一部 —— 现在这个源是唯一对得上的。",
-                                        color = T.TextFaint, fontSize = Fs.tiny, lineHeight = Fs.tiny * 1.6f,
+                                        color = T.TextDim, fontSize = Fs.xs, lineHeight = Fs.xs * 1.6f,
                                     )
                                 }
                                 if (sibGaps.isNotEmpty()) {
@@ -1397,7 +1369,7 @@ fun PlayerScreen(
                                     Text(
                                         "另有 ${sibGaps.size} 个源没答上话：" +
                                             sibGaps.joinToString("、") { "${it.sourceName}（${it.reason}）" },
-                                        color = T.TextFaint, fontSize = Fs.tiny, lineHeight = Fs.tiny * 1.6f,
+                                        color = T.TextDim, fontSize = Fs.xs, lineHeight = Fs.xs * 1.6f,
                                     )
                                 }
                             }
@@ -1429,9 +1401,9 @@ fun PlayerScreen(
                                 // 这一行是这一格里唯一一句关于**画面**的话，上面那些是设置。
                                 if (playingHeight > 0) "此刻在放 ${playingHeight}P。"
                                 else "还没量到 —— 这一条流解不出档位之前，那一格说的是设置，不是画面。",
-                                color = T.TextFaint,
-                                fontSize = Fs.tiny,
-                                lineHeight = Fs.tiny * 1.6f,
+                                color = T.TextDim,
+                                fontSize = Fs.xs,
+                                lineHeight = Fs.xs * 1.6f,
                             )
                             Text(
                                 "只有源站给了多档分辨率时这里才有得选。",

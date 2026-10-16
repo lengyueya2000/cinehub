@@ -133,13 +133,14 @@ fun HomeScreen(
                     Text("影枢", color = T.Text, fontSize = Fs.sec, fontWeight = FontWeight.ExtraBold)
                     Spacer12()
                     Row(
-                        Modifier.weight(1f).height(36.dp).clip(R.full).background(T.Surface2)
+                        // 44dp：这是全应用的主搜索门，36dp 在手里按不准
+                        Modifier.weight(1f).height(44.dp).clip(R.full).background(T.Surface2)
                             .clickable(onClick = onOpenSearch).padding(horizontal = 13.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Icons.Filled.Search, null, tint = T.TextFaint, modifier = Modifier.size(14.dp))
                         Spacer8()
-                        Text("搜索影片、演员、播放源", color = T.TextFaint, fontSize = Fs.sm)
+                        Text("搜索影片、演员、播放源", color = T.TextDim, fontSize = Fs.sm)
                     }
                 }
             }
@@ -252,10 +253,11 @@ fun HomeScreen(
                         // 这一页可能是不知多久以前落盘的那份先上屏的，不说几点取回的就没人知道它新不新。
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             if (homeAt > 0L) {
+                                // 这一句承载的是「这份榜新不新」这个事实，别用最小最弱的那一号字
                                 Text(
                                     "取回于 ${formatFetchedAt(homeAt)}",
-                                    color = T.TextFaint,
-                                    fontSize = Fs.tiny,
+                                    color = T.TextDim,
+                                    fontSize = Fs.xs,
                                 )
                             }
                             Box(Modifier.weight(1f))
@@ -264,10 +266,12 @@ fun HomeScreen(
                                 color = if (loading) T.TextFaint else T.Src500,
                                 fontSize = Fs.xs,
                                 fontWeight = FontWeight.SemiBold,
+                                // 44dp：同一件事在页顶那条横幅上是 44dp，这里两处的门不一样高
                                 modifier = Modifier
                                     .clip(R.full)
+                                    .heightIn(min = 44.dp)
                                     .clickable(enabled = !loading, onClick = vm::refreshHome)
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    .padding(horizontal = 8.dp, vertical = 8.dp),
                             )
                         }
                         Spacer4()
@@ -375,20 +379,8 @@ private fun HeroCard(
                 )
             )
         )
-        Row(
-            Modifier.align(Alignment.TopStart).padding(Sp.s3)
-                .clip(R.full)
-                .background(Color.Black.copy(alpha = .62f))
-                .padding(horizontal = 10.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "豆瓣 · 剧集热门",
-                color = T.Src500,
-                fontSize = Fs.xxs,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
+        // 这一张卡不再在封面上挂一遍「豆瓣 · 剧集热门」：同一个名字在 60dp 之下那个
+        // 区块的标题上已经写过一次（SectionHead），这里第二份只是装饰，不答任何问题。
         Column(Modifier.align(Alignment.BottomStart).padding(Sp.s4)) {
             Text(
                 title,
@@ -403,8 +395,9 @@ private fun HeroCard(
             Spacer12()
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Row(
+                    // 44dp：这一颗是这一屏唯一会把人带进播放的门
                     Modifier
-                        .height(34.dp)
+                        .height(44.dp)
                         .clip(R.full)
                         .background(Brush.verticalGradient(listOf(T.Play400, T.Play500)))
                         .clickable(enabled = !resolving, onClick = onPlay)
