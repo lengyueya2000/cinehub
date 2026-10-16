@@ -153,30 +153,40 @@ object BrowserEngine {
     /** 带回正文，和**它真正花了多久**（排队等锁的那段不算，那个数字要拿去显示在界面上）。 */
     private suspend fun fetch(url: String, timeoutSec: Long): Pair<Http.ResponseBody, Long> {
         val origin = originOf(url) ?: error("这个地址没有主机名，浏览器内核不知道该打开谁")
-        val out = withTimeoutOrNull(WALL_MS) {
-            gate.withLock {
-                val wv = ensure()
-                val t0 = System.currentTimeMillis()
-                val r = if (!warm(wv, url)) {
-                    Http.ResponseBody("浏览器内核没能把这一源打开（过题那一次加载没回来）", 0)
-                } else {
-                    var one = request(wv, origin, url, timeoutSec)
-                    if (isChallenge(one) || one.status == 0) {
-                        // 两种「还没到」：题页还挂着（403 那张），或者这一趟压根没回话 ——
-                        // 后者就是文档在我们发出 fetch 之后自己跳走了，脚本连上下文一起没。
-                        // 两种都重新加载一次、让引擎再答一遍，然后只问第二次。
-                        // 不循环 —— 反复交卷正是把限流踩深的东西（高清点播那边实测连着打会改回 429）。
-                        one = if (!warm(wv, url, force = true)) {
-                            Http.ResponseBody("重答一次也没能把这一源打开", 0)
-                        } else {
-                            request(wv, origin, url, timeoutSec)
-                        }
+        // 总闸在锁**里面**起算。上一版写作 withTimeoutOrNull(WALL_MS) { gate.withLock { … } }，
+        // 于是「排队等别的源过题」的时间也从这一趟的预算里扣：一个源都还没碰，就被判
+        // 「浏览器内核这一趟超过 70 秒 —— 放弃」。这句会经 MediaRepository.check 写成
+        // Health.Down —— 一个本来健康的源在界面上变红、被自动换源跳过，而给的原因是假的。
+        //
+        // 预算现在往下传：暖机与每一趟问话都只看还剩多少，所以「重答一遍」这条设计主路
+        // 不会因为一次慢暖机就系统性地拿不到时间。
+        val out = gate.withLock {
+            val deadline = System.currentTimeMillis() + WALL_MS
+            val wv = ensure()
+            val t0 = System.currentTimeMillis()
+            val r = if (!warm(wv, url, deadline)) {
+                Http.ResponseBody("浏览器内核没能把这一源打开（过题那一次加载没回来）", 0)
+            } else {
+                var one = request(wv, origin, url, timeoutSec, deadline)
+                if (isChallenge(one) || one.status == 0) {
+                    // 两种「还没到」：题页还挂着（403 那张），或者这一趟压根没回话 ——
+                    // 后者就是文档在我们发出 fetch 之后自己跳走了，脚本连上下文一起没。
+                    // 两种都重新加载一次、让引擎再答一遍，然后只问第二次。
+                    // 不循环 —— 反复交卷正是把限流踩深的东西（高清点播那边实测连着打会改回 429）。
+                    one = if (!warm(wv, url, deadline, force = true)) {
+                        Http.ResponseBody(
+                            "重答一次也没能把这一源打开（这一趟最多 ${WALL_MS / 1000} 秒，" +
+                                "暖机和问话都在里面）",
+                            0,
+                        )
+                    } else {
+                        request(wv, origin, url, timeoutSec, deadline)
                     }
-                    one
                 }
-                r to (System.currentTimeMillis() - t0)
+                one
             }
-        } ?: error("浏览器内核这一趟超过 ${WALL_MS / 1000} 秒 —— 放弃")
+            r to (System.currentTimeMillis() - t0)
+        }
         if (out.first.status == 0) error(out.first.body)
         return out
     }
@@ -241,7 +251,7 @@ object BrowserEngine {
      * 暖机报成功，紧接着的 fetch 拿回 403 那道题，界面上就成了「影枢答过一次还是没过」，
      * 而真相是「我们抢在它答完之前问了」。
      */
-    private suspend fun warm(wv: WebView, url: String, force: Boolean = false): Boolean {
+    private suspend fun warm(wv: WebView, url: String, deadlineMs: Long, force: Boolean = false): Boolean {
         val origin = originOf(url) ?: return false
         if (!force && liveOrigin == origin && !loading) return true
         try {
@@ -258,7 +268,9 @@ object BrowserEngine {
             liveOrigin = null
             throw e
         }
-        val deadline = System.currentTimeMillis() + WARM_TIMEOUT_MS
+        // 暖机上限取「常量」和「这一趟还剩多少」里更短的那个：总闸已经在锁里起算，
+        // 慢暖机不该把后面那次问话的时间花光。
+        val deadline = minOf(System.currentTimeMillis() + WARM_TIMEOUT_MS, deadlineMs)
         var quietSince = 0L
         while (System.currentTimeMillis() < deadline) {
             delay(WARM_POLL_MS)
@@ -274,7 +286,12 @@ object BrowserEngine {
             liveOrigin = null
             return false
         }
-        return docOrigin(wv) == origin
+        val arrived = docOrigin(wv) == origin
+        // 答完题那颗 cf_clearance 只在 WebView 的内存里；不 flush 就可能随着进程被回收一起没了。
+        // 上面那句类注释承诺的是「落盘、跨启动有效」—— 全项目原本只有「站点页取链」那一页
+        // 关闭时 flush 一次，而这颗引擎从不 flush，所以那份承诺在 FreeOK 这条路上是空的。
+        if (arrived) runCatching { CookieManager.getInstance().flush() }
+        return arrived
     }
 
     /** 引擎此刻还挂在题页上吗。题页的标题就是 `Just a moment...`，而它占的是你要的那个地址。 */
@@ -289,6 +306,7 @@ object BrowserEngine {
         origin: String,
         url: String,
         timeoutSec: Long,
+        deadlineMs: Long,
     ): Http.ResponseBody {
         if (docOrigin(wv) != origin) {
             // 文档不在这源上就别发这条 fetch：跨源的 fetch 只会拿到一条 CORS 错，
@@ -296,6 +314,13 @@ object BrowserEngine {
             liveOrigin = null
             return Http.ResponseBody("这一源的页面没停在它自己身上（引擎现在在 ${docOrigin(wv) ?: "别的地方"}）", 0)
         }
+        // 问话上限同样只看还剩多少。留出 1 秒余量：连 1 秒都不剩时发出去的 fetch
+        // 一定回不来，而那种失败长得和「这个源不放」一模一样。
+        val budgetMs = minOf(timeoutSec * 1000, deadlineMs - System.currentTimeMillis())
+        if (budgetMs < 1_000L) {
+            return Http.ResponseBody("这一趟留给问话的时间不足 1 秒（暖机把它花完了）", 0)
+        }
+        val askedSec = (budgetMs / 1000).coerceAtLeast(1L)
         val token = newToken()
         val d = CompletableDeferred<Reply>()
         pending[token] = d
@@ -306,8 +331,8 @@ object BrowserEngine {
             ".catch(function(e){__cinehub.reply($q,0,String(e),0)})"
         try {
             onMain { wv.evaluateJavascript(script, null) }
-            val r = withTimeoutOrNull(timeoutSec * 1000) { d.await() }
-                ?: return Http.ResponseBody("这一页在 ${timeoutSec}s 内没回话", 0)
+            val r = withTimeoutOrNull(budgetMs) { d.await() }
+                ?: return Http.ResponseBody("这一页在 ${askedSec}s 内没回话", 0)
             if (r.length > CHAR_CAP) error("这个源回的内容超过 $CHAR_CAP 字符，不像一份能解析的接口")
             return Http.ResponseBody(body = r.body, status = r.status)
         } finally {

@@ -310,9 +310,14 @@ fun PlayerScreen(
             androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(data)
                 .createMediaSource(item)
         }
-        // 换集 / 换源走 setMediaSource，不走 stop()：stop 会把带宽估计一起清零，
-        // 于是每换一集都要从第一档重新试一遍码率 —— 用户看到的正是「每集开头都要卡几秒」。
-        // 估计留着，起播就直接落到上一集已经量出来的那一档。
+        // 换集 / 换源走 setMediaSource + prepare，不走 release/rebuild 那颗播放器：
+        // 重建要把 trackSelector、带宽估计、Surface 全搬一遍，那才是真的从头来。
+        //
+        // 但别把这一句读成「换集一定保住了带宽估计」：vm.play() 会先发出一帧
+        // streamUrl=null 的 Playing（那是「我收到了」这一步），主 effect 于是先在
+        // 上面那个 null 分支里 player.stop() 一次，才走到这里。stop() 对估计做了什么
+        // 没有实测过 —— 原来这段注释断言的是「不 stop 所以估计留着、起播直接落到上一集
+        // 那一档」，那句是没有依据的，留着只会让人以为这条优化已经生效。
         player.setMediaSource(source)
         player.prepare()
         // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 轮询会把那个活值写成 0，
@@ -342,7 +347,17 @@ fun PlayerScreen(
 
     // 轮询播放位置；顺带把这一条流里真实存在的视频高度取出来给「画质」用 ——
     // 只有 Media3 解出 master playlist 之后才知道有几档，不能凭空列。
-    LaunchedEffect(player) {
+    //
+    // 键里必须带上「这是哪一集、哪个源、哪条地址」。这个循环里读到的 `playing` 是协程创建
+    // 那一刻的快照，媒体一换它就是旧的；而落盘走的是 vm 里**已经翻成新那一集**的 _playing。
+    // 原来只键在 player 上，于是换集/换线路以后有一个 tick 会拿着旧播放器里**旧那一集**的
+    // 位置，往**新那一集**的记录上写 —— 下次进来直接从上一集的秒数开始播，一点报错都没有。
+    LaunchedEffect(player, playing?.sourceId, playing?.episodeIndex, playing?.streamUrl) {
+        // 另一条流就是另一条流：上一流的档数与档位不作数，等它自己报
+        videoHeights = emptyList()
+        playingHeight = 0
+        var lastPos = -1L
+        var lastDur = -1L
         while (true) {
             pos = msToSec(player.currentPosition)
             dur = msToSec(player.duration)
@@ -351,7 +366,15 @@ fun PlayerScreen(
             // prepare 之前那一句 seekTo 就已经让 currentPosition 报出续播起点了 —— 
             // 不问一句就写，等于把「这一集根本没播开」记成「看到了第 18 分钟」，
             // 下次进来「已经看完了」的判断、继续观看的位置全是拿它算的。
-            if (player.playbackState == Player.STATE_READY) vm.updatePosition(pos, dur)
+            //
+            // 而且**只在数字真的变了时**落盘：暂停着、退到后台放着（影枢没有前台服务，
+            // ON_STOP 只 pause）都还是 STATE_READY，原来这一句会一路把同一个位置每 500ms
+            // 量一次、每 10 秒往 DataStore 写一笔，横穿整个后台期间磨盘。
+            if (player.playbackState == Player.STATE_READY && (pos != lastPos || dur != lastDur)) {
+                vm.updatePosition(pos, dur)
+                lastPos = pos
+                lastDur = dur
+            }
             val (hs, sel) = runCatching {
                 val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
                 val heights = groups
@@ -480,7 +503,8 @@ fun PlayerScreen(
     }
     val cacheLabel = when (cacheTask?.status) {
         DownloadStatus.Done -> "已缓存"
-        DownloadStatus.Running -> "缓存 ${(cacheTask.progress * 100).toInt()}%"
+        DownloadStatus.Running ->
+            if (cacheTask.hasPercent) "缓存 ${(cacheTask.progress * 100).toInt()}%" else "缓存中"
         DownloadStatus.Queued -> "排队中"
         DownloadStatus.Paused -> "继续缓存"
         DownloadStatus.Failed -> "缓存失败"
@@ -864,8 +888,18 @@ fun PlayerScreen(
                                 .background(Color.White.copy(alpha = .14f))
                                 .clickable {
                                     errText = null
+                                    // prepare() 之后播放器会回到这一段的开头，所以位置得先抓下来、
+                                    // 起播以后再放回去。原来这里是裸 prepare()+play()：
+                                    // 看到二十分钟处报了一次错，点「重试」就回到 0:00，
+                                    // 而那句「续播」的功劳全在给媒体源的那一处，这里没接上。
+                                    val back = player.currentPosition.let {
+                                        if (it < 0L || it == androidx.media3.common.C.TIME_UNSET)
+                                            (playing?.resumeFrom ?: 0L) * 1000
+                                        else it
+                                    }
                                     player.prepare()
                                     player.play()
+                                    if (back > 0L) player.seekTo(back)
                                 }
                                 .padding(horizontal = 16.dp, vertical = 7.dp),
                         )
@@ -1217,35 +1251,58 @@ fun PlayerScreen(
                                 Modifier.weight(1f).verticalScroll(rememberScrollState()),
                             ) {
                                 lines.forEachIndexed { i, l ->
-                                    Text(
-                                        l.name.take(18),
-                                        color = if (i == safeLine) T.Play400 else T.Text,
-                                        fontSize = Fs.sm,
-                                        modifier = Modifier.fillMaxWidth()
+                                    val cur = playing?.episodeIndex ?: 1
+                                    // 这一条线路有没有正在播的这一集。缺集是真实存在的：
+                                    // 自动换源那套 nextLine 就专门跳过这种线路。
+                                    val has = l.episodes.any { it.index == cur }
+                                    Row(
+                                        Modifier.fillMaxWidth()
                                             .clip(R.sm)
                                             .background(
                                                 if (i == safeLine) T.Play500.copy(alpha = .16f) else Color.Transparent
                                             )
-                                            .clickable {
+                                            .clickable(enabled = has) {
                                                 // 换线路 = 换一套地址，集数按 index 对齐，
                                                 // **进度也要跟着过去**：还是同一部片的同一集，
                                                 // 从 0 开始等于把看到一半的位置扔了。
-                                                // 原来这里漏传了 keepPos，playEpisode 那个参数
-                                                // 一直是默认值 0 —— 换集是对的，换线路不是。
                                                 //
-                                                // 读的是这一刻的 player.currentPosition，不是
-                                                // vm.resumePosition：那个活值会被轮询和 stop() 冲成 0
-                                                // （见上面 setMediaSource 那条注释同一件事），
-                                                // 而换线路这一笔马上就要停旧起新，从它那儿读有概率拿到 0。
-                                                val cur = playing?.episodeIndex ?: 1
-                                                val at = msToSec(player.currentPosition)
-                                                lines.getOrNull(i)?.episodes?.firstOrNull { it.index == cur }
+                                                // 读的是一刻的 player.currentPosition，不是
+                                                // vm.resumePosition：那个活值会被轮询和 stop() 冲成 0。
+                                                // 播放器已经进 IDLE（报错以后、还在解析以后）时它是
+                                                // TIME_UNSET —— 那正是最需要换线路的时候，于是退回
+                                                // 这一笔起播时冻结的 resumeFrom，而不是当 0 处理。
+                                                val raw = player.currentPosition
+                                                val at = if (raw < 0L || raw == androidx.media3.common.C.TIME_UNSET) {
+                                                    (playing?.resumeFrom ?: 0L).coerceAtLeast(0L)
+                                                } else {
+                                                    msToSec(raw)
+                                                }
+                                                l.episodes.firstOrNull { it.index == cur }
                                                     ?.let { playEpisode(it, keepPos = at) }
+                                                // 只有真的换了才翻页。原来这里无条件 lineIndex = i：
+                                                // 缺集的那一条点下去什么也没播，芯片却翻成「线路 i/n」、
+                                                // 分集列表跟着换成那一套 —— 屏上说的和耳里放的对不上。
                                                 lineIndex = i
                                                 panel = null
                                             }
                                             .padding(horizontal = 12.dp, vertical = 10.dp),
-                                    )
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            l.name.take(18),
+                                            color = if (i == safeLine) T.Play400 else T.Text,
+                                            fontSize = Fs.sm,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        // 按不动的那一条要自己把原因说出来，不能只把点击吞掉
+                                        if (!has) {
+                                            Text(
+                                                "没有第 $cur 集",
+                                                color = T.TextFaint,
+                                                fontSize = Fs.xs,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }

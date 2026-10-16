@@ -295,7 +295,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            // 先补这一版新加的内置源，再开始订阅列表、再量健康度。
+            // 先补这一版新加的内置源，再量健康度。
             // 顺序不能反：mutate 每一笔都会刷新「见过」那份账，先落了别的写，
             // 新源就被记成见过了、反而补不进来。
             val fresh = runCatching { sourceRepo.syncNewSeeds() }.getOrDefault(emptyList())
@@ -303,8 +303,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _seedNotice.value = "这次更新补进来 ${fresh.size} 个新源：" +
                     fresh.joinToString("、") { it.name } + "。不想要就在下面删掉，删了不会再自动加回来。"
             }
-            sourceRepo.sources.collect { _sources.value = it }
+            // 这一句不能排在 sources.collect 后面：那是一个永不返回的订阅
+            // （DataStore 的流不会结束），排在它后面的代码一行都跑不到。
+            // 上一版就是这么把开机首轮探测弄成死代码的 —— 后果是整个列表全灰「未检测」。
             refreshHealth()
+        }
+        viewModelScope.launch {
+            sourceRepo.sources.collect { _sources.value = it }
         }
         // 首页那一份不在这里取：和片库一样，只在真的显示这一屏时才敲豆瓣的门 ——
         // 由 HomeScreen 那边驱动，省得用户直接进「我的」也白取一趟榜单。
@@ -375,7 +380,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _siblingFailures.value = s.failures
                 // 当前这个源仍排第一：那一栏的次序就是「你正在用哪个源」的次序
                 val act = _activeSourceId.value
-                _siblings.value = s.items.sortedByDescending { it.sourceId == act }
+                val list = s.items.sortedByDescending { it.sourceId == act }
+                // 「先塞当前源再补齐」这条口径 openDetail 有、这一条没有 —— 于是点一次
+                // 「重新检测」就能把面板清空：当前源被停用（siblingsOf 只扇出启用的源），
+                // 或这一部在该源自搜搜不回来，items 就是空。空的 siblings 到了界面上
+                // 渲染成「正在比对该片在其它源的情况…」，而比对明明已经跑完 ——
+                // 那句谎永不撤回，当前源那一格也一起没了。这里按 openDetail 同一口径补上。
+                _siblings.value = if (act != null && list.none { it.sourceId == act }) {
+                    val cfg = sourceRepo.all().firstOrNull { it.id == act }
+                    listOf(
+                        SourceAvailability(
+                            sourceId = act,
+                            sourceName = cfg?.name ?: act,
+                            item = d.media,
+                            health = _health.value[act]?.health ?: Health.Unknown,
+                            quality = qualityOf(d.media),
+                            latencyMs = _health.value[act]?.latencyMs,
+                        ),
+                    ) + list
+                } else {
+                    list
+                }
                 _siblingsOf = d.media.key
             } finally {
                 // 只由当代这一次关转圈：被顶掉的那趟把新一次的圈关掉，
@@ -1139,6 +1164,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         r.detail = null
         r.tried.clear()
         r.accounted = false
+        // 上一轮如果是靠「去别的源找过这一部」才判的没戏，这个位还立着。
+        // 它是 reportPlaybackFailure 的一句 `if (r.findingSiblings) return` 的闸门：
+        // 不跟着这一轮一起清零，重试以后当前源的线路再走完时那句 return 会当场拦下 ——
+        // 既不重新去别的源找，也不再 publish(exhausted=true)，横幅就永远停在
+        // 「正在试 · 第 N 次」，而实际上什么都没在跑，用户也没有出口。
+        r.findingSiblings = false
         _fallback.value = null
         switchWithinRound(r, 0)
     }
@@ -1228,6 +1259,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         it.lineCursor = lineIndexOf(it.detail, episodeIndex, episodeUrl)
                         it.attemptUrl = episodeUrl
                         it.accounted = false
+                        // 已经播开了以后那句「现在是 源 · 线路」也跟着改口。原来这里只挪游标、
+                        // 不重发横幅：用户手动换过线路，播的是这一条、屏上写的还是上一轮那一条，
+                        // 而这一句是「此刻在放什么」的唯一屏幕内交代。
+                        _fallback.value?.takeIf { fb -> fb.settled }?.let { fb ->
+                            val nm = lineNameOf(it)
+                            if (nm != null) _fallback.value = fb.copy(tryingLineName = nm)
+                        }
                     }
                 } else _playing.value?.let { beginRound(it, _playingSiblings.value, _playingDetail.value) }
                 _resumePosition.value = start
@@ -1645,6 +1683,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 这一轮的流水跟着这一次播放一起结束：回详情页再进来该看到干净的面板
         round = null
         _fallback.value = null
+        // 取链那趟还在跑就得当场掐掉、并把代号作废：它后面还会走到「这个源要现算地址，
+        // 直接把站点页开给他」那一步（见 play 里的 openSiteBrowser）。不掐的后果是用户
+        // 退出播放器回到详情页/首页以后，站点页的 WebView 突然盖上来 —— 他要看的已经不是这一部了。
+        playGen++
+        playJob?.cancel()
+        playJob = null
     }
 
     // ---------- 收藏与观看记录 ----------

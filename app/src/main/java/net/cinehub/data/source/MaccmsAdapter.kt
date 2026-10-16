@@ -87,19 +87,36 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
             sourceId = config.id,
         )
 
-        val fromNames = item.str(rules.playFromField)?.split("$$$") ?: emptyList()
-        val urlGroups = item.str(rules.playUrlField)?.split("$$$") ?: emptyList()
+        // 线路之间是两三个 `$`（苹果 CMS 的文档写 `$$`，实测这批站里是 `$$$`），
+        // 而**每一集内部**是「名字$地址」—— 正好一个 `$`。所以分隔按「两个及以上」切：
+        // 按 `$$$` 硬切的站一旦给的是 `$$`，整表会被并成一条线路、边界那一集直接吞掉；
+        // 按单个 `$` 切则把每集自己劈开。
+        val lineSplit = Regex("\\$\\$+")
+        val fromNames = item.str(rules.playFromField)?.split(lineSplit) ?: emptyList()
+        val urlGroups = item.str(rules.playUrlField)?.split(lineSplit) ?: emptyList()
 
         val lines = urlGroups.mapIndexed { gi, group ->
-            val eps = group.split("#").mapNotNull { seg ->
-                val parts = seg.split("$")
-                if (parts.size < 2) return@mapNotNull null
-                Episode(name = parts[0].trim(), index = 0, playUrl = parts[1].trim())
-            }.mapIndexed { i, e -> e.copy(index = i + 1) }
-
+            val raw = group.split("#").mapNotNull { seg ->
+                val parts = seg.split("$", limit = 2)
+                if (parts.size < 2 || parts[1].isBlank()) return@mapNotNull null
+                parts[0].trim() to parts[1].trim()
+            }
+            // 集号优先认名字里那个编号，认不到才按位置数。
+            //
+            // 按位置数在这里是个真窟窿：只要有一条脏分片被上面那句丢掉，后面每一集的
+            // index 就集体前移一格 —— A 线的第 5 集变成 B 线的第 4 集。而「换线路保进度」
+            // 与「点第 N 集播第 N 集」全靠 index 对齐，于是播的是另一集，
+            // 写进观看记录的也是那个错集号，且一点报错都没有。
+            // HtmlAdapter 那边早就防过同一件事（还防了倒序模板把集号排反），这条 JSON 路径漏了。
             PlayLine(
                 name = fromNames.getOrNull(gi)?.takeIf { it.isNotBlank() } ?: "线路 ${gi + 1}",
-                episodes = eps,
+                episodes = raw.mapIndexed { i, pair ->
+                    Episode(
+                        name = pair.first,
+                        index = episodeNoOf(pair.first) ?: (i + 1),
+                        playUrl = pair.second,
+                    )
+                },
             )
         }.filter { it.episodes.isNotEmpty() }
 
@@ -177,7 +194,20 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
             )
         }
     }
+
+    /**
+     * 从分集名字里认那个编号：`第12集`、`12期`、`HD 7 4K` 里那个 7 都算。
+     * 认不出来返回 null，由调用方退回按位置数。
+     */
+    private fun episodeNoOf(name: String): Int? {
+        EP_NO.find(name)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        EP_LEADING.find(name)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return null
+    }
 }
+
+private val EP_NO = Regex("第\\s*(\\d{1,4})\\s*[集期话]")
+private val EP_LEADING = Regex("^\\s*(\\d{1,3})\\b")
 
 private val JsonElement.contentOrNull: String?
     get() = (this as? JsonPrimitive)?.takeIf { it.isString || it.content != "null" }?.content

@@ -136,9 +136,15 @@ fun SiteBrowserScreen(
         onDispose {
             if (wv != null) {
                 // 停loading只停了页面自己的加载，页面里那个正在播的 <video> 会继续出声继续耗流量 ——
-                // 先让页面自己把媒体停了，再 onPause 摁住后台播放/定时，stopLoading 掐掉还在跑的请求
+                // 先让页面自己把媒体停了，再 stopLoading 掐掉还在跑的请求。
+                //
+                // 这里不能再叠 onPause()：平台文档写明 onPause 作用于**本进程所有 WebView**，
+                // 它把页面整体 background 化、推迟 timer 与周期任务。而影枢里另一台 WebView 是
+                // BrowserEngine 那台取数引擎 —— 用户关掉站点页那一瞬它可能正卡在 Cloudflare
+                // 那道题上，题的计时器被冻住就再也不会回话，30 秒暖机白等，最后报
+                // 「这个源接不进来了」，还把那个源在健康表里判死。全项目没有任何一处 onResume
+                // 能把它解开来，这份假死一直留到进程重启。
                 runCatching { wv.evaluateJavascript(PauseMediaJs, null) }
-                runCatching { wv.onPause() }
                 runCatching { wv.stopLoading() }
                 // 必须先从父布局摘出来再 destroy，否则 WebView 被父 view 引用着，销毁不掉、还泄漏
                 runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }

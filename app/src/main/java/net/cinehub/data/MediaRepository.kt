@@ -33,6 +33,15 @@ class MediaRepository(private val sources: SourceRepository) {
     private val healthAt = ConcurrentHashMap<String, Long>()
 
     /**
+     * 这一份健康报告是**对着哪个地址**量出来的。
+     *
+     * 只按源 id 缓存会出这样一件事：用户在「播放源管理」里把某个源的 baseUrl 改了、
+     * 存下之后 10 分钟内（HEALTH_TTL_MS）界面继续挂着上一个站的状态和毫秒数 ——
+     * 搜索页那行延迟数字是直接打印它的。地址换了，这一栏的结论就该作废重来。
+     */
+    private val healthProbeKey = ConcurrentHashMap<String, String>()
+
+    /**
      * 健康度多久算过期。
      *
      * 原来只有 `Down` 会过期（一分钟）—— 意思是「一次都没探通」会自己重试，
@@ -51,10 +60,13 @@ class MediaRepository(private val sources: SourceRepository) {
         val age = System.currentTimeMillis() - at
         val expired = cached != null &&
             (if (cached.health == Health.Down) age > DOWN_RETRY_MS else age > HEALTH_TTL_MS)
-        if (!force && cached != null && !expired) return cached
+        // 量的是这一条：baseUrl 或「要不要走浏览器内核」换了，旧的那份就不是这一路的结论了
+        val probeKey = "${cfg.baseUrl.trimEnd('/')}|${cfg.needsBrowser}"
+        if (!force && cached != null && !expired && healthProbeKey[cfg.id] == probeKey) return cached
         val report = check(cfg)
         healthCache[cfg.id] = report
         healthAt[cfg.id] = System.currentTimeMillis()
+        healthProbeKey[cfg.id] = probeKey
         return report
     }
 
@@ -97,40 +109,55 @@ class MediaRepository(private val sources: SourceRepository) {
             // 这里不按健康度设闸门：探根路径失败不代表这个源取不到内容，
             // 拿 Down 当闸门会让一次抖动把源整个会话判死 —— 表现就是「搜索失效、少了几个源」。
             async {
-                val t0 = System.currentTimeMillis()
                 val r = quietly { SourceAdapters.create(cfg).search(keyword, 1) }
                 val list = r.getOrNull().orEmpty()
-                // 真取回了内容，就是比探根路径更硬的证据 —— 用它把「不可用」洗掉，
-                // 否则界面上会出现「这个源给了结果、却标着不可用」的自相矛盾。
-                if (list.isNotEmpty()) {
-                    val cost = System.currentTimeMillis() - t0
-                    healthCache[cfg.id] = HealthReport(if (cost < 800) Health.Ok else Health.Slow, cost)
-                    healthAt[cfg.id] = System.currentTimeMillis()
-                }
+                if (list.isNotEmpty()) washHealth(cfg.id)
                 Triple(cfg, list, r.exceptionOrNull())
             }
         }.map { it.await() }
 
+        // 归并的桶按「片名指纹」开，年份只在两个桶真打架时才分家。
+        //
+        // 原来直接用 Media.key（归一化片名 + 年份）当桶，于是「有的源给年份、有的不给」
+        // 会被当成两部不同的片 —— 实测这批站里 4kku 的卡片带年份、懂片帝与 FreeOK 不带：
+        // 同一部片搜成两行，各自只挂一个源徽标，那句「1 个源可播」就成了假话，
+        // 而点进任意一行都能给出对方的源（详情那条路用的是宽松判据，见 [sameWork]）。
+        // 两条路口径不一致，就该按宽松那一条统一：有一方没年份即算同一部。
+        val byFp = LinkedHashMap<String, MutableList<Pair<SourceConfig, Media>>>()
+        per.forEach { (cfg, list, _) ->
+            // 同一个源可能对同一部片返回多条（不同线路各算一条），先在本源内去掉，
+            // 否则徽标会重复出现
+            list.groupBy { it.key }.forEach { (_, dupes) ->
+                byFp.getOrPut(titleFingerprint(dupes.first().title)) { mutableListOf() } += cfg to dupes.first()
+            }
+        }
+
         val merged = LinkedHashMap<String, MutableList<SourceAvailability>>()
         val seed = HashMap<String, Media>()
-
-        per.forEach { (cfg, list, _) ->
-            val health = healthCache[cfg.id]?.health ?: Health.Unknown
-            // 同一个源可能对同一部片返回多条（不同线路各算一条），
-            // 归并后只保留这个源最好的一条，否则徽标会重复出现。
-            list.groupBy { it.key }.forEach { (key, dupes) ->
-                val m = dupes.first()
-                seed.putIfAbsent(key, m)
-                val slot = merged.getOrPut(key) { mutableListOf() }
-                if (slot.none { it.sourceId == cfg.id }) {
-                    slot += SourceAvailability(
-                        sourceId = cfg.id,
-                        sourceName = cfg.name,
-                        item = m,
-                        health = health,
-                        quality = qualityTag(m),
-                        latencyMs = healthCache[cfg.id]?.latencyMs,
-                    )
+        byFp.forEach { (fp, bucket) ->
+            val years = bucket.mapNotNull { yearOf(it.second) }.distinct()
+            val groups: List<Pair<String?, List<Pair<SourceConfig, Media>>>> = if (years.size <= 1) {
+                listOf(years.firstOrNull() to bucket)
+            } else {
+                // 同名不同年（重拍、同名续作）才按年份分家；没带年份的那些归进第一档，
+                // 因为这里没有更多信息可判，而把它们单独成一行同样是在骗人
+                bucket.groupBy { yearOf(it.second) ?: years.first() }.map { (y, ms) -> y to ms }
+            }
+            groups.forEach { (year, items) ->
+                val key = if (year == null) fp else "$fp|$year"
+                items.forEach { (cfg, m) ->
+                    val slot = merged.getOrPut(key) { mutableListOf() }
+                    if (slot.none { it.sourceId == cfg.id }) {
+                        slot += SourceAvailability(
+                            sourceId = cfg.id,
+                            sourceName = cfg.name,
+                            item = m,
+                            health = healthCache[cfg.id]?.health ?: Health.Unknown,
+                            quality = qualityTag(m),
+                            latencyMs = healthCache[cfg.id]?.latencyMs,
+                        )
+                        seed.putIfAbsent(key, m)
+                    }
                 }
             }
         }
@@ -210,17 +237,12 @@ class MediaRepository(private val sources: SourceRepository) {
         val active = sources.active()
         val per = active.map { cfg ->
             async {
-                val t0 = System.currentTimeMillis()
                 // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
                 val (hits, err) = findInSource(cfg, media.title, want, year)
                 // 真取回了内容，就是比探根路径更硬的证据 —— 和 [searchOnIo] 同一件事，
                 // 这里原先没做：于是播放器里「查一次」刚把 FreeOK 列进可换的源，
                 // 退回详情页那一栏它却写着「不可用」，同一部片、隔一秒、两句话。
-                if (hits.isNotEmpty()) {
-                    val cost = System.currentTimeMillis() - t0
-                    healthCache[cfg.id] = HealthReport(if (cost < 800) Health.Ok else Health.Slow, cost)
-                    healthAt[cfg.id] = System.currentTimeMillis()
-                }
+                if (hits.isNotEmpty()) washHealth(cfg.id)
                 val health = healthCache[cfg.id]?.health ?: Health.Unknown
                 Triple(
                     cfg,
@@ -278,11 +300,29 @@ class MediaRepository(private val sources: SourceRepository) {
         return emptyList<Media>() to lastErr
     }
 
+    /**
+     * 真取回了内容，就是比「探根路径没答话」更硬的证据 —— 用它把不可用洗掉，
+     * 否则界面上会出现「这个源给了结果、却标着不可用」的自相矛盾。
+     *
+     * 只改状态，**不拿这一趟的耗时去覆写 latencyMs**：那个数字里混着浏览器内核排队与解析，
+     * 而健康表里 latencyMs 的定义是「只探根路径、不读体」量出来的（见 [check]）。
+     * 一个字段两套定义，而界面上三处（搜索行、详情页那一栏、源管理）都拿它当「延迟」显示。
+     */
+    private fun washHealth(cfgId: String) {
+        val prev = healthCache[cfgId]
+        if (prev?.health == Health.Ok) return
+        healthCache[cfgId] = HealthReport(Health.Ok, prev?.latencyMs)
+        healthAt[cfgId] = System.currentTimeMillis()
+    }
+
     private fun sameWork(m: Media, want: String, year: String?): Boolean {
         if (titleFingerprint(m.title) != want) return false
         val otherYear = m.key.substringAfter('|', "").takeIf { it.isNotBlank() }
         return year == null || otherYear == null || otherYear == year
     }
+
+    /** [Media.key] 尾上那四位年份；这一条没带年份就是 null。 */
+    private fun yearOf(m: Media): String? = m.key.substringAfter('|', "").takeIf { it.isNotBlank() }
 
     private fun qualityTag(m: Media): String? {
         val text = listOfNotNull(m.remark, m.category, m.title).joinToString(" ")

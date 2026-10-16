@@ -39,10 +39,14 @@ internal object SlideChallenge {
     suspend fun solve(pageUrl: String, pageBody: String): Boolean {
         val host = runCatching { URI(pageUrl).host }.getOrNull() ?: return false
         val now = System.currentTimeMillis()
-        val previous = lastAttempt.put(host, now)
+        val previous = lastAttempt[host]
         if (previous != null && now - previous < REATTEMPT_AFTER_MS) return false
 
         val scriptSrc = SCRIPT_SRC.find(pageBody)?.groupValues?.get(1)?.takeIf { it.isNotBlank() } ?: return false
+        // 到这一步才落下这颗时间戳。原来它在解析之前就写了：于是「这一页里根本没有那道题的
+        // 脚本」也算一次尝试，把后面 3 分钟的窗口一起烧掉，而界面上那句是「影枢照它自己那条
+        // 路答过一次还是没过」—— 那一次压根没答过。
+        lastAttempt[host] = System.currentTimeMillis()
         val scriptUrl = if (scriptSrc.startsWith("http")) scriptSrc else originOf(pageUrl) + scriptSrc
         val script = Http.getKeepStatus(scriptUrl, referer = pageUrl, timeoutSec = 15).body
         val key = SCRIPT_KEY.find(script)?.groupValues?.get(1) ?: return false

@@ -171,8 +171,13 @@ class SourceRepository(private val context: Context) {
         var added: List<SourceConfig> = emptyList()
         mutate { cur, seen ->
             val have = cur.map { it.id }.toSet()
-            added = if (seen.isEmpty()) emptyList() else
+            val fresh = if (seen.isEmpty()) emptyList() else
                 Seed.sources.filter { it.id !in seen && it.id !in have }
+            // 一律补到队尾。原来直接带着 Seed 里写死的那个 priority 进来：mutate 之后是按
+            // priority 排序的，于是一条 priority=1 的新源会把用户拖出来的第一名挤下去 ——
+            // 而第一名就是进播放器时默认那个源，那是替他做决定。
+            val tail = cur.maxOfOrNull { it.priority } ?: 0
+            added = fresh.mapIndexed { i, s -> s.copy(priority = tail + i + 1) }
             cur + added
         }
         return added

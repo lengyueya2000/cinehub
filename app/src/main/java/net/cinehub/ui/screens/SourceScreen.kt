@@ -455,17 +455,17 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 }
 
 /**
- * 手指现在压到第几位。
+ * 手指现在压到第几位（返回的是**把被拖那一行摘掉以后**的绝对下标，和调用处
+ * `moved.add(t, moved.removeAt(f))` 同一套坐标，预览的让位步长也按它算）。
  *
  * 坐标一律从 [LazyListState] 的当前布局现读，不自攒一份表：滑出屏幕的行会被 LazyColumn 回收，
  * 自己记过的那份既不清理也不更新，滚到底再往回拖就会拿陈旧坐标把顺序落到不相干的位次上。
  *
- * 判据只有一条：**其它行的中心点有几个在抬起那一行的中心点之上**，那个数就是落点。
- *
- * 原来写的是「第一个中心点落在下面的行的位次」，这在往下拖时多算一格：中心刚好压在
- * B、C 之间时它返回的是 C 的位次 2，而 `removeAt(0) + add(2)` 出来是 `[B,C,A]` ——
- * 手指只挪了一格半，列表里跳了两格，看上去就像落点和手指反着走。而这个位次是当场
- * 落盘的，松手以后错序就留下了，重开还是错的。
+ * 落点按「行在 order 里的绝对位次」算，不按「可见行里有几行在上面」数。
+ * 原来数的是可见行 —— 列表滚过一屏以后屏外上方那些行压根不在这批 visible 里，
+ * 数出来的是一个**相对**位次，而调用处拿它当**全局**下标用：八个源、屏上只有第 3~8 行，
+ * 把最后一行拖到第 4 行与第 5 行之间，落点被算成第 2 位。而且当场就 `reorder` 落盘了，
+ * 松手以后错序留下、重开还是错的。
  */
 private fun targetIndexFor(
     dragId: String?,
@@ -474,16 +474,24 @@ private fun targetIndexFor(
     listState: LazyListState,
 ): Int {
     if (dragId == null || order.isEmpty()) return -1
+    val f = order.indexOf(dragId)
+    if (f < 0) return -1
     val visible = listState.layoutInfo.visibleItemsInfo
-    val self = visible.firstOrNull { it.key == dragId } ?: return order.indexOf(dragId)
+    val self = visible.firstOrNull { it.key == dragId } ?: return f
     val center = self.offset + self.size / 2f + dragDy
     val others = visible.filter { vi ->
         vi.key != dragId && (vi.key as? String)?.let { order.indexOf(it) }?.let { it >= 0 } == true
     }
-    // 数不到屏外去的行：这一版不做拖到边缘自动滚动，拖不出屏幕就是拖不出这一批 ——
-    // 宁可少排一位，也不要凭陈旧的屏外坐标猜一个落点。
-    val above = others.count { it.offset + it.size / 2f < center }
-    return above.coerceIn(0, others.size)
+    if (others.isEmpty()) return f
+    // 中心点在手指之下的第一行 → 插在它之前；一行都没有（已经拖到这批之最下）
+    // → 插在看得见的最后一行之后。两侧都用 order 里的绝对位次，所以屏外上方的行
+    // 不必被数到也不会算错。
+    val below = others
+        .filter { it.offset + it.size / 2f >= center }
+        .minByOrNull { it.offset }
+    val abs = below?.let { order.indexOf(it.key as String) }
+        ?: (others.maxByOrNull { it.offset }?.let { order.indexOf(it.key as String) }?.plus(1) ?: f)
+    return if (abs > f) abs - 1 else abs
 }
 
 @Composable

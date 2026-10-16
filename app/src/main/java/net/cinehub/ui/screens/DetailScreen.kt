@@ -334,7 +334,7 @@ fun DetailScreen(
                                             DownloadStatus.Done -> "✓"
                                             DownloadStatus.Failed -> "!"
                                             DownloadStatus.Paused -> "‖"
-                                            else -> "${(it.progress * 100).toInt()}%"
+                                            else -> if (it.hasPercent) "${(it.progress * 100).toInt()}%" else "…"
                                         },
                                         color = if (on) Color.White else T.Src500,
                                         fontSize = Fs.tiny,
@@ -620,7 +620,8 @@ private fun ActionTile(
 /** 缓存按钮上的字 —— 每一句都要对得上任务真实处在的那一步。 */
 private fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
     DownloadStatus.Done -> "已缓存"
-    DownloadStatus.Running -> "缓存中 ${(t.progress * 100).toInt()}%"
+    // 对方不给总大小的那种单文件，百分比压根算不出来（progress 恒为 0）—— 报「0%」是假话
+    DownloadStatus.Running -> if (t.hasPercent) "缓存中 ${(t.progress * 100).toInt()}%" else "缓存中"
     DownloadStatus.Queued -> "排队中"
     DownloadStatus.Paused -> "继续缓存"
     DownloadStatus.Failed -> "重试缓存"
@@ -665,8 +666,10 @@ private fun SourcePanel(
         }
         Spacer12()
         if (siblings.isEmpty()) {
+            // 这句话只该在真的还在跑的时候说。原来它只看 siblings 空不空，
+            // 于是比对跑完、结果为空时它长挂成「正在比对…」永不撤回。
             Text(
-                "正在比对该片在其它源的情况…",
+                if (checking) "正在比对该片在其它源的情况…" else "这一部只在当前这个源上有，别的源没搜到同名",
                 color = T.TextFaint,
                 fontSize = Fs.xxs,
             )

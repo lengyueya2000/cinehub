@@ -79,7 +79,9 @@ object Http {
             out.write(buf, 0, n)
             total += n
             if (total > MAX_BODY_BYTES) error(
-                "这个源回的内容超过 ${MAX_BODY_BYTES / 1024 / 1024} MB，不像一份能解析的页面 —— " +
+                // 4_000_000 字节按十进制 MB 报，别写成整除出来的「3 MB」—— 那比闸门本身小，
+                // 是一句会说谎的话（界面上这一句是要给用户看的）
+                "这个源回的内容超过 ${MAX_BODY_BYTES / 1000 / 1000} MB，不像一份能解析的页面 —— " +
                     "多半是地址指到了视频本身",
             )
         }
@@ -88,8 +90,17 @@ object Http {
 
     /** 从 Content-Type 里认字符集；认不出来按 UTF-8 处理（这批站基本都声明了 gbk/utf-8）。 */
     private fun charsetOf(contentType: String?): java.nio.charset.Charset {
-        val name = contentType?.substringAfter("charset=", "")?.trim()?.takeIf { it.isNotEmpty() }
-            ?: return Charsets.UTF_8
+        // 参数名不分大小写，值也可能带引号：`CHARSET=GBK` 和 charset="gbk" 都是合法的写法。
+        // 原来这两样都不认，于是整页按 UTF-8 解成乱码 —— 乱码解析出来是「零条结果」，
+        // 界面就把它写成「这个源里没有这部片」。
+        val lower = contentType?.lowercase() ?: return Charsets.UTF_8
+        val at = lower.indexOf("charset=")
+        if (at < 0) return Charsets.UTF_8
+        val name = lower.substring(at + "charset=".length)
+            .trim()
+            .trim('"', '\'')
+            .takeWhile { !it.isWhitespace() && it != ';' && it != ',' }
+            .takeIf { it.isNotEmpty() } ?: return Charsets.UTF_8
         return runCatching { java.nio.charset.Charset.forName(name) }.getOrNull() ?: Charsets.UTF_8
     }
 
@@ -150,16 +161,35 @@ object Http {
 
     /** 收下这一条响应下发的 cookie。 */
     private fun remember(url: String, r: Response) {
-        val host = hostOf(url) ?: return
-        val pairs = r.headers("Set-Cookie").mapNotNull { raw ->
+        // 记在**真的下发它的那一台**名下。followRedirects 是开着的（见 client 那一段），
+        // apex→www、http→https 之后那条 Set-Cookie 属于链上最后一跳；原来只按请求 URL 的
+        // 第一跳记账，于是重定向型站点的会话存到了一个再也不会被问到的 host 上 ——
+        // 表现是「会话永远建立不起来」，而这一类失败在界面上查不出原因。
+        val hosts = listOfNotNull(hostOf(url), hostOf(r.request.url.toString())).distinct()
+        if (hosts.isEmpty()) return
+        for (raw in r.headers("Set-Cookie")) {
             val kv = raw.substringBefore(';').trim()
             val i = kv.indexOf('=')
-            if (i <= 0) null else kv.substring(0, i) to kv.substring(i + 1)
+            if (i <= 0) continue
+            val name = kv.substring(0, i)
+            val value = kv.substring(i + 1)
+            // 一条删除指令（Max-Age=0 / Expires 已过期）被当成新值存下来，等于把这个名字
+            // 永久钉在一份早该作废的会话上
+            val dead = isDeadCookie(raw)
+            hosts.forEach { host ->
+                val m = jar.getOrPut(host) { java.util.concurrent.ConcurrentHashMap() }
+                if (dead) m.remove(name) else m[name] = value
+            }
         }
-        if (pairs.isEmpty()) return
-        jar.getOrPut(host) { java.util.concurrent.ConcurrentHashMap() }.let { m ->
-            pairs.forEach { (k, v) -> m[k] = v }
-        }
+    }
+
+    /** 这条 Set-Cookie 是在「下发一个值」还是「作废一个名字」。 */
+    private fun isDeadCookie(raw: String): Boolean {
+        // 让 JDK 自己认这套属性（Max-Age / Expires 的格式与大小写都不用我们重抄一遍）。
+        // 认不出来的（站点写得不规范很常见）一律当「还活着」：认错了方向会把一份能用的会话删掉，
+        // 认不出来不过是这份 cookie 多活了一会儿 —— 反正它不落盘。
+        val c = runCatching { java.net.HttpCookie.parse(raw).firstOrNull() }.getOrNull() ?: return false
+        return c.maxAge == 0L || c.hasExpired()
     }
 
     /** 浏览器导航页面时会发的那组头里，站点真正会看的就是 Accept-Language 这一条。 */
@@ -344,13 +374,17 @@ object Http {
         if (viaBrowser) return BrowserEngine.probe(url)
         val (ms, status, snippet) = probeOnce(url, referer)
         if (ms != null) return ms
-        if (SlideChallenge.isSlideGate(status, snippet) && SlideChallenge.solve(url, snippet)) {
-            val retry = probeOnce(url, referer)
-            val again = retry.first
-            if (again != null) return again
-            return error(failureReason(retry.second, retry.third))
-        }
-        return error(failureReason(status, snippet))
+        if (!SlideChallenge.isSlideGate(status, snippet)) return error(failureReason(status, snippet))
+        // 撞上那道滑块题：探测这一路只截了**前 8 KB** 正文（见 errorSnippet），而拦访页
+        // 实测十几 KB —— 要的正则（脚本 src、key/value）落在 8 KB 之后时这一路就答不了题，
+        // 于是同一个站：取数那一路（读全份）答得出来，探测这一路报「对方要求浏览器验证、
+        // 这个源接不进来」。两条路两种结论，而探测那一栏的结论决定它在源列表里排哪儿、
+        // 要不要被自动换源跳过。所以这里换走 page() 那条读全份正文的路：它自己会答一次题、
+        // 答完在新会话上重发，通了我才量得到延迟，不通就照实把那张页的原因带回去。
+        val t1 = System.currentTimeMillis()
+        val again = runCatching { page(url, referer, emptyMap(), 20, browserHeaders = true) }.getOrNull()
+        if (again != null && again.status in 200..299) return System.currentTimeMillis() - t1
+        return error(failureReason(again?.status ?: status, again?.body.orEmpty()))
     }
 
     /**

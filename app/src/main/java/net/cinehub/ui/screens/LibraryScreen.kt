@@ -506,7 +506,9 @@ private fun DownloadCard(
  * 速度只在真有速度时出现 —— 暂停中的任务报 0 B/s 会被读成「网卡了」。
  */
 private fun downloadStatsLine(task: DownloadTask, speed: Long): String {
-    val parts = mutableListOf("${(task.progress * 100).toInt()}%")
+    // 算不出百分比时不写数：单文件那条路全看对方给不给 Content-Length，
+    // 不给时 progress 恒为 0，而字节明明在往上涨 —— 那一条整段下载都写着「0%」是假话
+    val parts = mutableListOf(if (task.hasPercent) "${(task.progress * 100).toInt()}%" else "进行中")
     parts += when {
         task.bytesTotal > 0 ->
             "${fmtBytes(task.bytesDone)} / ${if (task.sizeEstimated) "约 " else ""}${fmtBytes(task.bytesTotal)}"

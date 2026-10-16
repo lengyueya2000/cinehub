@@ -65,4 +65,14 @@ data class DownloadTask(
             segmentsTotal > 0 -> (segmentsDone.toFloat() / segmentsTotal).coerceIn(0f, 1f)
             else -> 0f
         }
+
+    /**
+     * 这一条**算不算得出**百分比。
+     *
+     * 单文件那条路全靠对方给 Content-Length；不给时 bytesTotal 是 0、又不是分片流
+     * （segmentsTotal 也是 0），于是整段真实下载期间 progress 恒等于 0 ——
+     * 界面上那格会一路写着「缓存中 0%」，而字节明明在往上涨。写不出准数就别写数。
+     */
+    val hasPercent: Boolean
+        get() = status == DownloadStatus.Done || bytesTotal > 0L || segmentsTotal > 0
 }

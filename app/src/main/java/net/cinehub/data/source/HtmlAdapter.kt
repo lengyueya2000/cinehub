@@ -122,7 +122,7 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
                 // 也不要拿别人的名字安在这一组头上 —— 那是句看起来更可信的假话。
                 val tab = tabs.getOrNull(ordinal)?.takeIf { it.episodes == null || it.episodes == anchors.size }
                 PlayLine(
-                    name = doc.lineName(line, tab),
+                    name = doc.lineName(line, tab, ordinal),
                     episodes = anchors.mapIndexed { i, a ->
                         Episode(
                             name = a.text().trim().ifBlank { "第 ${i + 1} 集" },
@@ -301,14 +301,20 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
      *
      * 站点给线路起的名字是「②蓝光」「推荐K」「稳定③」这种，跟地址尾段那个线路号
      * 没有任何可推的对应关系 —— 只能从页面的标签栏读，或者干脆不猜。
+     *
+     * 最后那一路 `a[alt]`（北觅这类皮）必须**按 ordinal 配对**：原来写的是全篇
+     * `selectFirst`，于是同一个文档里每一条线路都取到同一个 alt —— 实测那份详情里唯一的
+     * `a[alt]` 就是「北觅影视」，结果是两条线路同名。同名的代价不只是「兄弟该平级却有两条
+     * 一模一样」：换线路靠 `index == cur` 挑地址、[HtmlRules.lineDrop] 按名字舍掉已知放不出
+     * 的那条，同名一次就同时命中全部，用户点线路二落到的可能还是线路一。
      */
-    private fun Document.lineName(line: String, tab: LineTab?): String =
+    private fun Document.lineName(line: String, tab: LineTab?, ordinal: Int): String =
         // 这套皮的线路名写在 #source-tabs 的按钮上（data-source="3" → 「TT线路」），
         // 用 ownText 是为了不把图标元素那些空文本一起带进来
         selectFirst("[data-source=$line],[data-sid=$line]")?.ownText()?.trim()
             ?.takeIf { it.isNotBlank() && it.length <= 12 }
             ?: tab?.name
-            ?: selectFirst(".hl-plays-from a[alt],a[alt]")?.attr("alt")?.takeIf { it.isNotBlank() }
+            ?: select(".hl-plays-from a[alt]").getOrNull(ordinal)?.attr("alt")?.takeIf { it.isNotBlank() }
             ?: "线路 $line"
 
     /**

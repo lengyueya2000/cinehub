@@ -155,7 +155,12 @@ class DownloadRepository(
         scope.launch {
             // 只有真的读通了盘才敢清孤儿目录：读盘失败时 _tasks 是空的，
             // 照着「没有任务」去清就等于把所有缓存文件全删了。
-            if (load().isSuccess) pruneOrphans()
+            //
+            // 判据不能只用 load().isSuccess：那份清单**解不出来**时 load 也是成功返回的
+            // （它只把原文挪进备份键、置 _unreadable，不抛），而此刻 _tasks 是空的 ——
+            // 于是守卫形同不存在，用户整屏缓存被删光，记录还躺在备份键里等版本修好。
+            val loaded = load()
+            if (loaded.isSuccess && !_unreadable.value) pruneOrphans()
             refreshSpace()
         }
     }
@@ -205,24 +210,42 @@ class DownloadRepository(
 
     suspend fun enqueue(cfg: SourceConfig, m: Media, ep: Episode) {
         val id = keyOf(cfg.id, m.id, ep.index)
-        _tasks.value.firstOrNull { it.id == id }?.let {
-            if (it.status == DownloadStatus.Done || it.status == DownloadStatus.Running ||
-                it.status == DownloadStatus.Queued
-            ) return
+        val prev = _tasks.value.firstOrNull { it.id == id }
+        if (prev != null &&
+            (prev.status == DownloadStatus.Done || prev.status == DownloadStatus.Running ||
+                prev.status == DownloadStatus.Queued)
+        ) return
+        val task = if (prev == null) {
+            DownloadTask(
+                id = id,
+                mediaId = m.id,
+                mediaTitle = m.title,
+                mediaKey = m.key,
+                mediaYear = m.year,
+                mediaCover = m.cover,
+                sourceId = cfg.id,
+                sourceName = cfg.name,
+                episodeName = ep.name,
+                episodeIndex = ep.index,
+                episodeUrl = ep.playUrl,
+            )
+        } else {
+            // 上一次是 Failed/Paused：那些已经落盘的分片是**真进度**，整条重建等于把它抹成 0。
+            // 而 download() 判「全新一次」用的正是 bytesDone==0 && segmentsDone==0 && fileName==null，
+            // 抹成 0 就当场把目录删了从零重下 —— 用户暂停了一集 160MB、在详情页再点一次
+            // 「缓存这一集」，那点东西全没了，而界面上那句「点继续接着来」是同一文件里写的。
+            //
+            // 留着 streamKey：续传会重新解析直链，对不上流的时候 downloadHls 自己会清目录重来，
+            // 那是「丢已下字节 vs 整集是花的」原有的一笔账，不该由这里抢先抹掉。
+            prev.copy(
+                status = DownloadStatus.Queued,
+                error = null,
+                createdAt = System.currentTimeMillis(),
+                // 播放页地址以这一次为准：站点那页可能换了，用户也可能是从另一个入口进来的
+                episodeUrl = ep.playUrl,
+                episodeName = ep.name,
+            )
         }
-        val task = DownloadTask(
-            id = id,
-            mediaId = m.id,
-            mediaTitle = m.title,
-            mediaKey = m.key,
-            mediaYear = m.year,
-            mediaCover = m.cover,
-            sourceId = cfg.id,
-            sourceName = cfg.name,
-            episodeName = ep.name,
-            episodeIndex = ep.index,
-            episodeUrl = ep.playUrl,
-        )
         // 重下同一集（上一次是 Failed/Paused）时要把「用户按过暂停」这个名字摘掉，
         // 否则这一笔真失败了会被当成用户暂停，界面上一个原因都不写。
         pausedByUser -= id
@@ -382,7 +405,27 @@ class DownloadRepository(
      * 影枢也不去绕它。该做的是把「换条线路 / 换个源」说成用户真能执行的下一步：
      * 有些源（如北觅）每条片子只给一条线路，这时候能换的只有源。
      */
+    /**
+     * 这一条失败是不是「手机存不下了」。
+     *
+     * 判据只能拿异常链上的原文认：Linux 报 ENOSPC 时抛的就是一条普通 IOException，
+     * 消息在不同 ROM 上写作 `No space left on device` / `ENOSPC (No space left on device)`，
+     * 与「连接被对方切断」在类型上完全分不开 —— 而这两件事的解法相反：
+     * 一个是清地方，一个是换线路。认错了方向，用户会一直等一个永远不会来的「接着来」。
+     */
+    private fun isOutOfSpace(e: Throwable): Boolean {
+        var t: Throwable? = e
+        while (t != null) {
+            val m = t.message?.lowercase().orEmpty()
+            if ("no space" in m || "enospc" in m || "disk full" in m || "not enough space" in m) return true
+            t = t.cause
+        }
+        return false
+    }
+
     private fun reasonOf(e: Exception): String = when {
+        isOutOfSpace(e) ->
+            "手机的存储空间不够了 —— 这一集先停在这里。清掉一集旧的再来：重试没有用，缺的不是网络。"
         e is IllegalStateException -> e.message ?: "下载失败"
         e is java.net.SocketTimeoutException ->
             "连不上这个地址（超时）—— 换一条线路，或换一个源再缓存"
@@ -785,7 +828,11 @@ class DownloadRepository(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                val transient = e is Transient || e is java.io.IOException
+                // 存储写满了（ENOSPC 也是一条 IOException）。它不能算瞬时故障：
+                // 重试三次不会让手机多出空间，而最后一次落进 reasonOf 的 IOException 分支，
+                // 界面就写出「存下 163 MB 之后连接断了…点继续接着来」—— 方向完全错，
+                // 用户照那句话去等，等的是一次又一次同样的失败。
+                val transient = (e is Transient || e is java.io.IOException) && !isOutOfSpace(e)
                 if (!transient || attempt >= SEG_ATTEMPTS) {
                     // Transient 里带的是已经翻译好的原话（如「站点异常 503」），
                     // 别让它落到 reasonOf 的 IOException 分支变成一句「连接被对方切断」
@@ -883,6 +930,11 @@ class DownloadRepository(
         if (rangeFrom != null && rangeFrom > 0) b.header("Range", "bytes=$rangeFrom-")
         val call = Http.client.newBuilder()
             .readTimeout(60, TimeUnit.SECONDS)
+            // 换一套自己的 Dispatcher。newBuilder() 是**拷贝**派发器的，而 OkHttp 默认
+            // maxRequestsPerHost=5：缓存一路一条集就并发开 4~8 条分片连接，全挤在同一个 host 上，
+            // 同一源的 search/detail 会被排在 ready queue 里出不来 —— 界面上就是
+            // 「正在查询…」一直转，看着像这个源挂了，其实是被自己正在下的那集堵的。
+            .dispatcher(DOWNLOAD_DISPATCHER)
             .build()
             .newCall(b.build())
         // 挂到这一组里，暂停 / 删除时才掐得住：分片并发之后一个任务同时有好几个连接在飞。
@@ -1288,6 +1340,11 @@ class DownloadRepository(
     }
 
     private companion object {
+        /** 缓存这一路专用的派发器，别和页面请求共用默认那 5 路 per-host 闸门。 */
+        val DOWNLOAD_DISPATCHER = okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 32
+        }
         /** 同时在跑几集。多了没意义：带宽就那么宽，站点那边也容易把并发当成刷接口。 */
         const val MAX_PARALLEL = 3
 
