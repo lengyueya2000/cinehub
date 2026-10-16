@@ -57,8 +57,31 @@ data class SourceConfig(
      * 代价是这一源的取数慢 —— 第一次过题十几秒，而且全应用排队走一颗引擎。
      */
     val needsBrowser: Boolean = false,
+    /**
+     * 健康栏探测用的路径（拼在 [baseUrl] 后面）。
+     *
+     * 默认探 [baseUrl] 根路径 —— 对绝大多数站成立，它们根路径就是一个能打开的页面。
+     * 但有些后端根路径直接回 404（如自建 Apple-CMS 的接口型源：内容全在 `/api/...` 下，
+     * 站点根本没有首页 HTML）。那一栏探的是「这个源现在通不通」，而它的结论会决定
+     * 这一源在列表里排哪儿、要不要被自动换源跳过 —— 拿一个注定的 404 去量，
+     * 一个完全能取到内容的源就会永远挂着红字「连接失败」，那是假话。
+     *
+     * 于是这一类源可以指名一个**真的代表「服务活着」**的探点。留空即沿用根路径。
+     */
+    val probePath: String? = null,
+    /**
+     * 地址是否在界面上隐藏显示（内置源）。
+     *
+     * 只是防「顺手看到」：编辑表单不回显、列表行不显示完整地址。
+     * 反编译或抓包依然能拿到——真正的隐藏做不到，这里只做展示层遮挡。
+     * 用户自己加的源一律 false，照常完整显示、正常编辑。
+     */
+    val hiddenUrl: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
 ) {
+    /** 健康栏该探哪一个绝对地址。 */
+    fun probeUrl(): String =
+        baseUrl.trimEnd('/') + (probePath?.takeIf { it.isNotBlank() } ?: "")
     /**
      * 拼出源站自己的播放页地址。
      *
@@ -102,6 +125,17 @@ enum class SourceKind {
      * 取播放地址要靠站点下发的匿名会话。规则不是 CSS 选择器，而是接口路径。
      */
     AiMovie,
+
+    /**
+     * 自建 Apple-CMS 后端的签名接口（MINO 型协议）。
+     *
+     * 与 [AiMovie] 同属「请求要签名」那一类，但握手不一样：这一型要先做一次
+     * ECDH（临时 secp256r1 密钥对 + 服务端公钥 → HKDF 派生签名钥与响应体钥），
+     * 之后每个请求带 HMAC-SHA256 签名头，响应正文还可能是 AES-256-GCM 加密的信封。
+     * 播放地址也不在接口里：分集给的是加密票证 `tk:`，要换 play_ticket、
+     * 再拿票据里下发的解析接口现算（见 [net.cinehub.data.source.MinoAdapter]）。
+     */
+    MinoApi,
 }
 
 @Serializable

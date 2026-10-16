@@ -64,7 +64,7 @@ object SourceAdapters {
 
     private fun connectionKey(cfg: SourceConfig) = listOf(
         cfg.baseUrl, cfg.kind.name, cfg.authToken.orEmpty(), cfg.authMode.name,
-        cfg.playPath.orEmpty(), cfg.needsBrowser.toString(),
+        cfg.playPath.orEmpty(), cfg.needsBrowser.toString(), cfg.probePath.orEmpty(),
         cfg.html?.toString().orEmpty(), cfg.api?.toString().orEmpty(),
     ).joinToString("\n")
 
@@ -73,6 +73,7 @@ object SourceAdapters {
         net.cinehub.data.model.SourceKind.JsonApi -> MaccmsAdapter(cfg)
         net.cinehub.data.model.SourceKind.Html -> HtmlAdapter(cfg)
         net.cinehub.data.model.SourceKind.AiMovie -> AiMovieAdapter(cfg)
+        net.cinehub.data.model.SourceKind.MinoApi -> MinoAdapter(cfg)
     }
 
     private class Held(val key: String, val adapter: SourceAdapter)

@@ -458,7 +458,11 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                 initial = editTarget,
                 onDismiss = { showAdd = false; editTarget = null },
                 onTest = { name, url, kind, token, playPath, browsePath, mode, cb ->
-                    vm.testSource(name, url, kind, token, playPath, browsePath, mode, cb)
+                    // 内置隐藏源的地址栏空着 = 测原来的地址：拿空串去探测只会得到一个
+                    // 必然失败的结论，而那个结论还会把按钮锁在「测试并保存」上。
+                    val editOf = editTarget
+                    val effective = if (editOf?.hiddenUrl == true && url.isBlank()) editOf.baseUrl else url
+                    vm.testSource(name, effective, kind, token, playPath, browsePath, mode, cb)
                 },
                 onSave = { cfg ->
                     vm.saveSource(cfg)
@@ -605,7 +609,8 @@ private fun SourceRow(
                     }
                 }
                 Text(
-                    cfg.baseUrl,
+                    // 内置源的地址不显示：防顺手看到。用户自己加的源照常显示完整地址。
+                    if (cfg.hiddenUrl) "内置地址已隐藏" else cfg.baseUrl,
                     color = T.TextDim,
                     fontSize = Fs.tiny,
                     maxLines = 1,
@@ -657,6 +662,7 @@ private fun SourceRow(
                     SourceKind.JsonApi -> "JSON 接口"
                     SourceKind.M3u -> "M3U 列表"
                     SourceKind.AiMovie -> "签名接口"
+                    SourceKind.MinoApi -> "签名接口"
                 },
                 ghost = true,
             )
@@ -701,7 +707,11 @@ private fun AddSourceSheet(
     initial: SourceConfig? = null,
 ) {
     var name by remember { mutableStateOf(initial?.name.orEmpty()) }
-    var url by remember { mutableStateOf(initial?.baseUrl.orEmpty()) }
+    // 内置隐藏源进来时不回显明文：空着表示「保留原地址」，填了才替换。
+    // 直接把 baseUrl 倒进输入框就等于没藏 —— 表单是第二个能看到地址的地方。
+    var url by remember {
+        mutableStateOf(if (initial?.hiddenUrl == true) "" else initial?.baseUrl.orEmpty())
+    }
     var token by remember { mutableStateOf(initial?.authToken.orEmpty()) }
     var playPath by remember { mutableStateOf(initial?.playPath.orEmpty()) }
     var browsePath by remember { mutableStateOf(initial?.html?.browsePath.orEmpty()) }
@@ -723,6 +733,9 @@ private fun AddSourceSheet(
      * 改一个源时，探测回来的那份是**新造的配置**（新 id、排在末尾、没启停、规则退回默认）。
      * 直接落库就等于：改个地址，这个源从第 1 位掉到最后一位、被重新启用、
      * 身上那些内置标签和站点规则也全没了。所以身份那几样一律用原来那份。
+     *
+     * 内置隐藏源的地址栏是空着进来的（不回显明文）：空表示「保留原地址」，
+     * 填了才替换。否则空串会把原地址直接冲掉，这个源就废了。
      */
     fun keepIdentity(cfg: SourceConfig): SourceConfig =
         if (initial == null) cfg
@@ -731,6 +744,8 @@ private fun AddSourceSheet(
             priority = initial.priority,
             enabled = initial.enabled,
             tags = initial.tags,
+            baseUrl = if (initial.hiddenUrl && url.isBlank()) initial.baseUrl else cfg.baseUrl,
+            hiddenUrl = initial.hiddenUrl,
             html = initial.html?.let { base ->
                 // 浏览路径是用户刚在这张表单里填/改的那一格，不能跟着身份一起被还原回旧值。
                 // 其余规则（选择器那几样）表单里根本没有，仍按原来那份留着。
@@ -801,7 +816,10 @@ private fun AddSourceSheet(
                 }
             }
 
-            Field("站点地址", "支持 http / https") {
+            Field(
+                "站点地址",
+                if (initial?.hiddenUrl == true) "内置地址已隐藏 · 不填则保留原地址" else "支持 http / https",
+            ) {
                 Box(
                     Modifier.fillMaxWidth().height(44.dp).clip(R.md)
                         .background(T.Surface2)
@@ -809,7 +827,11 @@ private fun AddSourceSheet(
                         .padding(horizontal = 13.dp),
                     contentAlignment = Alignment.CenterStart,
                 ) {
-                    if (url.isEmpty()) Text("https://", color = T.TextFaint, fontSize = Fs.body2)
+                    if (url.isEmpty()) Text(
+                        if (initial?.hiddenUrl == true) "••••••（已隐藏，留空不改）" else "https://",
+                        color = T.TextFaint,
+                        fontSize = Fs.body2,
+                    )
                     BasicTextField(
                         url, { url = it; invalidate() },
                         singleLine = true,
@@ -829,6 +851,10 @@ private fun AddSourceSheet(
                     Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                         KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
                         KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                        KindTile("自建签名接口", "自有后端", SourceKind.MinoApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        Spacer(Modifier.weight(1f))
                     }
                 }
             }
@@ -962,7 +988,9 @@ private fun AddSourceSheet(
                                 )
                             )
                         )
-                        .clickable(enabled = !busy && url.isNotBlank()) {
+                        // 内置隐藏源允许地址栏留空（= 保留原地址）：按钮只看别的必填项。
+                        // 用户自己加的源没有原地址可保，仍要求填。
+                        .clickable(enabled = !busy && (url.isNotBlank() || initial?.hiddenUrl == true)) {
                             val ready = tested
                             if (ready != null) {
                                 // 已经探测通过：这一步只负责落库

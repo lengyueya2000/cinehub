@@ -61,8 +61,8 @@ class MediaRepository(private val sources: SourceRepository) {
         val age = System.currentTimeMillis() - at
         val expired = cached != null &&
             (if (cached.health == Health.Down) age > DOWN_RETRY_MS else age > HEALTH_TTL_MS)
-        // 量的是这一条：baseUrl 或「要不要走浏览器内核」换了，旧的那份就不是这一路的结论了
-        val probeKey = "${cfg.baseUrl.trimEnd('/')}|${cfg.needsBrowser}"
+        // 量的是这一条：baseUrl / 探测路径 或「要不要走浏览器内核」换了，旧的那份就不是这一路的结论了
+        val probeKey = "${cfg.probeUrl()}|${cfg.needsBrowser}"
         if (!force && cached != null && !expired && healthProbeKey[cfg.id] == probeKey) return cached
         val report = check(cfg)
         healthCache[cfg.id] = report
@@ -73,7 +73,9 @@ class MediaRepository(private val sources: SourceRepository) {
 
     private suspend fun check(cfg: SourceConfig): HealthReport = withContext(Dispatchers.IO) {
         runCatching {
-            val ms = Http.probe(cfg.baseUrl, referer = null, viaBrowser = cfg.needsBrowser)
+            // 探 probeUrl()：有的后端根路径本来就 404（内容全在 /api 下的接口型源），
+            // 拿根路径去量会把一个完全取得出内容的源永远画成红字「连接失败」。
+            val ms = Http.probe(cfg.probeUrl(), referer = null, viaBrowser = cfg.needsBrowser)
             val health = when {
                 ms < 800 -> Health.Ok
                 else -> Health.Slow

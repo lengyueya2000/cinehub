@@ -149,9 +149,52 @@ class SourceRepository(private val context: Context) {
             val have = cur.map { it.id }.toSet()
             val missing = Seed.sources.filter { it.id !in have }
             added = missing.size
-            cur + missing
+            // 缺的补到队尾，不打乱用户已有的排序。
+            val tail = cur.maxOfOrNull { it.priority } ?: 0
+            cur + missing.mapIndexed { i, s -> s.copy(priority = tail + i + 1) }
         }
         return added
+    }
+
+    /**
+     * 老安装一次性迁移：已存的 `minoself` 挪到第一位，其余位次保持相对顺序。
+     *
+     * 背景：这一版之前 minoself 是后补进来的，`syncNewSeeds` 按约定只补到队尾，
+     * 老用户（包括 aaa 模拟器上那份）手里它是最后一位；但它现在是默认线路。
+     * 只有在新种子顺序已经把它写成第一（`Seed` 里 priority == 1）时才做，
+     * 以后种子顺序再变也不会重复挪。
+     */
+    suspend fun promoteSeedToFront(seedId: String): Boolean {
+        var moved = false
+        mutate { cur, _ ->
+            val idx = cur.indexOfFirst { it.id == seedId }
+            if (idx <= 0) return@mutate cur
+            val keepOrder = (cur.take(idx) + cur.drop(idx + 1)).sortedBy { it.priority }
+            moved = true
+            listOf(cur[idx].copy(priority = 0)) + keepOrder
+        }
+        return moved
+    }
+
+    /**
+     * 老安装一次性补标：盘里已存的那几个内置源盖上 `hiddenUrl`。
+     *
+     * 新字段是后加的，老用户 DataStore 里反序列化出来的那四份全是 false ——
+     * 而它们正是要藏地址的那几份。只按 id 认种子源，用户自己加的（id 形如 src_xxx）碰不到。
+     * 已经标过的再走一遍是空操作，顺手幂等。
+     */
+    suspend fun markBuiltinHidden(): Boolean {
+        var touched = false
+        mutate { cur, _ ->
+            val hiddenIds = Seed.sources.filter { it.hiddenUrl }.map { it.id }.toSet()
+            cur.map {
+                if (it.id in hiddenIds && !it.hiddenUrl) {
+                    touched = true
+                    it.copy(hiddenUrl = true)
+                } else it
+            }
+        }
+        return touched
     }
 
     /**
@@ -192,50 +235,46 @@ class SourceRepository(private val context: Context) {
 object Seed {
     val sources: List<SourceConfig> = listOf(
         SourceConfig(
+            id = "minoself",
+            name = "MINO自建",
+            // 自有 / 有权限的 Apple-CMS 后端：内容全在 /api/... 下，站点根路径本来就回 404。
+            // 于是健康栏改探一个「服务活着」的接口点，而不是注定的 404（否则这一个源
+            // 在列表里永远是红字，而它其实三条线路都出得来流）。
+            baseUrl = "http://43.248.128.122:578",
+            kind = net.cinehub.data.model.SourceKind.MinoApi,
+            priority = 1,
+            tags = listOf("多条线路", "含 4K"),
+            probePath = "/api/v1/app/tabs",
+            hiddenUrl = true,
+        ),
+        SourceConfig(
             id = "luttt",
             name = "北觅影视",
             baseUrl = "https://v.luttt.com",
             kind = net.cinehub.data.model.SourceKind.Html,
-            priority = 1,
+            priority = 2,
             tags = listOf("4K 画质", "直链可播"),
             html = net.cinehub.data.source.DefaultRules.maccms,
+            hiddenUrl = true,
         ),
         SourceConfig(
             id = "k4ku",
             name = "4kku",
             baseUrl = "https://www.4kku.com",
             kind = net.cinehub.data.model.SourceKind.Html,
-            priority = 2,
+            priority = 3,
             tags = listOf("4K 画质", "三条线路"),
             html = net.cinehub.data.source.DefaultRules.tailwind,
+            hiddenUrl = true,
         ),
         SourceConfig(
             id = "dongpiandi",
             name = "懂片帝AI",
             baseUrl = "https://dongpiandi.ai",
             kind = net.cinehub.data.model.SourceKind.AiMovie,
-            priority = 3,
-            tags = listOf("1080P", "AI 找片"),
-        ),
-        SourceConfig(
-            id = "hqvod",
-            name = "高清点播",
-            baseUrl = "https://www.hqvod.com",
-            kind = net.cinehub.data.model.SourceKind.Html,
             priority = 4,
-            tags = listOf("片库全", "地址要问解析站"),
-            html = net.cinehub.data.source.DefaultRules.hq,
-        ),
-        SourceConfig(
-            id = "freeokk",
-            name = "FreeOK",
-            // 站点页自己写着「官方域名 www.freeokk.pro · 最新域名 www.freeokk.lol」，两个域都在
-            // 同一道 Cloudflare 题后面；接的是后者，因为接口实测在这一个上给得出内容。
-            baseUrl = "https://www.freeokk.lol",
-            kind = net.cinehub.data.model.SourceKind.JsonApi,
-            priority = 5,
-            tags = listOf("片库九万", "第一次要过浏览器验证"),
-            needsBrowser = true,
+            tags = listOf("1080P", "AI 找片"),
+            hiddenUrl = true,
         ),
     )
 
@@ -245,5 +284,5 @@ object Seed {
      * 只从 [sources] 里删掉是不够的：老用户列表里那几条是启动时写进去的，会一直留着。
      * 按 id 清掉它们，用户自己手动加的同类源（id 形如 `src_xxx`）不受影响。
      */
-    val retiredIds = setOf("k4vm", "xiguazx", "demo_m3u")
+    val retiredIds = setOf("k4vm", "xiguazx", "demo_m3u", "hqvod", "freeokk")
 }

@@ -24,6 +24,9 @@ class CineHubApplication : Application(), ImageLoaderFactory {
         // 挂了浏览器验证那道题的源要靠一颗后台 WebView 取数，而那颗 WebView 只能在
         // 主线程、拿一个活得比任何一屏都久的 Context 造 —— 挂在这里，第一次用到再建。
         net.cinehub.data.net.BrowserEngine.init(this)
+        // 自建签名接口那一型每一次请求都要带「本机」的设备 id：适配器工厂拿不到 Context，
+        // 和浏览器内核同一个先例，在这里递给它。
+        net.cinehub.data.source.MinoDeviceId.appContext = applicationContext
     }
 
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)

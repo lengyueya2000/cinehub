@@ -341,10 +341,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            // 先补这一版新加的内置源，再量健康度。
+            // 先补这一版新加的内置源、盖内置隐藏标记，再挪默认位，最后量健康度。
             // 顺序不能反：mutate 每一笔都会刷新「见过」那份账，先落了别的写，
             // 新源就被记成见过了、反而补不进来。
+            runCatching { sourceRepo.markBuiltinHidden() }
             val fresh = runCatching { sourceRepo.syncNewSeeds() }.getOrDefault(emptyList())
+            runCatching { sourceRepo.promoteSeedToFront("minoself") }
             if (fresh.isNotEmpty()) {
                 _seedNotice.value = "这次更新补进来 ${fresh.size} 个新源：" +
                     fresh.joinToString("、") { it.name } + "。不想要就在下面删掉，删了不会再自动加回来。"
@@ -512,9 +514,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // 适配器（和它那份站点会话）在内存里没人认领
                     SourceAdapters.forget(cfg.id)
                 }
-                // 根路径只用来报延迟。它失败不再是「这个源不行」，只是「这一项没量到」。
+                // 探测路径只用来报延迟。它失败不再是「这个源不行」，只是「这一项没量到」。
                 val ms = runCatching {
-                    net.cinehub.data.net.Http.probe(cfg.baseUrl, viaBrowser = cfg.needsBrowser)
+                    net.cinehub.data.net.Http.probe(cfg.probeUrl(), viaBrowser = cfg.needsBrowser)
                 }.getOrNull()
                 val latency = if (ms != null) " · 平均延迟 ${ms}ms" else " · 根路径没答话（不影响取内容）"
                 // 「识别到 0 个资源」不是成功。一个资源都没给，存进来就是个占位的死源。
@@ -559,6 +561,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 而界面上那句「已带上凭证」照样亮着 —— 它带的是一个对方不收的头。
         authMode = if (authToken.isNullOrBlank()) net.cinehub.data.model.AuthMode.None else authMode,
         playPath = playPath?.takeIf { it.isNotBlank() },
+        // 自建签名接口这一型：后端根路径本来就 404（内容全在 /api 下），
+        // 健康栏默认改探一个无签名也回 200 的接口点；用户手动加的这类源不该一进来就红字。
+        probePath = when (kind) {
+            SourceKind.MinoApi -> "/api/v1/app/tabs"
+            else -> null
+        },
         html = when (kind) {
             // 通用兜底规则里唯一一格用户能自己填的就是浏览路径 —— 搜索模板对陌生站往往是错的，
             // 而浏览路径给了，这个源才既能在片库里翻、也能在「测试并保存」里被正确判一次。
