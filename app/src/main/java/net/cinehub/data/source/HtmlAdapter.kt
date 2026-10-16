@@ -136,7 +136,12 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
                 )
             }
         }
-        return MediaDetail(media = media, lines = lines, intro = media.intro)
+        // 站点排在第一的那条是替它自己的播放器挑的，影枢放得出来的却不是它（高清点播 的「推荐」
+        // 实测就是：清单开头是不带地址的 #EXTINF，接着是几条图片 CDN 的 .image）。
+        // 按名字直接舍掉 —— 只是挪到最后它还在候选里，自动换源照样会走到它，白失败一次。
+        // 一条不剩时整条规则不生效：规则写错了，也不该让用户看到一份没有线路的详情。
+        val kept = lines.filterNot { it.name in rules.lineDrop }.takeIf { it.isNotEmpty() } ?: lines
+        return MediaDetail(media = media, lines = kept, intro = media.intro)
     }
 
     /**
@@ -407,12 +412,18 @@ object DefaultRules {
      * [Element.playLine] 按它把 13 条线路拆开（这套皮不给锚点标任何线路属性）。
      * 搜索页 /sousuo/{词}-------------，末尾那一串横线是模板写死的空条件位。
      *
-     * 直链走 [HtmlRules.MODE_MACCMS_PLAYER] 的 [MaccmsParseResolver]。这一套皮里
+     * 直链走 [HtmlRules.MODE_MACCMS_PARSE] 的 [MaccmsParseResolver]。这一套皮里
      * `player_aaaa.url` 那串**不是地址**：一部片 13 条线路没有一条给地址，给的全是一串
      * base64url 样子的凭据（`from` 是 PK / PJ / PD / lzm3u8 这类线路名，或 qq / youku 那种
      * 平台页），照读出来塞给播放器只会得到一个看不懂的错。站点自己怎么用它、影枢又怎么跟着走，
      * 都写在 [MaccmsParseResolver] 的注释里（那条链路 2026-10-15 用 node 探针在三种页面上逐环验过：
      * 中间某集、最后一集、只有一集的电影）。
+     *
+     * `lineDrop` 舍掉的是它排在最前那条「推荐」：同一集同一线路，官网的播放器放得出来，
+     * 影枢拿到的却是一份「开头几条 #EXTINF 后面不带地址、接着是几条图片 CDN 的 .image」的清单，
+     * ExoPlayer 报 Source error。为什么两边不一样**还没定案**（要同一集两边各抓一份清单对比），
+     * 先按名字舍掉，免得每次起播都白等一次失败 —— 这一条不再出现在线路选单里，
+     * 自动换源也不会再走到它。名字是**正好等于**才舍，「推荐L」「推荐K」留在原位。
      */
     val hq = HtmlRules(
         listPath = "/sousuo/{q}-------------.html",
@@ -421,6 +432,7 @@ object DefaultRules {
         detailPath = "/xiangqing/{id}.html",
         episodeSelector = "a[href*=/bofang/]",
         resolveMode = HtmlRules.MODE_MACCMS_PARSE,
+        lineDrop = listOf("推荐"),
     )
 
     /**
