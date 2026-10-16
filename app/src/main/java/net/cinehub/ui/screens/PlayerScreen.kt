@@ -111,6 +111,9 @@ private enum class Panel { Episodes, Line, Quality, Speed, Source }
 /** 横滑划满一屏对应的跳转量。 */
 private const val SCRUB_SPAN_MS = 120_000L
 
+/** 「换过 N 次才播起来」那句在屏上留多久 —— 控件 3.5 秒就收，这句话得比控件活得长。 */
+private const val SETTLED_NOTICE_MS = 10_000L
+
 /**
  * 播放器报的毫秒 → 秒。
  *
@@ -166,7 +169,7 @@ fun PlayerScreen(
     var attemptUrl by remember { mutableStateOf<String?>(null) }
     /** 这一次播放渲染过第一帧没有 —— 起播看门狗只看这一位。 */
     var firstFrame by remember { mutableStateOf(false) }
-    /** 常驻告知上的「一路试过哪些源」展开没有。 */
+    /** 告知横幅上的「一路试过哪些源」展开没有。 */
     var fbExpanded by remember { mutableStateOf(false) }
 
     // 点播放就进全屏，不用用户再找按钮
@@ -438,6 +441,27 @@ fun PlayerScreen(
     }
 
     /**
+     * 「换过 N 次才播起来 · 现在是 …」这一句 10 秒后自己收，收法和点 × 是同一件事
+     * （[AppViewModel.dismissFallbackNotice]）。
+     *
+     * 只有这一态收：「正在试」是现场，收了等于说没在重试；「都放不出来」底下挂着
+     * 「再试一轮」那一格，收了就把唯一的出口藏了。
+     *
+     * 上面那份控件倒数是 3.5 秒 —— 跟着它一起收的话，这句话在没人抬头看字的时机就没了，
+     * 而换源是应用自己做的，不是用户点的。10 秒是「这句至少被读一遍」那条线；
+     * 收掉之后源名还在顶栏「正在播放 · x」那一行，随控件一起出现。
+     *
+     * 键里没有横幅内容：手动换一次线路会改写「现在是 …」那一行，跟着重置就永远收不掉。
+     * 展开着读失败清单时不倒数，折回去重新数 10 秒。
+     */
+    LaunchedEffect(fallback?.settled, fbExpanded) {
+        if (fallback?.settled == true && !fbExpanded) {
+            delay(SETTLED_NOTICE_MS)
+            vm.dismissFallbackNotice()
+        }
+    }
+
+    /**
      * 退到后台就把播放和轮询一起停下。
      *
      * 影枢没有前台服务，也不发播放通知 —— 放任它在后台放着，用户既找不到入口也关不掉，
@@ -694,9 +718,10 @@ fun PlayerScreen(
                 }
             }
 
-            // ---------- 自动换源的常驻告知 ----------
-            // 不跟着 controls 收起来：源是被系统换掉的，不是用户自己点的，
-            // 收掉就等于悄悄换了个源 —— 画面、清晰度、甚至片名写法都变了却没人说明。
+            // ---------- 自动换源的告知 ----------
+            // 不跟着 controls 一起收：源是被系统换掉的，不是用户自己点的，控件那 3.5 秒
+            // 一过就没了等于悄悄换了个源。各态各自的活法见上面那份倒数 ——
+            // 「正在试」和「都放不出来」常驻到它有下文，「换过 N 次才播起来」留 10 秒。
             fallback?.let { fb ->
                 val last = fb.failures.lastOrNull()
                 Column(

@@ -919,7 +919,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val failures: List<Attempt>,
         /** 候选全试完了：停下说话，不再自己动。 */
         val exhausted: Boolean,
-        /** 已经播开了：横幅留着说明刚才发生了什么，但不再表示「还在试」。 */
+        /** 已经播开了：横幅再留一会儿说明刚才发生了什么（留多久由界面定），但不再表示「还在试」。 */
         val settled: Boolean = false,
     )
 
