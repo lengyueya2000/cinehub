@@ -174,7 +174,13 @@ fun PlayerScreen(
     var controls by remember { mutableStateOf(true) }
     var lastUi by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var panel by remember { mutableStateOf<Panel?>(null) }
-    var speed by remember { mutableFloatStateOf(1f) }
+    /**
+     * 倍速读的是全局那一份（见 `PlaybackRepository`），不是这一屏的本地态。
+     *
+     * 以前它是 `remember { mutableFloatStateOf(1f) }`：同一部剧连看八集，每一集都得
+     * 重新点一遍 1.5x —— 用户的耳朵记着上一集那档，界面不记。
+     */
+    val speed by vm.playbackSpeed.collectAsState()
     var lineIndex by remember { mutableIntStateOf(0) }
     /** 0 = 不封顶，交给 ExoPlayer 自适应；否则是用户选的视频高度上限。 */
     var maxVideoHeight by remember { mutableIntStateOf(0) }
@@ -1195,13 +1201,13 @@ fun PlayerScreen(
                         Panel.Speed -> {
                             Text("倍速", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
                             Spacer8()
-                            listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f).forEach { s ->
+                            vm.speedChoices.forEach { s ->
                                 Row(
                                     Modifier.fillMaxWidth().clip(R.sm)
                                         .background(
                                             if (s == speed) T.Play500.copy(alpha = .16f) else Color.Transparent
                                         )
-                                        .clickable { speed = s; panel = null }
+                                        .clickable { vm.setPlaybackSpeed(s); panel = null }
                                         .padding(horizontal = 12.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {

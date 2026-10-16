@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
+import net.cinehub.data.PlaybackRepository
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
 import net.cinehub.data.quietly
@@ -48,6 +49,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val watchRepo = WatchRepository(app)
     private val doubanRepo = DoubanRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
+    private val playbackRepo = PlaybackRepository(app)
 
     /**
      * 一次性的一句话告知，界面那侧弹出来。
@@ -81,6 +83,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val downloadMaxSegParallel: Int get() = downloadRepo.maxSegParallel
 
     fun setSegParallel(n: Int) = downloadRepo.setSegParallel(n)
+
+    // ---------- 播放偏好 ----------
+
+    /** 全局倍速：不分作品、不分源，起播/换线路/换集都读它，用户调一次就一直是那一档。 */
+    val playbackSpeed: StateFlow<Float> = playbackRepo.speed
+    val speedChoices: List<Float> get() = playbackRepo.speedChoices
+    fun setPlaybackSpeed(value: Float) = playbackRepo.setSpeed(value)
 
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
