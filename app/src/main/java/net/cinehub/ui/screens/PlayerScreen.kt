@@ -94,6 +94,7 @@ import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Health
 import net.cinehub.playback.PlayerBuffering
 import net.cinehub.ui.AppViewModel
+import net.cinehub.ui.SiblingsQuery
 import net.cinehub.ui.components.Spacer4
 import net.cinehub.ui.components.Spacer8
 import net.cinehub.ui.components.StatusDot
@@ -142,6 +143,9 @@ fun PlayerScreen(
     // 从继续观看、搜索结果、缓存列表直接进播放器时它们可能还停在上一部 ——
     // 于是选集、线路、换源三处列的都是别的片的东西。
     val siblings by vm.playingSiblings.collectAsState()
+    /** 这份跨源列表查过没有：没查过的时候「只有一个源」和「还没比对」是两回事。 */
+    val sibQuery by vm.playingSiblingsQuery.collectAsState()
+    val sibGaps by vm.playingSiblingsGaps.collectAsState()
     val health by vm.health.collectAsState()
     val detail by vm.playingDetail.collectAsState()
     val resumeFrom by vm.resumePosition.collectAsState()
@@ -800,13 +804,13 @@ fun PlayerScreen(
                             }
                             Spacer8()
                             Text(
-                                if (fullscreen) "退出全屏后可切换右侧的源" else "用右侧的源切换 →",
+                                "换一个源",
                                 color = T.Src500,
                                 fontSize = Fs.sm,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier
                                     .clip(R.full)
-                                    .clickable { if (fullscreen) fullscreen = false else Unit }
+                                    .clickable { panel = Panel.Source }
                                     .padding(horizontal = 8.dp, vertical = 4.dp),
                             )
                         }
@@ -844,13 +848,13 @@ fun PlayerScreen(
                         )
                         Spacer8()
                         Text(
-                            "或用其它源切换 →",
+                            "换一个源",
                             color = T.Src500,
                             fontSize = Fs.sm,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier
                                 .clip(R.full)
-                                .clickable { if (fullscreen) fullscreen = false }
+                                .clickable { panel = Panel.Source }
                                 .padding(horizontal = 8.dp, vertical = 4.dp),
                         )
                     }
@@ -1000,6 +1004,15 @@ fun PlayerScreen(
                                 Spacer8()
                                 Chip("倍速 ${fmtSpeed(speed)}") { panel = Panel.Speed }
                                 Spacer8()
+                                if (siblings.size > 1 || sibQuery != SiblingsQuery.Done) {
+                                    // 「源」和「线路」不是一回事：源是懂片帝AI、4kku 这种一整个站，
+                                    // 线路是同一个站里给出的几套地址。全屏时右边那排竖着的切源栏
+                                    // 让位给画面，这一格就是唯一的出口。
+                                    Chip(
+                                        if (siblings.size > 1) "源 ${siblings.size}" else "源",
+                                    ) { panel = Panel.Source }
+                                    Spacer8()
+                                }
                                 if (lines.size > 1) {
                                     // 条数一并写出来：懂片帝AI 那种源有十几条，只报「线路 2」
                                     // 用户不知道后面还有得挑
@@ -1201,14 +1214,39 @@ fun PlayerScreen(
                             Spacer8()
                             Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                                 if (siblings.isEmpty()) {
-                                    // 这一栏空着是有原因的：起播时手上没有跨源比对的结果
-                                    // （从首页或继续观看直接进来）。别摆一排看不见的源冒充可选。
-                                    Text(
-                                        "这一部在其它源里还没查到 —— 右侧那条竖排只有查得到的源才会出现。",
-                                        color = T.TextFaint,
-                                        fontSize = Fs.xs,
-                                        lineHeight = Fs.xs * 1.6f,
-                                    )
+                                    // 空着分两种：起播时手上就没有这份比对（从首页、继续观看直接进来），
+                                    // 和查过了但谁也没对上。别摆一排看不见的源冒充可选，也别把前者说成后者。
+                                    when (sibQuery) {
+                                        SiblingsQuery.Running -> Text(
+                                            "正在挨个源比对这一部…",
+                                            color = T.TextFaint, fontSize = Fs.xs, lineHeight = Fs.xs * 1.6f,
+                                        )
+                                        SiblingsQuery.Idle -> {
+                                            Text(
+                                                "这一部还没跟其它源比对过 —— 从首页或继续观看直接进播放器时，" +
+                                                    "手上没有这份结果。",
+                                                color = T.TextFaint, fontSize = Fs.xs, lineHeight = Fs.xs * 1.6f,
+                                            )
+                                            Spacer8()
+                                            Text(
+                                                "查一次",
+                                                color = T.Play400, fontSize = Fs.sm,
+                                                modifier = Modifier.fillMaxWidth().clip(R.sm)
+                                                    .background(T.Surface2)
+                                                    .clickable { vm.queryPlayingSiblings() }
+                                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                            )
+                                            Spacer8()
+                                            Text(
+                                                "这一趟要把每个源都搜一遍，几秒起。",
+                                                color = T.TextFaint, fontSize = Fs.tiny, lineHeight = Fs.tiny * 1.6f,
+                                            )
+                                        }
+                                        SiblingsQuery.Done -> Text(
+                                            "其它源里没对上这一部。",
+                                            color = T.TextFaint, fontSize = Fs.xs, lineHeight = Fs.xs * 1.6f,
+                                        )
+                                    }
                                 }
                                 siblings.forEach { av ->
                                     val on = av.sourceId == playing?.sourceId
@@ -1248,6 +1286,21 @@ fun PlayerScreen(
                                             overflow = TextOverflow.Ellipsis,
                                         )
                                     }
+                                }
+                                if (siblings.size == 1 && sibQuery == SiblingsQuery.Done) {
+                                    Spacer8()
+                                    Text(
+                                        "其它源里没对上这一部 —— 现在这个源是唯一对得上的。",
+                                        color = T.TextFaint, fontSize = Fs.tiny, lineHeight = Fs.tiny * 1.6f,
+                                    )
+                                }
+                                if (sibGaps.isNotEmpty()) {
+                                    Spacer8()
+                                    Text(
+                                        "另有 ${sibGaps.size} 个源没答上话：" +
+                                            sibGaps.joinToString("、") { "${it.sourceName}（${it.reason}）" },
+                                        color = T.TextFaint, fontSize = Fs.tiny, lineHeight = Fs.tiny * 1.6f,
+                                    )
                                 }
                             }
                         }

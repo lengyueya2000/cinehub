@@ -788,11 +788,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 和 [_playingDetail] 同一个道理：[_siblings] 是详情页那一次的查询结果，
      * 从继续观看直接进播放器时它还是上一部片的 —— 换源面板会列出别的片的源，
-     * 点下去就是拿另一部片去解析。所以只有对得上号才带过来，对不上宁可空着
-     * （空着面板就不显示，比摆一排假的强）。
+     * 点下去就是拿另一部片去解析。所以只有对得上号才带过来，对不上宁可空着。
+     * 空着不等于「就这一个源」，那是没查过，见 [_playingSiblingsQuery]。
      */
     private val _playingSiblings = MutableStateFlow<List<SourceAvailability>>(emptyList())
     val playingSiblings: StateFlow<List<SourceAvailability>> = _playingSiblings.asStateFlow()
+
+    /** 播放器那份跨源列表查过没有：这一格决定「换源」上摆不摆得出数字。 */
+    private val _playingSiblingsQuery = MutableStateFlow(SiblingsQuery.Idle)
+    val playingSiblingsQuery: StateFlow<SiblingsQuery> = _playingSiblingsQuery.asStateFlow()
+
+    /** 这一趟里根本没答上的源（名字 + 原因）。「其它源里没有」和「有几个源没查到」是两回事。 */
+    private val _playingSiblingsGaps = MutableStateFlow<List<SearchOutcome.Failure>>(emptyList())
+    val playingSiblingsGaps: StateFlow<List<SearchOutcome.Failure>> = _playingSiblingsGaps.asStateFlow()
+
+    private var playingSiblingsJob: Job? = null
+
+    /**
+     * 播放器那份跨源列表属于**哪一部片**（片名指纹）。
+     *
+     * 用指纹而不是各源的 key：换源以后 key 就变了，而这份列表本来就是跨源的，
+     * 拿 key 比会逼着用户每换一次源重查一遍。
+     */
+    private var playingSiblingsOf: String? = null
 
     /**
      * 第几次起播。
@@ -1175,9 +1193,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _playingDetail.value = detail
                     ?: _detail.value?.takeIf { fits(it) }
                     ?: _playingDetail.value?.takeIf { fits(it) }
-                _playingSiblings.value =
-                    if (_playingDetail.value != null && _siblingsOf == mediaKey) _siblings.value
-                    else emptyList()
+                retainPlayingSiblings(
+                    mediaTitle = mediaTitle,
+                    sourceId = sourceId,
+                    inherited = _siblings.value.takeIf {
+                        _playingDetail.value != null && _siblingsOf == mediaKey
+                    },
+                )
                 // 自动换源走到这里是同一轮里的下一次尝试，流水和游标都不能动；
                 // 用户自己点的播/换集/续播才开新的一轮。
                 val keepRound = autoAdvance && round?.episodeIndex == episodeIndex
@@ -1363,6 +1385,90 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 换源面板那份列表要跟着「正在播的是哪一部片」走。
+     *
+     * 认的是片名指纹，不是各源自己的 key：换源以后 key 就变了（懂片帝不给年份、4kku 给 2026），
+     * 拿 key 比的话每换一次源都退回「没查过」，得再查一遍。指纹对不上就是换了片，就地清空 ——
+     * 面板列出别的片的源，点下去要的是另一部的地址。
+     * [inherited] 是详情页刚比对过的那一份，直接采信。
+     */
+    private fun retainPlayingSiblings(
+        mediaTitle: String,
+        sourceId: String,
+        inherited: List<SourceAvailability>?,
+    ) {
+        val fingerprint = normalizeTitle(mediaTitle)
+        val kept = inherited ?: _playingSiblings.value.takeIf { playingSiblingsOf == fingerprint }
+        val has = !kept.isNullOrEmpty()
+        _playingSiblings.value = (kept ?: emptyList()).sortedByDescending { it.sourceId == sourceId }
+        _playingSiblingsGaps.value = when {
+            inherited != null -> _siblingFailures.value
+            has -> _playingSiblingsGaps.value
+            else -> emptyList()
+        }
+        // 空着不等于「就这一个源」，那是没查过；界面这两句话说得不一样，见 SiblingsQuery
+        _playingSiblingsQuery.value = if (has) SiblingsQuery.Done else SiblingsQuery.Idle
+        playingSiblingsOf = if (has) fingerprint else null
+    }
+
+    /**
+     * 播放器里现查一次「这部片在其它源里有没有」。
+     *
+     * 从首页、继续观看、缓存列表直接进播放器时手上没有这份比对，换源那一格只能空着。
+     * 这一趟要挨个源搜一遍（网络扇出，几个站各自几秒），所以只在用户点「查一次」时跑，
+     * 不进播放器就自动来一次 —— 自动查等于每开一集就把所有源打一遍。
+     */
+    fun queryPlayingSiblings() {
+        if (_playingSiblingsQuery.value == SiblingsQuery.Running) return
+        val p = _playing.value
+        // 比对只用得到片名和年份，这两样起播时一定带进来了；详情快照却可能没有
+        // （一进去就解析失败那种）。别因为手上没整份详情就不给查 —— 越是不通的源，
+        // 用户越需要这一格来看「别的源有没有」。
+        val media = _playingDetail.value?.media ?: p?.let {
+            Media(
+                id = it.mediaId ?: "",
+                title = it.mediaTitle,
+                cover = it.mediaCover,
+                year = it.mediaYear,
+                sourceId = it.sourceId,
+            )
+        }
+        if (media == null) {
+            showNotice("这一笔连片名都没带进播放器，没法比对 —— 回到详情页从片子本身进一次再试。")
+            return
+        }
+        val mine = p?.sourceId
+        _playingSiblingsQuery.value = SiblingsQuery.Running
+        playingSiblingsJob?.cancel()
+        playingSiblingsJob = viewModelScope.launch {
+            // quietly 而不是 runCatching：这一趟会被下一次起播顶掉，
+            // 顶掉的时候不该在屏上留一句「加载失败」
+            quietly { mediaRepo.siblingsOf(media) }
+                .onSuccess { s ->
+                    val found = s.items.sortedByDescending { it.sourceId == mine }
+                    // 一个源都没对上也仍然要摆出正在播的这个：它确实就在这儿播着，
+                    // 面板里报「没有别的源」比报「这部片没有源」诚实
+                    _playingSiblings.value = found.ifEmpty {
+                        if (p == null) emptyList() else listOf(
+                            SourceAvailability(
+                                sourceId = p.sourceId,
+                                sourceName = p.sourceName,
+                                item = media,
+                                health = _health.value[p.sourceId]?.health ?: Health.Unknown,
+                                quality = qualityOf(media),
+                                latencyMs = _health.value[p.sourceId]?.latencyMs,
+                            ),
+                        )
+                    }
+                    _playingSiblingsGaps.value = s.failures
+                    _playingSiblingsQuery.value = SiblingsQuery.Done
+                    playingSiblingsOf = normalizeTitle(media.title)
+                }
+                .onFailure { _playingSiblingsQuery.value = SiblingsQuery.Idle }
+        }
+    }
+
     // ---------- 离线缓存 ----------
 
     fun downloadTask(sourceId: String, mediaId: String, episodeIndex: Int): DownloadTask? =
@@ -1454,6 +1560,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 选集/线路那份也一样：从缓存列表直接播一部片时，手上那份快照
         // 可能还是刚才在线看的那一部，留着就是拿别的片的集数列表播这一部
         _playingDetail.value = _playingDetail.value?.takeIf { it.media.id == task.mediaId }
+        retainPlayingSiblings(task.mediaTitle, task.sourceId, inherited = null)
     }
 
     /**
@@ -1630,6 +1737,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             mediaCover = e.cover,
             resumeFrom = e.positionSec,
         )
+        // 这一笔也换了「正在播的是哪一部」：跨源那份列表和那份分集快照都要跟着认片，
+        // 不然屏上写的是这一部的片名，点「选集」「线路」摆出来的却是上一部的东西
+        _playingDetail.value = _playingDetail.value?.takeIf {
+            it.media.id == e.mediaId && it.media.sourceId == e.sourceId
+        }
+        retainPlayingSiblings(e.title, e.sourceId, inherited = null)
     }
 
     // ---------- 豆瓣榜单 ----------
@@ -1762,3 +1875,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 }
+
+/**
+ * 播放器里那份跨源列表的状态。
+ *
+ * Idle 是「还没查过」，不是「别处没有」—— 从首页、继续观看直接进播放器时手上就是空的，
+ * 界面得把这两种情况分开说，否则「只有一个源」和「没查过」看起来一模一样。
+ */
+enum class SiblingsQuery { Idle, Running, Done }
+
