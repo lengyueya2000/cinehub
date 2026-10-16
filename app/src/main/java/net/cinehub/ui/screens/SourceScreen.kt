@@ -91,6 +91,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val health by vm.health.collectAsState()
     val checking by vm.checking.collectAsState()
     val unreadable by vm.sourcesUnreadable.collectAsState()
+    val seedNotice by vm.seedNotice.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
     // 同一张表单也用来改：接进来的源地址写错了、要换个凭证，以前只能删了重加 ——
@@ -243,6 +244,40 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                     Text("已接入", color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
                     Box(Modifier.weight(1f))
                     Text("按优先级排序", color = T.TextFaint, fontSize = Fs.xxs)
+                }
+            }
+
+            // 这一次更新自动补进来的新源，说一次。不藏：悄悄多出一个源和悄悄少一个源
+            // 是同一种毛病，都得让用户看得见。
+            seedNotice?.let { msg ->
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().clip(R.md)
+                            .background(T.Play500.copy(alpha = .07f))
+                            .border(1.dp, T.Play500.copy(alpha = .28f), R.md)
+                            .padding(Sp.s3),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            msg,
+                            color = T.Text,
+                            fontSize = Fs.xs,
+                            lineHeight = Fs.xs * 1.6f,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer12()
+                        Text(
+                            "知道了",
+                            color = T.Play400,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clip(R.full)
+                                .heightIn(min = 44.dp)
+                                .clickable { vm.dismissSeedNotice() }
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                        )
+                    }
+                    Spacer12()
                 }
             }
 

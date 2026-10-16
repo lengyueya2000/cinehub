@@ -295,12 +295,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
+            // 先补这一版新加的内置源，再开始订阅列表、再量健康度。
+            // 顺序不能反：mutate 每一笔都会刷新「见过」那份账，先落了别的写，
+            // 新源就被记成见过了、反而补不进来。
+            val fresh = runCatching { sourceRepo.syncNewSeeds() }.getOrDefault(emptyList())
+            if (fresh.isNotEmpty()) {
+                _seedNotice.value = "这次更新补进来 ${fresh.size} 个新源：" +
+                    fresh.joinToString("、") { it.name } + "。不想要就在下面删掉，删了不会再自动加回来。"
+            }
             sourceRepo.sources.collect { _sources.value = it }
+            refreshHealth()
         }
-        refreshHealth()
         // 首页那一份不在这里取：和片库一样，只在真的显示这一屏时才敲豆瓣的门 ——
         // 由 HomeScreen 那边驱动，省得用户直接进「我的」也白取一趟榜单。
     }
+
+    /** 「这次更新补进来了新源」那一句，只在真的补过的这一次启动里有话。 */
+    private val _seedNotice = MutableStateFlow<String?>(null)
+    val seedNotice: StateFlow<String?> = _seedNotice.asStateFlow()
+    fun dismissSeedNotice() { _seedNotice.value = null }
 
     // ---------- 源管理 ----------
 

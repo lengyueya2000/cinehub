@@ -25,6 +25,14 @@ class SourceRepository(private val context: Context) {
 
     private val KEY = stringPreferencesKey("sources_v1")
     private val BACKUP_KEY = stringPreferencesKey("sources_v1_unreadable")
+
+    /**
+     * 这些内置源的 id **这个安装见过**。
+     *
+     * 「见过」和「在列表里」是两件事，而补新源必须认前者：认后者的话，用户自己删掉的那几条
+     * 会在每次升级时被偷偷加回来一次。
+     */
+    private val SEEN_KEY = stringPreferencesKey("seen_seed_ids")
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
 
     /** 上一次真读通了的列表。读不通时用它兜，见 [sources]。 */
@@ -74,36 +82,42 @@ class SourceRepository(private val context: Context) {
      *
      * `edit { }` 里的变换由 DataStore 串行执行，读和写看到的是同一份，
      * 所以改的起点是事务里那份，不是调用方手里那份。
+     *
+     * 变换同时拿到「事务里那份列表」和「这批内置源见过没有」，因为 [syncNewSeeds] 要拿后者
+     * 判；「见过」也在这同一笔事务里刷新 —— 分开写就有个窗口：上一笔还没落、这一笔按旧的
+     * 那份见过判，新源会被补第二次。
      */
-    private suspend fun mutate(f: (List<SourceConfig>) -> List<SourceConfig>) {
+    private suspend fun mutate(f: (List<SourceConfig>, Set<String>) -> List<SourceConfig>) {
         context.dataStore.edit { p ->
             val raw = p[KEY]
             val (stored, unreadable) = decode(raw)
             val prev = stored ?: lastGood ?: Seed.sources
+            val seen = p[SEEN_KEY]?.split(SEEN_SEP)?.filter { it.isNotBlank() }?.toSet().orEmpty()
             // 排完之后统一重编成 1..n。
             //
             // 属性名是 JSON 键、值是用户看到的顺序，重复的 priority 会让「谁排前面」
             // 取决于排序算法的稳定性， restoreDefaults 补回来的内置源尤其容易和现有条目撞号。
             // 顺手把整列压成连续整数，读写两边就都只有一种解释。
-            val next = f(prev.filterNot { it.id in Seed.retiredIds })
+            val next = f(prev.filterNot { it.id in Seed.retiredIds }, seen)
                 .sortedBy { it.priority }
                 .mapIndexed { i, s -> s.copy(priority = i + 1) }
             // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
             // 而不是被「看起来正常」的新列表就地替换掉。
             if (unreadable && !raw.isNullOrBlank()) p[BACKUP_KEY] = raw
             p[KEY] = json.encodeToString(next)
+            p[SEEN_KEY] = Seed.sources.joinToString(SEEN_SEP.toString()) { it.id }
             lastGood = next
         }
     }
 
-    suspend fun upsert(cfg: SourceConfig) = mutate { cur ->
+    suspend fun upsert(cfg: SourceConfig) = mutate { cur, _ ->
         val i = cur.indexOfFirst { it.id == cfg.id }
         if (i >= 0) cur.toMutableList().also { it[i] = cfg } else cur + cfg
     }
 
-    suspend fun delete(id: String) = mutate { it.filterNot { s -> s.id == id } }
+    suspend fun delete(id: String) = mutate { cur, _ -> cur.filterNot { s -> s.id == id } }
 
-    suspend fun setEnabled(id: String, enabled: Boolean) = mutate { l ->
+    suspend fun setEnabled(id: String, enabled: Boolean) = mutate { l, _ ->
         l.map { if (it.id == id) it.copy(enabled = enabled) else it }
     }
 
@@ -114,7 +128,7 @@ class SourceRepository(private val context: Context) {
      * （补回内置源、存好一个新源），UI 手里那份顺序就已经少了它 —— 照原样「只保留传进来的」
      * 写回去，用户加的那个源就凭空消失了，而界面上他刚刚只是在挪位置。
      */
-    suspend fun reorder(ids: List<String>) = mutate { cur ->
+    suspend fun reorder(ids: List<String>) = mutate { cur, _ ->
         val byId = cur.associateBy { it.id }
         val moved = ids.toSet()
         // 新位置要写成新号：mutate 之后按 priority 排，只换列表顺序不换号等于什么都没改。
@@ -131,13 +145,41 @@ class SourceRepository(private val context: Context) {
      */
     suspend fun restoreDefaults(): Int {
         var added = 0
-        mutate { cur ->
+        mutate { cur, _ ->
             val have = cur.map { it.id }.toSet()
             val missing = Seed.sources.filter { it.id !in have }
             added = missing.size
             cur + missing
         }
         return added
+    }
+
+    /**
+     * 升级带进来的新内置源，自己长进列表里 —— 不用用户去「播放源管理」点补回。
+     *
+     * 判据是「这个 id 这个安装见过没有」，不是「它在不在列表里」。这个区别就是全部：
+     * 认后者的话，用户自己删掉的每一条都会在下次升级时被偷偷加回来一次。
+     *
+     * **第一次走到这条的老安装一个都不补**，只把当前这批记成见过。因为那时候还没有
+     * 「见过」这份账，列表里缺哪几条无从分辨是他删的还是版本没带 —— 宁可少补一次
+     * （他还能点补回），也不能多补一次（那是替他做决定）。
+     *
+     * 要在应用启动时就调，别排在任何一次用户改动之后：[mutate] 每一笔都会刷新那份「见过」，
+     * 先落了别的写，这一版的新源就被记成见过了、反而补不进来。
+     */
+    suspend fun syncNewSeeds(): List<SourceConfig> {
+        var added: List<SourceConfig> = emptyList()
+        mutate { cur, seen ->
+            val have = cur.map { it.id }.toSet()
+            added = if (seen.isEmpty()) emptyList() else
+                Seed.sources.filter { it.id !in seen && it.id !in have }
+            cur + added
+        }
+        return added
+    }
+
+    private companion object {
+        const val SEEN_SEP = '\u0001'
     }
 }
 
