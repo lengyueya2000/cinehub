@@ -187,7 +187,21 @@ data class HealthReport(
 data class AggregatedMedia(
     val media: Media,
     val availability: List<SourceAvailability>,
-)
+) {
+    /**
+     * 这一行的稳定唯一标识（给 LazyColumn 当 key 用）。
+     *
+     * **不能拿 [Media.key] 当界面上的 key**：归并键是「标题 + 年份」，而同一部片可能有
+     * 两条同名同年、类型不同的条目（实测「余红旧事」2026 的漫剧与连续剧），它们归并后
+     * 各成一行，[Media.key] 却完全相同 —— Compose 的 LazyColumn 收到重复 key 会当场抛
+     * `IllegalArgumentException`，表现就是「搜这个词应用直接闪退」。
+     *
+     * 用「源 id + 条目 id」：条目 id 在它自己的源里唯一（同源两条同名条目的 id 不同，
+     * 正是靠这个才分得开），所以这个组合在列表内唯一，且同一份结果重复渲染时保持稳定。
+     */
+    val rowKey: String
+        get() = "${availability.firstOrNull()?.sourceId.orEmpty()}:${media.id}"
+}
 
 data class SourceAvailability(
     val sourceId: String,

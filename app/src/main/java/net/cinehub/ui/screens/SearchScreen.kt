@@ -326,7 +326,9 @@ fun SearchScreen(
                 }
             }
 
-            items(shown, key = { it.media.key }) { agg ->
+            // key 用 rowKey 而不是 media.key：同名同年的两条不同条目（类型不同）
+            // media.key 完全一样，拿它当 key 会让 LazyColumn 抛重复 key 而闪退
+            items(shown, key = { it.rowKey }) { agg ->
                 ResultRow(agg) { av -> onOpenDetail(av.sourceId, av.item.id) }
             }
 

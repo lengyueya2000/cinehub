@@ -4,7 +4,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
-
 /**
  * 用**真实后端数据**钉住同名条目的归并行为。
  *
@@ -83,5 +82,43 @@ class SameTitleTypeSplitTest {
         // 同一条自己和自己比仍然算同一部
         assertEquals(true, newJudge(manhua(), manhua()))
         assertEquals(true, newJudge(series(), series()))
+    }
+
+    /** 一条聚合结果（一行搜索结果），键与条目都取自真实那两条。 */
+    private fun row(m: Media) = AggregatedMedia(
+        media = m,
+        availability = listOf(
+            SourceAvailability(
+                sourceId = m.sourceId,
+                sourceName = "MINO自建",
+                item = m,
+                health = Health.Ok,
+            ),
+        ),
+    )
+
+    /**
+     * 崩溃回归：两条同名条目必须给出**两个不同的行键**。
+     *
+     * 归并这两条之后，界面上是两行，而 Media.key（标题+年份）完全相同。
+     * 搜索页原来拿 media.key 当 LazyColumn 的 key，Compose 收到重复 key 当场抛
+     * `IllegalArgumentException: Key ... was already used` —— 表现就是
+     * 「搜别的词都没事，单单搜余红旧事应用直接闪退」。这一条钉住那个修复。
+     */
+    @Test
+    fun twoRowsHaveDistinctLazyColumnKeys() {
+        val a = row(manhua())
+        val b = row(series())
+
+        // 前提：归并键确实相同，否则这条用例测不到东西
+        assertEquals(a.media.key, b.media.key)
+        // 修复后：行键必须不同，重复 key 的崩溃才不会再出现
+        assertNotEquals(a.rowKey, b.rowKey)
+    }
+
+    @Test
+    fun rowKeyIsStableAcrossRenders() {
+        // 同一份结果重复渲染时键要一样，否则列表会每次重建（滚动位置、动画全丢）
+        assertEquals(row(manhua()).rowKey, row(manhua()).rowKey)
     }
 }
