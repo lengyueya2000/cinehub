@@ -232,21 +232,13 @@ object Seed {
             tags = listOf("片库九万", "第一次要过浏览器验证"),
             needsBrowser = true,
         ),
-        SourceConfig(
-            id = "demo_m3u",
-            name = "演示源",
-            baseUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-            kind = net.cinehub.data.model.SourceKind.M3u,
-            priority = 6,
-            tags = listOf("公开测试流", "可验证播放"),
-        ),
     )
 
     /**
      * 曾经内置、后来撤掉的源。
      *
-     * 只从 [sources] 里删掉是不够的：老用户列表里那两条是启动时写进去的，会一直留着。
+     * 只从 [sources] 里删掉是不够的：老用户列表里那几条是启动时写进去的，会一直留着。
      * 按 id 清掉它们，用户自己手动加的同类源（id 形如 `src_xxx`）不受影响。
      */
-    val retiredIds = setOf("k4vm", "xiguazx")
+    val retiredIds = setOf("k4vm", "xiguazx", "demo_m3u")
 }

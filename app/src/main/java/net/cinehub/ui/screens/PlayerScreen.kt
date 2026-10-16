@@ -1227,10 +1227,20 @@ fun PlayerScreen(
                                                 if (i == safeLine) T.Play500.copy(alpha = .16f) else Color.Transparent
                                             )
                                             .clickable {
-                                                // 换线路 = 换一套地址，集数按 index 对齐
+                                                // 换线路 = 换一套地址，集数按 index 对齐，
+                                                // **进度也要跟着过去**：还是同一部片的同一集，
+                                                // 从 0 开始等于把看到一半的位置扔了。
+                                                // 原来这里漏传了 keepPos，playEpisode 那个参数
+                                                // 一直是默认值 0 —— 换集是对的，换线路不是。
+                                                //
+                                                // 读的是这一刻的 player.currentPosition，不是
+                                                // vm.resumePosition：那个活值会被轮询和 stop() 冲成 0
+                                                // （见上面 setMediaSource 那条注释同一件事），
+                                                // 而换线路这一笔马上就要停旧起新，从它那儿读有概率拿到 0。
                                                 val cur = playing?.episodeIndex ?: 1
+                                                val at = msToSec(player.currentPosition)
                                                 lines.getOrNull(i)?.episodes?.firstOrNull { it.index == cur }
-                                                    ?.let { playEpisode(it) }
+                                                    ?.let { playEpisode(it, keepPos = at) }
                                                 lineIndex = i
                                                 panel = null
                                             }
