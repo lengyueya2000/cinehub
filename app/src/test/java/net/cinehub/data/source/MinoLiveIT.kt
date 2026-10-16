@@ -4,6 +4,7 @@ import kotlinx.coroutines.runBlocking
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.typeFingerprint
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -42,6 +43,24 @@ class MinoLiveIT {
         val hits = adapter.search("庆余年", 1)
         println("[live] search 庆余年 -> ${hits.size} 条：${hits.take(3).map { it.title }}")
         assertTrue("search 返回 0 条", hits.isNotEmpty())
+
+        // 2b) 同名条目：后端里「余红旧事」2026 有两条，靠类型才分得开。
+        //     这一条钉的是「官方那 3 条 4K 线路能被单独拿到」，也就是这次的 bug。
+        val same = adapter.search("余红旧事", 1).filter { it.title == "余红旧事" }
+        println("[live] search 余红旧事 -> ${same.size} 条同名条目：" +
+            same.joinToString { "id=${it.id} type=${it.category}" })
+        assertTrue("同名条目少于 2 条，类型校验无从谈起（后端数据可能变了）", same.size >= 2)
+        val types = same.map { typeFingerprint(it.category) }
+        assertTrue(
+            "两条同名条目的类型归一值没能区分开：$types（应含漫剧与连续剧）",
+            types.distinct().size >= 2,
+        )
+        // 分别打开两条，确认线路真的不一样 —— 这正是用户看到的「1080P vs 4K」
+        for (m in same.take(2)) {
+            val d = adapter.detail(m.id)
+            println("[live]   id=${m.id} type=${m.category} -> ${d.lines.size} 条线路：" +
+                d.lines.joinToString { it.name })
+        }
 
         // 3) 详情：爱情公寓3（报告里的验证样本，vod_id=1535960）该有多条线路
         val detail = adapter.detail("1535960")

@@ -95,13 +95,45 @@ class MinoSignTest {
     fun base64UrlSafeAndDecodeRoundTrip() {
         assertEquals("__4A", MinoSign.encodeBase64(byteArrayOf(-1, -2, 0), urlSafe = true))
         // 无填充的 JWT payload 段能解回来
-        val decoded = MinoSign.decodeBase64("eyJhIjoxLCJiIjoieD9-KyJ9", urlSafe = true)
+        val decoded = MinoSign.decodeBase64("eyJhIjoxLCJiIjoieD9-KyJ9")
         assertEquals("""{"a":1,"b":"x?~+"}""", decoded?.let { String(it) })
     }
 
     @Test
     fun base64DecodeRejectsGarbage() {
-        assertNull(MinoSign.decodeBase64("not*base64!", urlSafe = false))
+        assertNull(MinoSign.decodeBase64("not*base64!"))
+    }
+
+    /**
+     * 回归：票据 payload 段用的是**标准** base64，不是严格的 base64url。
+     *
+     * 实测同一部片（余红旧事 vod 1840029）的三条线路里，第二条的 payload 段含 `/`。
+     * 早先只认 url-safe 字母表，于是那一票被判成「格式不认识」—— 而它本身完全正常，
+     * 表现就是一部片三条线路两条能播、第三条必坏，且换一部片又变。
+     */
+    @Test
+    fun base64DecodeAcceptsStandardAlphabetSlashAndPlus() {
+        // 站点票据的 payload 段是**标准** base64（不是严格 base64url）：
+        // 实测余红旧事 vod 1840029 的第二条线路，payload 段里就含 '/'。
+        // 三字节 0xff 在标准字母表下编码成 '/'，url-safe 会换成 '_'。
+        val slashRaw = byteArrayOf(-1, -1, -1)
+        val withSlash = MinoSign.encodeBase64(slashRaw, urlSafe = false)
+        assertEquals("////", withSlash)
+        assertEquals(slashRaw.toHex(), MinoSign.decodeBase64(withSlash)?.toHex())
+
+        // '+' 同理：0xfb 0xef 0xbe 编码成 '++++++++'
+        val plusRaw = byteArrayOf(0xfb.toByte(), 0xef.toByte(), 0xbe.toByte())
+        val withPlus = MinoSign.encodeBase64(plusRaw, urlSafe = false)
+        assertTrue("样本本身应该含 '+'，否则这条测试没测到东西", withPlus.contains('+'))
+        assertEquals(plusRaw.toHex(), MinoSign.decodeBase64(withPlus)?.toHex())
+    }
+
+    @Test
+    fun base64DecodeStillAcceptsUrlSafe() {
+        val raw = byteArrayOf(-1, -2, 0, 63, 63, 63)
+        val url = MinoSign.encodeBase64(raw, urlSafe = true)
+        assertTrue("url-safe 样本应含 '-' 或 '_'", url.contains('-') || url.contains('_'))
+        assertEquals(raw.toHex(), MinoSign.decodeBase64(url)?.toHex())
     }
 
     @Test

@@ -18,6 +18,7 @@ import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.model.titleFingerprint
 import net.cinehub.data.model.titleSearchVariants
+import net.cinehub.data.model.typeFingerprint
 import net.cinehub.data.net.Http
 import net.cinehub.data.source.SourceAdapters
 import java.util.concurrent.ConcurrentHashMap
@@ -129,37 +130,62 @@ class MediaRepository(private val sources: SourceRepository) {
         val byFp = LinkedHashMap<String, MutableList<Pair<SourceConfig, Media>>>()
         per.forEach { (cfg, list, _) ->
             // 同一个源可能对同一部片返回多条（不同线路各算一条），先在本源内去掉，
-            // 否则徽标会重复出现
-            list.groupBy { it.key }.forEach { (_, dupes) ->
-                byFp.getOrPut(titleFingerprint(dupes.first().title)) { mutableListOf() } += cfg to dupes.first()
-            }
+            // 否则徽标会重复出现。
+            //
+            // 去重的键要把**类型**算进去：同名同年但类型不同的两条是两部片（实测
+            // 「余红旧事」2026 的漫剧与连续剧），只按 Media.key 去重会把后一条整个丢掉 ——
+            // 而丢掉的那条恰恰是带 4K 线路的，用户于是永远只看到先回来的那组线路。
+            list.distinctBy { it.key + "|" + typeFingerprint(it.category).orEmpty() }
+                .forEach { m ->
+                    byFp.getOrPut(titleFingerprint(m.title)) { mutableListOf() } += cfg to m
+                }
         }
 
         val merged = LinkedHashMap<String, MutableList<SourceAvailability>>()
         val seed = HashMap<String, Media>()
         byFp.forEach { (fp, bucket) ->
             val years = bucket.mapNotNull { yearOf(it.second) }.distinct()
-            val groups: List<Pair<String?, List<Pair<SourceConfig, Media>>>> = if (years.size <= 1) {
+            val yearGroups: List<Pair<String?, List<Pair<SourceConfig, Media>>>> = if (years.size <= 1) {
                 listOf(years.firstOrNull() to bucket)
             } else {
                 // 同名不同年（重拍、同名续作）才按年份分家；没带年份的那些归进第一档，
                 // 因为这里没有更多信息可判，而把它们单独成一行同样是在骗人
                 bucket.groupBy { yearOf(it.second) ?: years.first() }.map { (y, ms) -> y to ms }
             }
-            groups.forEach { (year, items) ->
-                val key = if (year == null) fp else "$fp|$year"
-                items.forEach { (cfg, m) ->
-                    val slot = merged.getOrPut(key) { mutableListOf() }
-                    if (slot.none { it.sourceId == cfg.id }) {
-                        slot += SourceAvailability(
-                            sourceId = cfg.id,
-                            sourceName = cfg.name,
-                            item = m,
-                            health = healthCache[cfg.id]?.health ?: Health.Unknown,
-                            quality = qualityTag(m),
-                            latencyMs = healthCache[cfg.id]?.latencyMs,
-                        )
-                        seed.putIfAbsent(key, m)
+            yearGroups.forEach { (year, items) ->
+                // 同名同年也未必是同一部片，再按类型归一值分一次家（见 [typeFingerprint]）。
+                // 判据与年份那一条完全一样：**有一方没写类型就不分家** —— 各源给不给这一列
+                // 差别很大，拿「一边没有」当「两边不同」会把本来对得上的片子全拆成两行，
+                // 那是为了修一条而弄坏一片。
+                val types = items.mapNotNull { typeFingerprint(it.second.category) }.distinct()
+                val typeGroups: List<Pair<String?, List<Pair<SourceConfig, Media>>>> =
+                    if (types.size <= 1) {
+                        listOf(types.firstOrNull() to items)
+                    } else {
+                        items.groupBy { typeFingerprint(it.second.category) ?: types.first() }
+                            .map { (t, ms) -> t to ms }
+                    }
+                typeGroups.forEach { (type, group) ->
+                    // 键里带上年份与类型：两条不同片必须落在两个 slot 里，
+                    // 否则下面那句「同一源只留一条」又会把后一条挡掉。
+                    val key = buildString {
+                        append(fp)
+                        if (year != null) append('|').append(year)
+                        if (type != null) append('|').append(type)
+                    }
+                    group.forEach { (cfg, m) ->
+                        val slot = merged.getOrPut(key) { mutableListOf() }
+                        if (slot.none { it.sourceId == cfg.id }) {
+                            slot += SourceAvailability(
+                                sourceId = cfg.id,
+                                sourceName = cfg.name,
+                                item = m,
+                                health = healthCache[cfg.id]?.health ?: Health.Unknown,
+                                quality = qualityTag(m),
+                                latencyMs = healthCache[cfg.id]?.latencyMs,
+                            )
+                            seed.putIfAbsent(key, m)
+                        }
                     }
                 }
             }
@@ -237,11 +263,14 @@ class MediaRepository(private val sources: SourceRepository) {
     private suspend fun siblingsOnIo(media: Media): Siblings = coroutineScope {
         val want = titleFingerprint(media.title)
         val year = media.key.substringAfter('|', "").takeIf { it.isNotBlank() }
+        // 类型也带过去比对：后端里同名同年可能有两条（漫剧 / 连续剧），不带它就会
+        // 把另一条的线路当成这部的 —— 切源切过去看到的是别的片。
+        val type = typeFingerprint(media.category)
         val active = sources.active()
         val per = active.map { cfg ->
             async {
                 // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
-                val (hits, err) = findInSource(cfg, media.title, want, year)
+                val (hits, err) = findInSource(cfg, media.title, want, year, type)
                 // 真取回了内容，就是比探根路径更硬的证据 —— 和 [searchOnIo] 同一件事，
                 // 这里原先没做：于是播放器里「查一次」刚把 FreeOK 列进可换的源，
                 // 退回详情页那一栏它却写着「不可用」，同一部片、隔一秒、两句话。
@@ -290,13 +319,14 @@ class MediaRepository(private val sources: SourceRepository) {
         title: String,
         want: String,
         year: String?,
+        type: String?,
     ): Pair<List<Media>, Throwable?> {
         var lastErr: Throwable? = null
         for (q in titleSearchVariants(title)) {
             // create() 也放在 quietly 里：这趟跑在 viewModelScope 上，外面没有 catch，
             // 一个源构造不出来不该把整张详情页带走
             val r = quietly { SourceAdapters.create(cfg).search(q, 1) }
-            val hits = r.getOrNull().orEmpty().filter { sameWork(it, want, year) }
+            val hits = r.getOrNull().orEmpty().filter { sameWork(it, want, year, type) }
             if (hits.isNotEmpty()) return hits to null
             lastErr = r.exceptionOrNull()
         }
@@ -318,10 +348,26 @@ class MediaRepository(private val sources: SourceRepository) {
         healthAt[cfgId] = System.currentTimeMillis()
     }
 
-    private fun sameWork(m: Media, want: String, year: String?): Boolean {
+    /**
+     * 是不是同一部片：标题指纹 + 年份不冲突 + **类型不冲突**。
+     *
+     * 第三条是实测倒逼出来的：后端里同名同年的条目不止一条，而它们往往不是同一部片。
+     * 「余红旧事」2026 有两条 —— 一条 `type_name=漫剧`（34 集，3 条 1080P 线路），
+     * 一条 `type_name=连续剧`（34 集，蓝光4K / 4K / 小艺）。只按「同名同年」判，
+     * 搜索卡片会把两条合成一条、详情页只拿到其中一条的线路：用户看到的就是
+     * 「官方源明明有 3 条 4K，影枢里只有 3 条 1080P」。
+     *
+     * 只在一方写了类型时生效：这一列各源写法差别大（有的给 type_name、有的给 vod_class、
+     * 有的根本不写），拿「一边没有」当「两边不同」会把本来对得上的片子全拆开 ——
+     * 那就成了为了修一条而弄坏一片。
+     */
+    private fun sameWork(m: Media, want: String, year: String?, type: String?): Boolean {
         if (titleFingerprint(m.title) != want) return false
         val otherYear = m.key.substringAfter('|', "").takeIf { it.isNotBlank() }
-        return year == null || otherYear == null || otherYear == year
+        if (!(year == null || otherYear == null || otherYear == year)) return false
+        if (type == null) return true
+        val otherType = m.category?.takeIf { it.isNotBlank() } ?: return true
+        return typeFingerprint(otherType) == type
     }
 
     /** [Media.key] 尾上那四位年份；这一条没带年份就是 null。 */

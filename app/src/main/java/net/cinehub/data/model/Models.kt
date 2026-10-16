@@ -87,6 +87,57 @@ fun titleSearchVariants(title: String): List<String> {
 
 private val SEASON_CN = Regex("第([零一二三四五六七八九十百两0-9]+)([季部])")
 
+/**
+ * 内容类型归一：把各源五花八门的写法折成同一档，用来判「同名同年的是不是同一部片」。
+ *
+ * 起因是实测到的一条真事：后端里「余红旧事」2026 有两条 —— 一条 `漫剧`（3 条 1080P 线路），
+ * 一条 `连续剧`（蓝光4K / 4K / 小艺）。只按「同名同年」归并会把两条合成一条，
+ * 用户看到的就是「官方源明明有 4K，影枢里只有 1080P」。
+ *
+ * **认不出来就返回 null（没有信号），不是返回原文**。这一条很重要，理由和年份那条一模一样：
+ * 拿原文去比，等于给每个源各发明一套档名，两个源对同一部片的写法稍有差别就会被拆成两行；
+ * 而返回 null 的语义是「这一边没说」，[net.cinehub.data.MediaRepository.sameWork] 按
+ * 「有一方没写就不分家」处理 —— 宁可少拦一次，也不能把本来对得上的片子拆开。
+ */
+fun typeFingerprint(raw: String?): String? {
+    val s = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    // 一个字段里可能塞好几个标签（「剧情,犯罪,短剧」「悬疑,犯罪,剧情,国产」）——
+    // 逐段去认，认出来的第一档就是它；整段再试一次是给「国产连续剧」这种连写留的。
+    val parts = s.split(',', '，', '/', '|', '、').map { it.trim() }.filter { it.isNotEmpty() }
+    for (p in parts) {
+        matchAlias(p)?.let { return it }
+    }
+    return matchAlias(s)
+}
+
+/**
+ * 一段文字能不能认成某一档。
+ *
+ * 只认**别名表里的完整词**，别名一律两个汉字以上 —— 不成文的单字（如「剧」）绝不能进来：
+ * 「漫剧」含「剧」，那样它会被折成连续剧，而这一项正是要拦的那个。
+ */
+private fun matchAlias(text: String): String? =
+    TYPE_ALIASES.entries.firstOrNull { (_, aliases) -> aliases.any { text.contains(it) } }?.key
+
+/**
+ * 别名表：键是归一后的档名，值是各源见过的写法。
+ *
+ * 两条规矩：
+ * 1. 别名一律是**两个汉字以上**的词。单字（如「剧」）放进来会子串误命中 ——
+ *    「漫剧」含「剧」，于是它会被折成连续剧，而这一项正是要拦的那个。
+ *    同理「动画片」含「动画」，所以更具体的写法要排在前面。
+ * 2. 顺序有意义：先匹配到的先算。
+ */
+private val TYPE_ALIASES: Map<String, List<String>> = linkedMapOf(
+    "漫剧" to listOf("漫剧", "动漫", "番剧", "国漫", "日漫", "动画"),
+    "短剧" to listOf("短剧", "微短剧", "竖屏"),
+    "连续剧" to listOf("连续剧", "电视剧", "国产剧", "美剧", "韩剧", "日剧", "港剧", "泰剧", "剧集"),
+    "电影" to listOf("电影", "院线", "剧情片", "动作片", "喜剧片"),
+    "综艺" to listOf("综艺", "真人秀", "脱口秀"),
+    "纪录片" to listOf("纪录片", "纪录"),
+    "体育" to listOf("体育", "赛事"),
+)
+
 /** 一…九十九的中文数字；认不出来返回 null，交回原文。 */
 private fun cnNumber(s: String): Int? {
     val d = mapOf('零' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4,

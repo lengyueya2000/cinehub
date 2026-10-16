@@ -211,10 +211,23 @@ internal object MinoSign {
         return out.toString()
     }
 
-    /** 解 base64；urlSafe=true 认 `-`/`_` 字母表。填充可缺省（JWT 的 payload 段就没有填充）。 */
-    fun decodeBase64(text: String, urlSafe: Boolean = false): ByteArray? {
-        val table = if (urlSafe) B64URL else B64STD
+    /**
+     * 解 base64：**自动认两种字母表**。
+     *
+     * 站点这一型票证的 payload 段不是严格的 JWT base64url —— 实测同一部片的几条线路里，
+     * 有的段含 `+` / `/`（标准字母表）。只认一种就会把含 `+` 的票判成「格式不认识」，
+     * 而内容本身完全正常：表现就是同一部片里三条线路两条能播、一条必坏。
+     *
+     * 所以按字符判断走哪张表：出现 `-`/`_` 当 url-safe，出现 `+`/`/` 当标准，
+     * 都不出现时两者等价。填充可缺省（JWT 的 payload 段就没有填充）。
+     */
+    fun decodeBase64(text: String): ByteArray? {
         val clean = text.trim().filterNot { it == '\n' || it == '\r' }
+        val urlSafe = clean.any { it == '-' || it == '_' }
+        return decodeWithTable(clean, if (urlSafe) B64URL else B64STD)
+    }
+
+    private fun decodeWithTable(clean: String, table: String): ByteArray? {
         if (clean.any { it != '=' && table.indexOf(it) < 0 }) return null
         var acc = 0
         var bits = 0

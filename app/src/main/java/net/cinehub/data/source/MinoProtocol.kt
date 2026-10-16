@@ -90,7 +90,8 @@ internal object MinoProtocol {
     fun ticketPayload(jwt: String): JsonObject? {
         val seg = jwt.substringBeforeLast('.', "")
         if (seg.isEmpty() || seg == jwt) return null
-        val raw = MinoSign.decodeBase64(seg, urlSafe = true) ?: return null
+        // 自动认字母表：这一段可能是标准 base64（含 + /），不是严格的 base64url
+        val raw = MinoSign.decodeBase64(seg) ?: return null
         return String(raw, Charsets.UTF_8).jsonRootOrNull()
     }
 }
