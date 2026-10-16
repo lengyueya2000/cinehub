@@ -113,29 +113,105 @@ object Http {
      * Accept-Language 没有放在这里：接口型源（懂片帝AI 那种）一直是「UA + 自己那几个头」的形态，
      * 一个站能用、另一个站不能用的差别往往就在头集合上，不顺手改已经跑通的那几路。
      */
-    private fun builder(url: String, referer: String?, headers: Map<String, String>): Request.Builder =
-        Request.Builder()
+    private fun builder(url: String, referer: String?, headers: Map<String, String>): Request.Builder {
+        val provided = headers["Cookie"]
+        val merged = mergeCookies(url, provided)
+        return Request.Builder()
             .url(url)
             .header("User-Agent", UA)
             .apply { referer?.let { header("Referer", it) } }
-            .apply { headers.forEach { (k, v) -> header(k, v) } }
+            .apply { headers.forEach { (k, v) -> if (k != "Cookie") header(k, v) } }
+            .apply { merged?.let { header("Cookie", it) } }
+    }
+
+    /**
+     * 这个站攒下的会话 cookie，和调用方自己带的那份并在一起（同名以调用方填的凭证为准）。
+     *
+     * 按 host 取，绝不把 A 站的 cookie 带进 B 站 —— 站点下发的会话和用户填的凭证都是凭证。
+     */
+    private fun mergeCookies(url: String, provided: String?): String? {
+        val saved = hostOf(url)?.let { jar[it] }?.toMap().orEmpty()
+        if (saved.isEmpty()) return provided
+        if (provided.isNullOrBlank()) return saved.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val have = provided.split(';').map { it.substringBefore('=').trim() }.toSet()
+        val extra = saved.filterKeys { it !in have }.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        return if (extra.isEmpty()) provided else "$provided; $extra"
+    }
+
+    /**
+     * 按 host 记的会话 cookie。
+     *
+     * 只活在进程里、不落盘：这些站的下发 cookie 有效期就几个小时（实测高清点播那道题给的写的是
+     * 2 小时），存到盘上既没用又留下一个能被人读走的东西。
+     */
+    private val jar = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, String>>()
+
+    private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host }.getOrNull()
+
+    /** 收下这一条响应下发的 cookie。 */
+    private fun remember(url: String, r: Response) {
+        val host = hostOf(url) ?: return
+        val pairs = r.headers("Set-Cookie").mapNotNull { raw ->
+            val kv = raw.substringBefore(';').trim()
+            val i = kv.indexOf('=')
+            if (i <= 0) null else kv.substring(0, i) to kv.substring(i + 1)
+        }
+        if (pairs.isEmpty()) return
+        jar.getOrPut(host) { java.util.concurrent.ConcurrentHashMap() }.let { m ->
+            pairs.forEach { (k, v) -> m[k] = v }
+        }
+    }
 
     /** 浏览器导航页面时会发的那组头里，站点真正会看的就是 Accept-Language 这一条。 */
     private const val ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
+
+    /** 一次页面请求：发出去、收下它下发的 cookie，正文和状态码一起带回，不抛。 */
+    private suspend fun fetchOnce(
+        url: String,
+        referer: String?,
+        headers: Map<String, String>,
+        timeoutSec: Long,
+        browserHeaders: Boolean,
+    ): ResponseBody = withContext(Dispatchers.IO) {
+        val request = builder(url, referer, headers)
+            .apply { if (browserHeaders) header("Accept-Language", ACCEPT_LANGUAGE) }
+            .build()
+        client.newBuilder().withBudget(timeoutSec).build()
+            .newCall(request).await().use { r ->
+                val body = r.bodyText()
+                remember(url, r)
+                ResponseBody(body = body, status = r.code, setCookie = setCookieOf(r))
+            }
+    }
+
+    /**
+     * 取一页。撞上「滑动验证」那道题时，照站点自己那条路答一次，答完立刻重发这一页。
+     *
+     * 只答一次：那道题的解锁活不了多久，而反复交卷正是把限流踩深的东西（实测连着打会改回 429）。
+     * 答过了还是不通，原样把那张题页带回 —— 上层照旧会说「对方要求浏览器验证」。
+     */
+    private suspend fun page(
+        url: String,
+        referer: String?,
+        headers: Map<String, String>,
+        timeoutSec: Long,
+        browserHeaders: Boolean,
+    ): ResponseBody {
+        val first = fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
+        if (!SlideChallenge.isSlideGate(first.status, first.body)) return first
+        if (!SlideChallenge.solve(url, first.body)) return first
+        return fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
+    }
 
     suspend fun get(
         url: String,
         referer: String? = null,
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
-    ): String = withContext(Dispatchers.IO) {
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(builder(url, referer, headers).header("Accept-Language", ACCEPT_LANGUAGE).build())
-            .await().use { r ->
-                val body = r.bodyText()
-                if (!r.isSuccessful) error(failureReason(r.code, body))
-                body.ifBlank { error("空响应") }
-            }
+    ): String {
+        val r = page(url, referer, headers, timeoutSec, browserHeaders = true)
+        if (r.status !in 200..299) error(failureReason(r.status, r.body))
+        return r.body.ifBlank { error("空响应") }
     }
 
     /**
@@ -149,16 +225,10 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         referer: String? = null,
         timeoutSec: Long = 20,
-    ): ResponseBody = withContext(Dispatchers.IO) {
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(builder(url, referer, headers).build()).await().use { r ->
-                val body = r.bodyText()
-                if (!r.isSuccessful) error(failureReason(r.code, body))
-                ResponseBody(
-                    body = body.ifBlank { error("空响应") },
-                    setCookie = setCookieOf(r),
-                )
-            }
+    ): ResponseBody {
+        val r = page(url, referer, headers, timeoutSec, browserHeaders = false)
+        if (r.status !in 200..299) error(failureReason(r.status, r.body))
+        return r.copy(body = r.body.ifBlank { error("空响应") })
     }
 
     /**
@@ -175,13 +245,7 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         referer: String? = null,
         timeoutSec: Long = 20,
-    ): ResponseBody = withContext(Dispatchers.IO) {
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(builder(url, referer, headers).header("Accept-Language", ACCEPT_LANGUAGE).build())
-            .await().use { r ->
-                ResponseBody(body = r.bodyText(), status = r.code, setCookie = setCookieOf(r))
-            }
-    }
+    ): ResponseBody = page(url, referer, headers, timeoutSec, browserHeaders = true)
 
     /** POST 一份表单；状态码与 Set-Cookie 一起带回（解析站那类接口收的是表单而不是 JSON）。 */
     suspend fun postForm(
@@ -229,35 +293,53 @@ object Http {
         val setCookie: String? = null,
     )
 
-    /** 探测连通性并返回延迟；失败抛出异常。 */
-    suspend fun probe(url: String, referer: String? = null): Long = withContext(Dispatchers.IO) {
-        val t0 = System.currentTimeMillis()
-        val b = Request.Builder()
-            .url(url)
-            .header("User-Agent", UA)
-            .header("Accept-Language", "zh-CN,zh;q=0.9")
-            // 探测的语义就是「像浏览器一样把这个站打开一次」，所以这里补齐浏览器导航时会发的头。
-            // 只加在这一处：各源真正取数据的请求仍按站点传头（见本文件顶部的约定）。
-            // 少了 `Accept` 这一条，个别站在内容协商上直接回 500 —— 浏览器打得开、我们判死，
-            // 而 500 会被读成「这个源不行」，那是假话（实测：hqvod 根路径）。
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            .header("Upgrade-Insecure-Requests", "1")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "none")
-            .header("Sec-Fetch-User", "?1")
-        referer?.let { b.header("Referer", it) }
-        client.newBuilder()
-            .readTimeout(8, TimeUnit.SECONDS)
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .callTimeout(24, TimeUnit.SECONDS)
-            .build()
-            .newCall(b.build()).await().use { r: Response ->
-                // 「测试连接」这句结论要能自证 —— 拒答页正文里写着真正的原因，
-                // 不读它就只能猜。成功路径不读整页，白省一次下行。
-                if (!r.isSuccessful) error(failureReason(r.code, errorSnippet(r)))
-                System.currentTimeMillis() - t0
-            }
+    /** 探一次连通性：成功带回耗时，失败带回状态码和那张错误页的正文片段。 */
+    private suspend fun probeOnce(url: String, referer: String?): Triple<Long?, Int, String> =
+        withContext(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            val b = builder(url, referer, emptyMap())
+                .header("Accept-Language", "zh-CN,zh;q=0.9")
+                // 探测的语义就是「像浏览器一样把这个站打开一次」，所以这里补齐浏览器导航时会发的头。
+                // 只加在这一处：各源真正取数据的请求仍按站点传头（见本文件顶部的约定）。
+                // 少了 `Accept` 这一条，个别站在内容协商上直接回 500 —— 浏览器打得开、我们判死，
+                // 而 500 会被读成「这个源不行」，那是假话（实测：hqvod 根路径）。
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "none")
+                .header("Sec-Fetch-User", "?1")
+            referer?.let { b.header("Referer", it) }
+            client.newBuilder()
+                .readTimeout(8, TimeUnit.SECONDS)
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .callTimeout(24, TimeUnit.SECONDS)
+                .build()
+                .newCall(b.build()).await().use { r: Response ->
+                    remember(url, r)
+                    when {
+                        r.isSuccessful -> Triple(System.currentTimeMillis() - t0, r.code, "")
+                        else -> Triple(null, r.code, errorSnippet(r))
+                    }
+                }
+        }
+
+    /**
+     * 探测连通性并返回延迟；失败抛出异常。
+     *
+     * 撞上那道滑块时先答一次再量：答得过去却报「这个源不可用」是假话，而这一栏的结论
+     * 会决定它在源列表里排哪儿、要不要被自动换源跳过。
+     */
+    suspend fun probe(url: String, referer: String? = null): Long {
+        val (ms, status, snippet) = probeOnce(url, referer)
+        if (ms != null) return ms
+        if (SlideChallenge.isSlideGate(status, snippet) && SlideChallenge.solve(url, snippet)) {
+            val retry = probeOnce(url, referer)
+            val again = retry.first
+            if (again != null) return again
+            return error(failureReason(retry.second, retry.third))
+        }
+        return error(failureReason(status, snippet))
     }
 
     /**
@@ -282,8 +364,11 @@ object Http {
                 // 而播放器里那个入口开的又是「正在播的那个源」自己的页面（PlayerScreen 用 playing.sitePageUrl）。
                 // 偏偏这一类的源因为探不进来，根本存不进列表、也就永远成不了正在播的那个源 ——
                 // 于是这句话只在它唯一不适用的场合被说出来。指引要等那条路真能走通再放回来说。
-                "对方要求浏览器验证（这类站在访问前摆了一道反爬的题，只有真的浏览器答得上来）—— " +
-                    "这个源接不进搜索和首页，影枢也不去替程序答那道题。换一个源"
+                //
+                // 「滑块」那一类影枢现在会自己答一次（见 SlideChallenge），答过了就不会走到这句；
+                // 走到这句的是答不了的（雷池、Cloudflare 那种要真浏览器指纹的），所以说「接不进来」。
+                "对方要求浏览器验证（这类站在访问前摆了一道反爬的题）—— 影枢照它自己那条路答过一次还是没过，" +
+                    "这个源接不进搜索和首页。换一个源"
 
             body.hasMarker(regionMarkers) ->
                 "拒绝来自访问地区 —— 换一条线路，或者换一个源"
@@ -341,8 +426,8 @@ object Http {
 
     /** 解析站点 baseUrl 是否可用，返回最终生效的 baseUrl（可能被重定向）。 */
     suspend fun resolveBase(base: String): String = withContext(Dispatchers.IO) {
-        val b = Request.Builder().url(base).header("User-Agent", UA)
-        client.newCall(b.build()).await().use { r ->
+        client.newCall(builder(base, null, emptyMap()).build()).await().use { r ->
+            remember(base, r)
             if (!r.isSuccessful) error(failureReason(r.code, errorSnippet(r)))
             r.request.url.toString().trimEnd('/')
         }
