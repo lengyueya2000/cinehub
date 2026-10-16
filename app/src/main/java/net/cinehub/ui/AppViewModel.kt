@@ -91,6 +91,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val speedChoices: List<Float> get() = playbackRepo.speedChoices
     fun setPlaybackSpeed(value: Float) = playbackRepo.setSpeed(value)
 
+    // ---------- 小窗播放 ----------
+
+    /**
+     * 播放器这一屏每半秒报一次的「此刻视频的宽高比」，`null` 表示不进小窗 ——
+     * 画面还没解出来，或者播放器那一屏早就不挂着了。
+     *
+     * 为什么在 VM 里递这一句：进小窗只能由 Activity 发起（只有它收得到「用户按了 Home」），
+     * 而「放得开与否、什么形状」只有播放器那一屏知道。
+     */
+    private val _pipRatio = MutableStateFlow<Float?>(null)
+    val pipRatio: StateFlow<Float?> = _pipRatio.asStateFlow()
+    fun publishPipRatio(ratio: Float?) { _pipRatio.value = ratio }
+
+    /** 此刻在小窗里吗：Activity 写，界面读它把控件、浮层、告知横幅全收掉。 */
+    private val _inPip = MutableStateFlow(false)
+    val inPip: StateFlow<Boolean> = _inPip.asStateFlow()
+    fun setInPip(on: Boolean) { _inPip.value = on }
+
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
     val watchHistory: StateFlow<List<HistoryEntry>> = watchRepo.history

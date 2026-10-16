@@ -153,6 +153,8 @@ fun PlayerScreen(
     val resumeFrom by vm.resumePosition.collectAsState()
     val resolving by vm.resolving.collectAsState()
     val fallback by vm.fallback.collectAsState()
+    /** 此刻在小窗里吗 —— 由 Activity 写进来，界面读它决定控件摆不摆。 */
+    val inPip by vm.inPip.collectAsState()
 
     var pos by remember { mutableLongStateOf(resumeFrom) }
     var dur by remember { mutableLongStateOf(0L) }
@@ -404,6 +406,9 @@ fun PlayerScreen(
                 playingHeight = 0
             }
             if (sel > 0 && sel != playingHeight) playingHeight = sel
+            // 顺手报一句「现在能按什么形状进小窗」：画面还没解出来就是 null，
+            // 那时候按 Home 就还是普通退出 —— 小窗是给已经在放的东西留的。
+            vm.publishPipRatio(playerDisplayRatio(player))
             delay(500)
         }
     }
@@ -467,18 +472,26 @@ fun PlayerScreen(
      * 影枢没有前台服务，也不发播放通知 —— 放任它在后台放着，用户既找不到入口也关不掉，
      * 只剩一个还在响的手机；而那条 500ms 的位置轮询会一路把同一个位置反复写进观看记录。
      * 回来时不自动续：没有通知、没有锁屏控件的情况下「自己又放起来了」比「要再点一下」更让人慌。
+     *
+     * 唯一的例外是小窗：上面那三条抱怨的「看不见、关不掉」，那颗悬浮窗本身就把入口和
+     * 关得掉都给了，所以它里面不许停。
      */
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && player.playWhenReady) player.pause()
+            if (event == Lifecycle.Event.ON_STOP && player.playWhenReady && !vm.inPip.value) player.pause()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     DisposableEffect(Unit) {
-        onDispose { player.release() }
+        onDispose {
+            // 小窗的发起权在 Activity，它只认这一份报来的比例；这一屏卸了就必须说「不进小窗」，
+            // 否则在首页按 Home 也会缩出一颗放着上一部片的小窗。
+            vm.publishPipRatio(null)
+            player.release()
+        }
     }
 
     val insetsController = remember(activity) {
@@ -514,6 +527,29 @@ fun PlayerScreen(
             insetsController?.show(WindowInsetsCompat.Type.systemBars())
             activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             activity?.let { restoreSystemBrightness(it) }
+        }
+    }
+
+    /**
+     * 小窗里只留画面。
+     *
+     * 不是一块一块去收：全屏那份开关本来就把顶栏、右侧竖排切源和下方选集抽屉全关掉了，
+     * 借它一次就够，出小窗再把用户刚才那一档原样还回去。
+     * 控件、浮层和手势反馈另收 —— 那颗小窗只收得到系统的拖动和关闭，
+     * 在里面摆一颗点不动的「重试」比什么都不摆更骗人。
+     */
+    var fullscreenBeforePip by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(inPip) {
+        if (inPip) {
+            if (fullscreenBeforePip == null) fullscreenBeforePip = fullscreen
+            fullscreen = true
+            controls = false
+            panel = null
+            hint = null
+        } else {
+            fullscreenBeforePip?.let { fullscreen = it; fullscreenBeforePip = null }
+            controls = true
+            lastUi = System.currentTimeMillis()
         }
     }
 
@@ -722,7 +758,9 @@ fun PlayerScreen(
             // 不跟着 controls 一起收：源是被系统换掉的，不是用户自己点的，控件那 3.5 秒
             // 一过就没了等于悄悄换了个源。各态各自的活法见上面那份倒数 ——
             // 「正在试」和「都放不出来」常驻到它有下文，「换过 N 次才播起来」留 10 秒。
-            fallback?.let { fb ->
+            // 小窗里没有这一句的位置：那颗只装画面，字挤进去谁也读不了，
+            // 回到应用再点一下控件，源名就在顶栏那一行。
+            if (!inPip) fallback?.let { fb ->
                 val last = fb.failures.lastOrNull()
                 Column(
                     Modifier
@@ -803,8 +841,13 @@ fun PlayerScreen(
                 }
             }
 
-            // 直链拿不到时给出明确原因，而不是留一个黑屏
-            if (playing?.streamUrl == null) {
+            // 小窗里这一整串（拿不到直链 / 播放失败 / 已暂停那颗 / 缓冲中）都不摆：
+            // 那颗窗只收得到系统的拖动和关闭，摆一颗点不动的「重试」比留黑屏更骗人。
+            // 回应用里操作时控件照旧，那句报错就在那儿等着。
+            if (inPip) {
+                // 什么都不摆，画面占满那颗窗
+            } else if (playing?.streamUrl == null) {
+                // 直链拿不到时给出明确原因，而不是留一个黑屏
                 Column(
                     Modifier
                         .align(Alignment.Center)
@@ -949,7 +992,8 @@ fun PlayerScreen(
                 )
             }
 
-            // 手势反馈
+            // 手势反馈 —— 只能由手势写，而那颗窗收不到手势（见上面进小窗时先清掉那一句），
+            // 所以这里不再问一遍在不在小窗里
             hint?.let {
                 Text(
                     it,
@@ -1747,6 +1791,20 @@ private fun fmt(sec: Long): String {
 
 private fun fmtSpeed(s: Float): String =
     if (s % 1f == 0f) "%.1f".format(s) else "%.2f".format(s).trimEnd('0')
+
+/**
+ * 画面现在的宽高比，交给小窗决定那颗的形状；还没解出画面就是 null。
+ *
+ * `unappliedRotationDegrees` 是播放器还没替界面转掉的那一份 —— 小窗的形状要按转完之后的算，
+ * 不然竖着拍的片子会拿到一颗横的窗。折错的代价只是那颗窗的形状
+ * （画面本身由 PlayerView 的 FIT 管着），不改播放。
+ */
+private fun playerDisplayRatio(player: Player): Float? {
+    val s = player.videoSize
+    if (s.width <= 0 || s.height <= 0) return null
+    val wide = s.width * s.pixelWidthHeightRatio / s.height
+    return if (s.unappliedRotationDegrees % 180 != 0) 1f / wide else wide
+}
 
 /**
  * 起播宽限：地址拿到之后，这么久还渲染不出第一帧就当一个源放不出来，交给自动换源。
