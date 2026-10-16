@@ -38,6 +38,25 @@ data class SourceConfig(
      * 于是影枢打开这个页面，在旁边接住页面已经请求出来的那条流 —— 换流是源站自己的播放器做的。
      */
     val playPath: String? = null,
+    /**
+     * 这个源的取数要不要走浏览器内核（[net.cinehub.data.net.BrowserEngine]）。
+     *
+     * 给的是「站点在前面挂了一道要执行它的脚本才答得出的题」那种源（Cloudflare 的
+     * managed challenge 是典型）：纯 HTTP 客户端无论把请求头拼得多像浏览器都拿不到正文，
+     * 差的不是头，是有没有真的跑对方那段脚本。标上这一项，这个源的取数就改由一颗后台
+     * WebView 同源问出去，题由引擎自己答。
+     *
+     * 只对 JSON 接口型源生效（[net.cinehub.data.source.MaccmsAdapter] 认它）：
+     * 网页解析那类源要的是 DOM，不是这份正文，换过去得另搭一层。
+     *
+     * 两件事要说在前面：这一条路上 [authToken] **发不出去** —— 浏览器不许脚本给 fetch 设
+     * Cookie / Authorization 头，所以「要凭证」和「要过浏览器题」是两套东西，别同时填；
+     * 而这一格目前只有内置源用得上，「添加播放源」那张表单里没有它 ——
+     * 一个过不了题的站，用户自己加进来就是列表里一行永远的红字。
+     *
+     * 代价是这一源的取数慢 —— 第一次过题十几秒，而且全应用排队走一颗引擎。
+     */
+    val needsBrowser: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
 ) {
     /**
@@ -103,6 +122,13 @@ data class HtmlRules(
     val episodeSelector: String = "a.episode-link",
     val episodeNameAttr: String = "text",
     val episodeUrlAttr: String = "href",
+    /**
+     * 名字正好等于其中某一项的线路，排到最后。
+     *
+     * 站点把哪条排在第一是替它自己的播放器挑的，影枢不一定放得出来那一条 —— 这一格就是留给
+     * 这种情况的：把它挪到最后，默认落点就是真的能播的那条，而不是每次都要先失败一次。
+     */
+    val lineLast: List<String> = emptyList(),
     /**
      * 直链获取方式。
      *

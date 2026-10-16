@@ -427,7 +427,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     SourceAdapters.forget(cfg.id)
                 }
                 // 根路径只用来报延迟。它失败不再是「这个源不行」，只是「这一项没量到」。
-                val ms = runCatching { net.cinehub.data.net.Http.probe(cfg.baseUrl) }.getOrNull()
+                val ms = runCatching {
+                    net.cinehub.data.net.Http.probe(cfg.baseUrl, viaBrowser = cfg.needsBrowser)
+                }.getOrNull()
                 val latency = if (ms != null) " · 平均延迟 ${ms}ms" else " · 根路径没答话（不影响取内容）"
                 // 「识别到 0 个资源」不是成功。一个资源都没给，存进来就是个占位的死源。
                 if (n == 0) "接口连上了，但列表里一个资源都没给 —— 先搜一次再决定存不存"

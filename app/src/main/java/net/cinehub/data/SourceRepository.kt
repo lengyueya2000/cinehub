@@ -180,11 +180,22 @@ object Seed {
             html = net.cinehub.data.source.DefaultRules.hq,
         ),
         SourceConfig(
+            id = "freeokk",
+            name = "FreeOK",
+            // 站点页自己写着「官方域名 www.freeokk.pro · 最新域名 www.freeokk.lol」，两个域都在
+            // 同一道 Cloudflare 题后面；接的是后者，因为接口实测在这一个上给得出内容。
+            baseUrl = "https://www.freeokk.lol",
+            kind = net.cinehub.data.model.SourceKind.JsonApi,
+            priority = 5,
+            tags = listOf("片库九万", "第一次要过浏览器验证"),
+            needsBrowser = true,
+        ),
+        SourceConfig(
             id = "demo_m3u",
             name = "演示源",
             baseUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
             kind = net.cinehub.data.model.SourceKind.M3u,
-            priority = 5,
+            priority = 6,
             tags = listOf("公开测试流", "可验证播放"),
         ),
     )

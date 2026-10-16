@@ -60,7 +60,7 @@ class MediaRepository(private val sources: SourceRepository) {
 
     private suspend fun check(cfg: SourceConfig): HealthReport = withContext(Dispatchers.IO) {
         runCatching {
-            val ms = Http.probe(cfg.baseUrl, referer = null)
+            val ms = Http.probe(cfg.baseUrl, referer = null, viaBrowser = cfg.needsBrowser)
             val health = when {
                 ms < 800 -> Health.Ok
                 else -> Health.Slow
@@ -210,9 +210,18 @@ class MediaRepository(private val sources: SourceRepository) {
         val active = sources.active()
         val per = active.map { cfg ->
             async {
+                val t0 = System.currentTimeMillis()
                 // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
-                val health = healthCache[cfg.id]?.health ?: Health.Unknown
                 val (hits, err) = findInSource(cfg, media.title, want, year)
+                // 真取回了内容，就是比探根路径更硬的证据 —— 和 [searchOnIo] 同一件事，
+                // 这里原先没做：于是播放器里「查一次」刚把 FreeOK 列进可换的源，
+                // 退回详情页那一栏它却写着「不可用」，同一部片、隔一秒、两句话。
+                if (hits.isNotEmpty()) {
+                    val cost = System.currentTimeMillis() - t0
+                    healthCache[cfg.id] = HealthReport(if (cost < 800) Health.Ok else Health.Slow, cost)
+                    healthAt[cfg.id] = System.currentTimeMillis()
+                }
+                val health = healthCache[cfg.id]?.health ?: Health.Unknown
                 Triple(
                     cfg,
                     hits.map {

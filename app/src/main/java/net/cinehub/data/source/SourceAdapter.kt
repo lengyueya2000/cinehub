@@ -64,7 +64,8 @@ object SourceAdapters {
 
     private fun connectionKey(cfg: SourceConfig) = listOf(
         cfg.baseUrl, cfg.kind.name, cfg.authToken.orEmpty(), cfg.authMode.name,
-        cfg.playPath.orEmpty(), cfg.html?.toString().orEmpty(), cfg.api?.toString().orEmpty(),
+        cfg.playPath.orEmpty(), cfg.needsBrowser.toString(),
+        cfg.html?.toString().orEmpty(), cfg.api?.toString().orEmpty(),
     ).joinToString("\n")
 
     private fun newOf(cfg: SourceConfig): SourceAdapter = when (cfg.kind) {

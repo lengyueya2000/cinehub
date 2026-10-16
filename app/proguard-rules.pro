@@ -47,3 +47,16 @@
 # 与其数着类名写，不如直接给所有 @Serializable 兜住 —— 以后新加一份快照不会再漏。
 -if @kotlinx.serialization.Serializable class **
 -keep class <1> { *; }
+
+# ---------------------------------------------------------------------------
+# JS 桥
+#
+# 挂了浏览器验证那道题的源，取数要靠一颗后台 WebView 把 fetch 的结果交回来
+# （BrowserEngine）。@JavascriptInterface 是对方靠**方法名**反射调进来的，
+# R8 full mode 看不到任何 Kotlin 侧的调用点，会把整条桥当死代码删掉 ——
+# 表现是 debug 包一切正常、release 包那个源永远「取不回来」。
+# 这条规则默认不在 proguard-android-optimize.txt 里，得自己写。
+# ---------------------------------------------------------------------------
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}

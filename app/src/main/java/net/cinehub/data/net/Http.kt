@@ -189,6 +189,10 @@ object Http {
      *
      * 只答一次：那道题的解锁活不了多久，而反复交卷正是把限流踩深的东西（实测连着打会改回 429）。
      * 答过了还是不通，原样把那张题页带回 —— 上层照旧会说「对方要求浏览器验证」。
+     *
+     * [viaBrowser] 是另一件事：这一源的题不在滑块那一类，而是**要执行脚本才答得出**的
+     * （Cloudflare managed challenge）。那种题 OkHttp 答不了，所以整条请求换给
+     * [BrowserEngine] —— 滑块那套重试对它是空转，直接跳过。
      */
     private suspend fun page(
         url: String,
@@ -196,7 +200,9 @@ object Http {
         headers: Map<String, String>,
         timeoutSec: Long,
         browserHeaders: Boolean,
+        viaBrowser: Boolean = false,
     ): ResponseBody {
+        if (viaBrowser) return BrowserEngine.get(url, timeoutSec)
         val first = fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
         if (!SlideChallenge.isSlideGate(first.status, first.body)) return first
         if (!SlideChallenge.solve(url, first.body)) return first
@@ -208,8 +214,9 @@ object Http {
         referer: String? = null,
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
+        viaBrowser: Boolean = false,
     ): String {
-        val r = page(url, referer, headers, timeoutSec, browserHeaders = true)
+        val r = page(url, referer, headers, timeoutSec, browserHeaders = true, viaBrowser = viaBrowser)
         if (r.status !in 200..299) error(failureReason(r.status, r.body))
         return r.body.ifBlank { error("空响应") }
     }
@@ -329,8 +336,12 @@ object Http {
      *
      * 撞上那道滑块时先答一次再量：答得过去却报「这个源不可用」是假话，而这一栏的结论
      * 会决定它在源列表里排哪儿、要不要被自动换源跳过。
+     *
+     * [viaBrowser] 的源改由浏览器内核量：拿 OkHttp 去量一个挂了 Cloudflare 的站，
+     * 得到的是「对方要求浏览器验证」，而这一栏要报的是**这个源现在到底通不通**。
      */
-    suspend fun probe(url: String, referer: String? = null): Long {
+    suspend fun probe(url: String, referer: String? = null, viaBrowser: Boolean = false): Long {
+        if (viaBrowser) return BrowserEngine.probe(url)
         val (ms, status, snippet) = probeOnce(url, referer)
         if (ms != null) return ms
         if (SlideChallenge.isSlideGate(status, snippet) && SlideChallenge.solve(url, snippet)) {

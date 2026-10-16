@@ -19,6 +19,13 @@ import okhttp3.Response
  */
 class CineHubApplication : Application(), ImageLoaderFactory {
 
+    override fun onCreate() {
+        super.onCreate()
+        // 挂了浏览器验证那道题的源要靠一颗后台 WebView 取数，而那颗 WebView 只能在
+        // 主线程、拿一个活得比任何一屏都久的 Context 造 —— 挂在这里，第一次用到再建。
+        net.cinehub.data.net.BrowserEngine.init(this)
+    }
+
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
         .okHttpClient {
             // 裸客户端的读超时是 10 秒。实测 4kku 的封面挂在 img.lzipic.com 上，

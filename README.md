@@ -118,6 +118,7 @@ app/src/main/java/net/cinehub/
 │  │  ├─ Watch.kt               Favorite / HistoryEntry（含「看不看完」的判据）
 │  │  └─ Douban.kt              DoubanItem + 手写的榜单表（DoubanChart）
 │  ├─ net/Http.kt               共用 OkHttp 客户端、UA、鉴权头、失败原因中文化
+│  ├─ net/BrowserEngine.kt      挂了浏览器验证那道题的源：后台 WebView 同源取数
 │  └─ source/
 │     ├─ SourceAdapter.kt       适配器接口 + 工厂
 │     ├─ M3uAdapter.kt          m3u / m3u8 播放列表
@@ -162,7 +163,8 @@ app/src/main/java/net/cinehub/
 | 2 | 4kku | `https://www.4kku.com` | 网页解析 | 苹果 CMS 的地址规则配 Tailwind 皮：三条线路，分集锚点不带线路标记，按播放地址尾段拆 |
 | 3 | 懂片帝AI | `https://dongpiandi.ai` | 签名接口 | 用户提供。带签名鉴权的前端应用：照它的协议取数据，不按 CSS 选择器抓 |
 | 4 | 高清点播 | `https://www.hqvod.com` | 网页解析 | 片库最全的一条，13 条线路。静态页里没有地址：那串凭据要拿去问它自己的解析站（见下文第 3 节） |
-| 5 | 演示源 | `https://test-streams.mux.dev/.../x36xhzz.m3u8` | M3U 列表 | 公开测试流，用来验证「本机解码」这条链路真的通 |
+| 5 | FreeOK | `https://www.freeokk.lol` | JSON 接口 | 实测 `total: 90107`、六条线路。整站在 Cloudflare 那道要执行脚本的题后面，取数走后台的浏览器内核（见下文第 3 节末尾） |
+| 6 | 演示源 | `https://test-streams.mux.dev/.../x36xhzz.m3u8` | M3U 列表 | 公开测试流，用来验证「本机解码」这条链路真的通 |
 
 曾经内置过的 `4kvm.net` 与 `xiguazx.cc` 已撤下（见 `Seed.retiredIds`：老用户列表里的那两条会按 id 清掉，你自己手动加的源不受影响）。撤下的原因分别是：前者对匿名用户根本不给直链、后者接口里根本没有直链（见下文两节）。
 
@@ -239,6 +241,12 @@ const val MODE_SESSION = "session"             // 只对登录用户开放，要
 自动重试不因此提前换源 —— 429 是这个源对**这一次**的回答，同源的下一条线路往往就给得出，所以规则是「先把这一个源的线路走完，再换下一个源」；只有写在规则上的那几种（地址要站点脚本现算 / 要凭证 / 没配解析规则）才直接跳源，因为那种换线路不会有第二个答案。
 
 `Http.failureReason()` 同样把状态码翻成人话：`567 → 安全策略拦截`、`403 → 拒绝访问`、`404 → 地址不存在`、`429 → 请求过于频繁`、`5xx → 站点异常 N`。源卡片上的红色标签因此是有信息量的，不是一句「连接失败」了事。
+
+内置的 **FreeOK**（`www.freeokk.lol`）是第三种墙，和前两种都不一样：题不在站点自己身上，而在它前面那道 CDN 反爬服务里。Cloudflare 的 managed challenge 对纯 HTTP 客户端一律回 403 `Just a moment...` —— 每一个路径都是，把请求头拼得再像浏览器也是。**差的不是头，是有没有真的执行它那段题脚本。** 这一类不靠伪造过：抄来的 `cf_clearance` 绑的就是答题那台浏览器的 UA + 出口 IP + TLS 指纹，换一次网络就废。所以 `BrowserEngine` 走的是让引擎自己答：一颗**后台 WebView** 先把这一源打开一次，题由 Chromium 自己做完，`cf_clearance` 落在它自己的 cookie 里（和「站点页取链」共用同一份 `CookieManager`，落盘、跨启动有效），之后每一趟取数就是**同源** `fetch()` 去问它本来就在问的那个接口 —— 不新增权限、不碰对方的验证逻辑，只是终于有了对方要求的那件事：一个真的浏览器。
+
+三条由这颗引擎的形状决定的约束写在那儿，别当它是免费的：只能问当前文档自己那个源（跨源被 CORS 掐掉，所以要先把文档挪过去）、全应用排队走一颗（并发打进去只会把题重做几遍）、第一次按十几秒算。所以只有源配置上 `needsBrowser = true` 的那一条走这条路，其余源照旧走 OkHttp 一点不变；而它目前只对 JSON 接口型源生效 —— 网页解析那类要的是渲染完的 DOM，不是这份正文，换过去得另搭一层。
+
+实测这一条走通了：release 包（R8 混淆过，JS 桥的 keep 规则见 `proguard-rules.pro`）在模拟器上「查一次」把 FreeOK 列进了可换的源、切过去之后 `ac=detail` 给出五条线路、播放器拿到了真流并出过画面；源健康栏量到 `553ms`（那是题已经答完、cookie 还在的那一次）。
 
 ### 4. 懂片帝AI 是带签名鉴权的前端应用
 

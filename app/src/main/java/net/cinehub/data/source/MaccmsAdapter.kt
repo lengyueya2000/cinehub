@@ -36,22 +36,29 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
     private fun JsonObject.str(field: String): String? =
         (this[field] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
 
-    override suspend fun browse(page: Int): List<Media> {
-        val url = "${abs(rules.listPath)}?ac=videolist&${rules.pageParam}=$page"
-        return parseList(Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config)))
-    }
+    /**
+     * 取一份接口正文。
+     *
+     * 三条取数一律走这里，就是为了 [SourceConfig.needsBrowser] 那一格只写一次：
+     * 挂在 Cloudflare 后面的站，搜索走通了、详情却还用 OkHttp 去问，界面上就会
+     * 出现「列表有片、点进去说这个源要求浏览器验证」。
+     */
+    private suspend fun fetch(url: String): String =
+        Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config), viaBrowser = config.needsBrowser)
+
+    override suspend fun browse(page: Int): List<Media> =
+        parseList(fetch("${abs(rules.listPath)}?ac=videolist&${rules.pageParam}=$page"))
 
     override suspend fun search(keyword: String, page: Int): List<Media> {
         val q = java.net.URLEncoder.encode(keyword, "UTF-8")
-        val url = "${abs(rules.listPath)}?ac=videolist&${rules.searchParam}=$q&${rules.pageParam}=$page"
-        return parseList(Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config)))
+        return parseList(fetch("${abs(rules.listPath)}?ac=videolist&${rules.searchParam}=$q&${rules.pageParam}=$page"))
     }
 
     override suspend fun detail(id: String): MediaDetail {
         // id 是从列表页/别的源手里接过来的字符串，原样拼进查询串就等于让它替我们决定
         // 这次请求长什么样（带一个 `&` 就能多出个参数）。填之前编一次。
         val url = abs(rules.detailPath.replace("{id}", java.net.URLEncoder.encode(id, "UTF-8")))
-        val root = json.parseToJsonElement(Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config))).jsonObject
+        val root = json.parseToJsonElement(fetch(url)).jsonObject
         val item = firstListItem(root) ?: error("详情接口无数据")
 
         val media = Media(
