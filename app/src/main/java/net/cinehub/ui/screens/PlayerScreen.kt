@@ -177,9 +177,18 @@ fun PlayerScreen(
     var panel by remember { mutableStateOf<Panel?>(null) }
     var speed by remember { mutableFloatStateOf(1f) }
     var lineIndex by remember { mutableIntStateOf(0) }
-    /** 0 = 交给 ExoPlayer 自适应；否则是选定的视频高度。 */
+    /** 0 = 不封顶，交给 ExoPlayer 自适应；否则是用户选的视频高度上限。 */
     var maxVideoHeight by remember { mutableIntStateOf(0) }
     var videoHeights by remember { mutableStateOf(listOf<Int>()) }
+    /**
+     * **此刻真的在放**哪一档（0 = 还不知道，Media3 还没解出 master playlist）。
+     *
+     * 和上面两个分开是必须的：[maxVideoHeight] 是用户许不许往下压的**上限**，
+     * [videoHeights] 是这一条流里**有哪些**档，只有这一个回答「屏幕上现在这几万个像素是多高」。
+     * 画质那一格要说「现在在放 1080P」，只能拿它当依据 —— 拿上限当依据就是句假话：
+     * 上限写 1080、网络撑不住掉到 480 的时候，芯片还写着 1080P。
+     */
+    var playingHeight by remember { mutableIntStateOf(0) }
     /** 手势反馈的浮动提示，null 表示不显示。 */
     var hint by remember { mutableStateOf<String?>(null) }
     /** 横向拖动时的目标位置（秒），非空表示正在拖、先预览不真的 seek。 */
@@ -343,13 +352,27 @@ fun PlayerScreen(
             // 不问一句就写，等于把「这一集根本没播开」记成「看到了第 18 分钟」，
             // 下次进来「已经看完了」的判断、继续观看的位置全是拿它算的。
             if (player.playbackState == Player.STATE_READY) vm.updatePosition(pos, dur)
-            val hs: List<Int> = runCatching {
-                player.currentTracks.groups
-                    .filter { it.type == C.TRACK_TYPE_VIDEO }
+            val (hs, sel) = runCatching {
+                val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                val heights = groups
                     .flatMap { g -> (0 until g.length).map { i -> g.getTrackFormat(i).height } }
                     .filter { it > 0 }
-            }.getOrDefault(emptyList()).distinct().sortedDescending()
-            if (hs.isNotEmpty() && hs != videoHeights) videoHeights = hs
+                    .distinct()
+                    .sortedDescending()
+                // isSelected 才是「这一条真的在被放」。只读清单的话，拿到的永远是
+                // 「这条流有几档」，那不是「画质」这个问题的答案。
+                val selected = groups.filter { it.isSelected }
+                    .flatMap { g -> (0 until g.length).map { i -> g.getTrackFormat(i).height } }
+                    .filter { it > 0 }
+                    .maxOrNull() ?: 0
+                heights to selected
+            }.getOrDefault(emptyList<Int>() to 0)
+            if (hs.isNotEmpty() && hs != videoHeights) {
+                // 换集 / 换源之后是另一条流，上一流那一档不作数 —— 先当不知道，等它自己报
+                videoHeights = hs
+                playingHeight = 0
+            }
+            if (sel > 0 && sel != playingHeight) playingHeight = sel
             delay(500)
         }
     }
@@ -1020,9 +1043,17 @@ fun PlayerScreen(
                                     Spacer8()
                                 }
                                 if (videoHeights.isNotEmpty()) {
-                                    Chip(if (maxVideoHeight == 0) "画质 自动" else "${maxVideoHeight}P") {
-                                        panel = Panel.Quality
-                                    }
+                                    // 报的是**此刻真在放**的那一档。原来这里报的是设置项
+                                    // （没封顶就写「自动」）—— 而「自动」既不是画质也不是档，
+                                    // 用户问「现在几 P」它答不上来。还没量到就退回说上限，
+                                    // 并且把「≤」写出来：那一格陈述的是设置，不是画面。
+                                    Chip(
+                                        when {
+                                            playingHeight > 0 -> "画质 ${playingHeight}P"
+                                            maxVideoHeight > 0 -> "画质 ≤${maxVideoHeight}P"
+                                            else -> "画质 最高"
+                                        },
+                                    ) { panel = Panel.Quality }
                                     Spacer8()
                                 }
                                 if (playing?.mediaId != null && playing?.sourceId != "local") {
@@ -1310,7 +1341,10 @@ fun PlayerScreen(
                             Spacer8()
                             (listOf(0) + videoHeights).forEach { h ->
                                 Text(
-                                    if (h == 0) "自动（按网络）" else "${h}P",
+                                    // 「自动」那一项原本光写「按网络」—— 它其实是不封顶，
+                                    // 也就是最高那一档起、撑不住才降。名字直接说清楚，
+                                    // 免得以为选了它和选 1080P 是两件不同的事。
+                                    if (h == 0) "最高（撑不住才降）" else "${h}P",
                                     color = if (h == maxVideoHeight) T.Play400 else T.Text,
                                     fontSize = Fs.sm,
                                     modifier = Modifier.fillMaxWidth()
@@ -1324,6 +1358,14 @@ fun PlayerScreen(
                                 )
                             }
                             Spacer8()
+                            Text(
+                                // 这一行是这一格里唯一一句关于**画面**的话，上面那些是设置。
+                                if (playingHeight > 0) "此刻在放 ${playingHeight}P。"
+                                else "还没量到 —— 这一条流解不出档位之前，那一格说的是设置，不是画面。",
+                                color = T.TextFaint,
+                                fontSize = Fs.tiny,
+                                lineHeight = Fs.tiny * 1.6f,
+                            )
                             Text(
                                 "只有源站给了多档分辨率时这里才有得选。",
                                 color = T.TextFaint,
