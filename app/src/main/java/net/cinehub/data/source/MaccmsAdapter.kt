@@ -42,9 +42,20 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
      * 三条取数一律走这里，就是为了 [SourceConfig.needsBrowser] 那一格只写一次：
      * 挂在 Cloudflare 后面的站，搜索走通了、详情却还用 OkHttp 去问，界面上就会
      * 出现「列表有片、点进去说这个源要求浏览器验证」。
+     *
+     * 走浏览器内核的那一路，一次问话给 40 秒而不是默认的 20 秒。这不是拍出来的数：
+     * 同一台模拟器上实测「全部重测」量到 21533ms（那一趟题正好过期，引擎现场答了一遍），
+     * 而探测那条路本来就是 30 秒 —— 只有取数沿用 20 秒。后果是这个源**每次冷启动都要
+     * 失败一次才好用**：暖机就发生在这一次失败的问话里，等题答完了，超时也到了。
+     * 界面上看到的是「第一次搜不到、第二次就有了」，那是句假话，不是这个源真的没有。
      */
-    private suspend fun fetch(url: String): String =
-        Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config), viaBrowser = config.needsBrowser)
+    private suspend fun fetch(url: String): String = Http.get(
+        url,
+        referer = config.baseUrl,
+        headers = Http.authHeaders(config),
+        viaBrowser = config.needsBrowser,
+        timeoutSec = if (config.needsBrowser) 40 else 20,
+    )
 
     override suspend fun browse(page: Int): List<Media> =
         parseList(fetch("${abs(rules.listPath)}?ac=videolist&${rules.pageParam}=$page"))
