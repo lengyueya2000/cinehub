@@ -27,7 +27,7 @@ object PlayerBuffering {
     const val BUFFER_FOR_PLAYBACK_MS = 1_200
 
     /** 卡住之后重新攒够多少毫秒才继续。默认 5000 —— 一次卡顿要停五秒才走。 */
-    const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 1_500
+    const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 2_500
 
     /**
      * 缓冲桶的下限。Media3 默认 50000。
@@ -73,7 +73,91 @@ object PlayerBuffering {
             BUFFER_FOR_PLAYBACK_MS,
             BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
         )
+        // 时间档优先于字节预算：慢源上「字节满了但时间不够」的假性就绪少一次是一次。
+        // 字节预算本身仍交给 Media3 按 131 MB 那套自己算（见上面的注释，不要手动调小）。
+        .setPrioritizeTimeOverSizeThresholds(true)
         .build()
+
+    /**
+     * 缓冲提示那一句话。
+     *
+     * **这里没有可信的百分比可用**，所以不报百分比。原因是真机上两次被打回：
+     *
+     * 1. 报「整片下了百分之几」：seek 到 20:44 那一刻它就定在 39% 不动，
+     *    等缓冲够了整句又消失 —— 用户看到的是「一直写缓冲中、百分比一闪而过」。
+     * 2. 改报「已攒量 ÷ 起播阈值」：仍然错。`MAX_BUFFER_MS` 是 120 秒，
+     *    ExoPlayer 一旦拿到数据就成批灌满几十秒，`bufferedPosition - currentPosition`
+     *    是一步跳到位的 —— 百分比成了阶跃函数，0 → 100% 瞬间完成，
+     *    还会出现「缓冲中 100%」却仍在等的画面（数据够了、解码器还没出帧）。
+     *
+     * 于是这里只报两件分开的事实，各自都是单调且可信的：
+     * - 数据还没来（[bufferedAheadMs] 不足一秒）→ 报**已经等了多久**。
+     *   prepare / 建连阶段往往是最长的等待，而那时缓冲量恒为 0，
+     *   任何比例都算不出来；干写「缓冲中…」用户分不清是在走还是死了。
+     * - 数据到了 → 报**已经攒了多少秒**，这才是「缓冲进度」的真实值。
+     *
+     * [waitedSec] 为 0 时不报秒数：写「已等 0 秒」看着像卡住了。
+     */
+    fun bufferingLabel(bufferedAheadMs: Long, waitedSec: Int): String {
+        val bufferedSec = bufferedAheadMs / 1_000L
+        if (bufferedSec > 0L) return "缓冲中 · 已缓冲 $bufferedSec 秒"
+        return if (waitedSec > 0) "缓冲中…已等 $waitedSec 秒" else "缓冲中…"
+    }
+
+    /**
+     * 重缓冲时把 ABR 上限压到「实测带宽 × [ABR_HEADROOM]%」，返回新的上限（比特每秒）。
+     *
+     * 卡顿的典型机制：选中的档位码率 > 出口 sustained 带宽 —— 播一段、追不上、
+     * 重缓冲、再播一段，桶（[MAX_BUFFER_MS]）再大也治不了消费速度超过生产速度。
+     * 治法是重缓冲时把上限压到实测以下，让 ABR 自动降档，而不是硬扛着反复卡。
+     *
+     * 边界：
+     * - 估计还没量出来（[estimate] <= 0）→ 原样返回 [currentMax]，什么都不动；
+     * - 结果只降不升：比当前上限还高时按当前上限封顶（网络变好交给 ABR 自己慢慢爬）；
+     * - 压到 [MIN_ABR_BITRATE] 为止 —— 再往下 ABR 会挑一条连音频都装不下的档。
+     */
+    fun clampBitrate(estimate: Long, currentMax: Long): Long {
+        if (estimate <= 0L) return currentMax
+        val capped = (estimate * ABR_HEADROOM / 100L).coerceAtMost(currentMax)
+        return capped.coerceAtLeast(MIN_ABR_BITRATE)
+    }
+
+    /** 重缓冲时给实测带宽留的头余量（%）：压到实测的 80%，防抖。 */
+    const val ABR_HEADROOM = 80L
+
+    /**
+     * 网络恢复后逐步放开 ABR 上限，返回新的上限（比特每秒）。
+     *
+     * 放开必须**单步有界**：上限从压扁状态一口气放回实测的 90%，一次网络抖动
+     * 又会把它打回重缓冲 —— 用户看到的是「松一下、卡一下」的循环。
+     * 这里每步最多放宽 [RELEASE_STEP_PERCENT]%，多轮才回到 [RELEASE_TARGET_PERCENT]%。
+     *
+     * 边界：
+     * - 估计没量出来（<= 0）→ 原样返回；
+     * - **只升不降**：往下压是 [clampBitrate] 在重缓冲时干的事，两条路径别混；
+     * - 目标是实测的 [RELEASE_TARGET_PERCENT]%（比压下去的 80% 留更多头余量），到了就停。
+     */
+    fun releaseBitrate(currentMax: Long, estimate: Long): Long {
+        if (estimate <= 0L) return currentMax
+        val target = estimate * RELEASE_TARGET_PERCENT / 100L
+        if (currentMax >= target) return currentMax
+        val step = currentMax * RELEASE_STEP_PERCENT / 100L
+        return (currentMax + step).coerceAtMost(target)
+    }
+
+    /** 放开路径的单步上限（%）：每步最多放宽 25%。 */
+    const val RELEASE_STEP_PERCENT = 25L
+
+    /** 放开路径的目标（实测的百分比）：90% —— 比 80% 那份多留一点，减少刚放开又卡的来回。 */
+    const val RELEASE_TARGET_PERCENT = 90L
+
+    /**
+     * ABR 上限的最低档（比特每秒）。
+     *
+     * 弱网估计可能抖到几十 kbps，跟着压会让音轨都选不出来（播放器直接卡死在 BUFFERING）。
+     * 320 kbps 够装一条音频 + 最低档视频。
+     */
+    const val MIN_ABR_BITRATE = 320_000L
 
     /**
      * 建带宽估计器。

@@ -106,6 +106,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val speedChoices: List<Float> get() = playbackRepo.speedChoices
     fun setPlaybackSpeed(value: Float) = playbackRepo.setSpeed(value)
 
+    /** 自动连播：播完一集后要不要倒计时接下一集。全局一份，与倍速同一语义。 */
+    val autoPlayNext: StateFlow<Boolean> = playbackRepo.autoNext
+    fun setAutoPlayNext(value: Boolean) = playbackRepo.setAutoNext(value)
+
+    /** 画面比例模式（fit/fill/zoom），全局一份，起播、换集都照它摆。 */
+    val playbackResizeMode: StateFlow<String> = playbackRepo.resizeMode
+    val resizeModeChoices: List<String> get() = playbackRepo.resizeModes
+    fun setPlaybackResizeMode(value: String) = playbackRepo.setResizeMode(value)
+
+    /** 「画面」芯片一次点击轮换到的下一档：fit → fill → zoom → fit。 */
+    fun nextResizeMode(current: String): String {
+        val modes = resizeModeChoices
+        val i = modes.indexOf(current)
+        return if (i < 0) modes.first() else modes[(i + 1) % modes.size]
+    }
+
     // ---------- 小窗播放 ----------
 
     /**

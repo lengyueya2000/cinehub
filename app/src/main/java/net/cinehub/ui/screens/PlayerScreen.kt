@@ -114,6 +114,9 @@ private const val SCRUB_SPAN_MS = 120_000L
 /** 「换过 N 次才播起来」那句在屏上留多久 —— 控件 3.5 秒就收，这句话得比控件活得长。 */
 private const val SETTLED_NOTICE_MS = 10_000L
 
+/** 播完后留给「取消连播」的窗口。 */
+private const val AUTO_NEXT_MS = 3_000L
+
 /**
  * 播放器报的毫秒 → 秒。
  *
@@ -122,6 +125,24 @@ private const val SETTLED_NOTICE_MS = 10_000L
  * 而「看完了没」是拿时长算的，靠「除一千再取非负」刚好抹平是在赌上游不改。
  */
 private fun msToSec(ms: Long): Long = if (ms < 0L) 0L else ms / 1000
+
+/**
+ * 本条线路清单里，当前这一集的下一（上）一条是谁；没有就返回 null。
+ *
+ * 手动那颗上下集按钮和自动连播的倒计时共用这一份查法：两处各写一套「往后挪一格」，
+ * 迟早有一处在「线路之间集号对不上」（清单里找不到当前集）时把用户扔到清单第一集 ——
+ * 那是当年 `-1 加一挡落到第一集` 的翻版。缺集也是同一类：第 2 集的下一集是清单里的
+ * 下一条（第 4 集），不是算术上的第 3 集。
+ */
+internal fun nextEpisodeOf(
+    episodes: List<Episode>,
+    currentIndex: Int,
+    delta: Int,
+): Episode? {
+    val i = episodes.indexOfFirst { it.index == currentIndex }
+    if (i < 0) return null
+    return episodes.getOrNull(i + delta)
+}
 
 /**
  * 播放器。
@@ -159,9 +180,26 @@ fun PlayerScreen(
     // 活值，collectAsState 会让这整屏（1800 行）跟着以 2 Hz 全量重组，而这里只用得上一次。
     var pos by remember { mutableLongStateOf(vm.resumePosition.value) }
     var dur by remember { mutableLongStateOf(0L) }
+    /** 已缓冲到的位置（秒），进度条第二根条与缓冲提示用。0 = 还没量到。 */
+    var buf by remember { mutableLongStateOf(0L) }
+    /**
+     * 缓冲领先播放点的毫秒数，**只喂缓冲提示那一个百分比**。
+     *
+     * 不能拿 [buf] 减 [pos] 来算：那两个都是取整到秒的，而分母只有 1.2~2.5 秒，
+     * 相减只剩四五个档位，进度是跳的。这里直接用播放器的毫秒原值，档位足够细。
+     */
+    var bufAheadMs by remember { mutableLongStateOf(0L) }
     /** 用户意图，不是 player.isPlaying —— 后者在 HLS seek/buffer 期间会短暂为 false，按钮会闪成「已暂停」。 */
     var wantsPlay by remember { mutableStateOf(true) }
     var buffering by remember { mutableStateOf(true) }
+    /**
+     * 这一轮缓冲已经等了多久（秒）。
+     *
+     * prepare 阶段（清单还没解析完、第一个分片还没落地）`duration` 和
+     * `bufferedPosition` 都是 0，算不出任何比例 —— 而那段往往是最长的等待。
+     * 这时候只能报等待时长，让用户知道它还在走。
+     */
+    var bufferingSec by remember { mutableIntStateOf(0) }
     var errText by remember { mutableStateOf<String?>(null) }
     /**
      * 播放器手里这一条媒体属于哪一次尝试（就是那一条 `episodeUrl`）。
@@ -172,6 +210,16 @@ fun PlayerScreen(
     var attemptUrl by remember { mutableStateOf<String?>(null) }
     /** 这一次播放渲染过第一帧没有 —— 起播看门狗只看这一位。 */
     var firstFrame by remember { mutableStateOf(false) }
+    /**
+     * 播放器这一集播到了结尾（STATE_ENDED）。自动连播的倒计时和横幅都认这一位。
+     *
+     * 键里换集/换源/换线路都要把它归零（见主媒体 effect）：旧那一集的「播完了」
+     * 不该让新那一集一挂上媒体源就弹倒计时 —— setMediaSource 之后 STATE_IDLE 之前
+     * 未必再经过一次别的状态回调。
+     */
+    var playerEnded by remember { mutableStateOf(false) }
+    /** 这一集里用户点过「取消连播」：本集不再弹，下一集 ENDED 时重新计。 */
+    var autoNextCancelled by remember { mutableStateOf(false) }
     /**
      * 用户在这一笔上手点了「重试」几次。
      *
@@ -194,6 +242,10 @@ fun PlayerScreen(
      * 重新点一遍 1.5x —— 用户的耳朵记着上一集那档，界面不记。
      */
     val speed by vm.playbackSpeed.collectAsState()
+    /** 自动连播也是全局那一份偏好：和倍速同理由，不在这一屏抄本地态。 */
+    val autoNext by vm.autoPlayNext.collectAsState()
+    /** 画面比例模式（fit/fill/zoom），同样读全局那份。 */
+    val resizeMode by vm.playbackResizeMode.collectAsState()
     var lineIndex by remember { mutableIntStateOf(0) }
     /** 0 = 不封顶，交给 ExoPlayer 自适应；否则是用户选的视频高度上限。 */
     var maxVideoHeight by remember { mutableIntStateOf(0) }
@@ -222,6 +274,16 @@ fun PlayerScreen(
     // 它必须同时挂在播放器和数据源上 —— 只挂一边等于 ABR 永远停在初始值。
     val bandwidth = remember { PlayerBuffering.bandwidthMeter(ctx) }
 
+    /**
+     * ABR 码率上限（比特每秒）的**当前值**。
+     *
+     * 正常时是 Int.MAX（不封顶，ABR 自由选档）；一次重缓冲把它压到实测 × 80%，
+     * 网络恢复后由轮询循环按 [PlayerBuffering.releaseBitrate] 逐步放开。
+     * 放在状态里而不是直接写 trackSelectionParameters：真正的参数应用只有
+     * `LaunchedEffect(abrMaxBitrate)` 那一处，和画质上限同一个入口。
+     */
+    var abrMaxBitrate by remember { mutableLongStateOf(Long.MAX_VALUE) }
+
     val player = remember {
         // 缓冲的几档阈值集中在 PlayerBuffering，不在这里散着写
         ExoPlayer.Builder(ctx)
@@ -234,6 +296,23 @@ fun PlayerScreen(
                         // BUFFERING / READY / ENDED —— 首帧渲染前 UI 要说清「在缓冲」，
                         // 否则用户看到的就是一个不动的黑屏，像是点了没反应。
                         buffering = state == Player.STATE_BUFFERING
+                        // 每进一轮缓冲就把等待计时归零：报的是「这一轮等了多久」，
+                        // 累计值在第二次卡顿时会显示成「已等 40 秒」，像是卡了很久
+                        if (state == Player.STATE_BUFFERING) bufferingSec = 0
+                        // 连播认这一位，而且只认 ENDED：从 ENDED 走向下一条媒体时
+                        // 这里会跟着归位，主媒体 effect 里那句复位是双保险。
+                        playerEnded = state == Player.STATE_ENDED
+                        // 播开之后又掉进 BUFFERING = 一次重缓冲：多半是当前档位的码率
+                        // 超过了出口带宽（消费 > 生产，桶再大也治不了）。把 ABR 上限
+                        // 压到实测带宽的 80%，让 ABR 自己降档，而不是硬扛着反复卡。
+                        // 首帧之前那次 BUFFERING 是起播，不动 —— 那时估计还没量准，
+                        // 压上去只会把起播档限死在最低档。
+                        if (state == Player.STATE_BUFFERING && firstFrame) {
+                            abrMaxBitrate = PlayerBuffering.clampBitrate(
+                                bandwidth.bitrateEstimate,
+                                abrMaxBitrate,
+                            )
+                        }
                     }
 
                     override fun onPlayWhenReadyChanged(
@@ -281,6 +360,15 @@ fun PlayerScreen(
         errText = null
         firstFrame = false
         buffering = true
+        // 缓冲进度也归零：上一条流攒下的数字留着，缓冲提示会在新流起播前
+        // 先闪一个旧百分比 —— 那正好是这次要修掉的「一闪而过」
+        buf = 0L
+        bufAheadMs = 0L
+        bufferingSec = 0
+        // 换集 / 换源 / 换线路都是新的一集：连播状态位归位，旧那一集「播完了」
+        // 不能让它一挂上媒体源就弹倒计时；用户上一集点过的「取消」也不带到下一集。
+        playerEnded = false
+        autoNextCancelled = false
         if (url.isNullOrBlank()) {
             // 没有地址可播（解析失败、还在解析）—— 这时候才真的停
             player.stop()
@@ -385,12 +473,27 @@ fun PlayerScreen(
         // 另一条流就是另一条流：上一流的档数与档位不作数，等它自己报
         videoHeights = emptyList()
         playingHeight = 0
+        // 换流之后 ABR 上限从头来：上一条流的「出口慢」不代表这一条也慢
+        abrMaxBitrate = Long.MAX_VALUE
         var lastPos = -1L
         var lastDur = -1L
         while (true) {
             pos = msToSec(player.currentPosition)
             dur = msToSec(player.duration)
             wantsPlay = player.playWhenReady
+            // 缓冲进度（秒）交给进度条第二根条与缓冲提示；没在缓冲时也照读，
+            // 进度条上的缓冲段要一直画
+            buf = msToSec(player.bufferedPosition).coerceAtLeast(pos)
+            // 毫秒原值另算一份给缓冲提示：它的分母是 1.2~2.5 秒的起播阈值，
+            // 用上面那个取整到秒的数只剩四五档，进度会跳
+            bufAheadMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)
+            // 网络恢复后逐步放开 ABR 上限：READY 且上限已被压过时按
+            // releaseBitrate 抬一点。放在 READY 条件里，BUFFERING 期间不动它。
+            if (player.playbackState == Player.STATE_READY &&
+                abrMaxBitrate != Long.MAX_VALUE
+            ) {
+                abrMaxBitrate = PlayerBuffering.releaseBitrate(abrMaxBitrate, bandwidth.bitrateEstimate)
+            }
             // 只有真的进了 READY 才把位置交给仓库落盘。
             // prepare 之前那一句 seekTo 就已经让 currentPosition 报出续播起点了 —— 
             // 不问一句就写，等于把「这一集根本没播开」记成「看到了第 18 分钟」，
@@ -428,11 +531,28 @@ fun PlayerScreen(
             // 顺手报一句「现在能按什么形状进小窗」：画面还没解出来就是 null，
             // 那时候按 Home 就还是普通退出 —— 小窗是给已经在放的东西留的。
             vm.publishPipRatio(playerDisplayRatio(player))
-            delay(500)
+            // 缓冲中把采样加密到 100ms：进度条的分母只有 1.2~2.5 秒，
+            // 按平时的 500ms 一采只能画出四五帧，进度看着是跳的而不是走的。
+            // 只在 BUFFERING 期间加密，正常播放仍走 500ms —— 上面那些
+            // currentTracks / 轨道查询都不便宜，不该为了进度条一直付这份钱。
+            delay(if (player.playbackState == Player.STATE_BUFFERING) 100 else 500)
         }
     }
 
     LaunchedEffect(speed) { player.setPlaybackSpeed(speed) }
+
+    /**
+     * 缓冲等待计时：只在缓冲中走秒，出缓冲就停。
+     *
+     * 单独一条 effect 而不是塞进那个 500ms 轮询里：轮询的频率本身会变
+     * （缓冲时加密到 100ms），拿它的节拍去数秒，两处改一处就会对不上。
+     */
+    LaunchedEffect(buffering) {
+        while (buffering) {
+            delay(1_000)
+            if (buffering) bufferingSec += 1
+        }
+    }
 
     LaunchedEffect(maxVideoHeight) {
         // 走 PlayerBuffering 那一份，别在这里另写一套 setMaxVideoSize ——
@@ -441,6 +561,17 @@ fun PlayerScreen(
             player.trackSelectionParameters,
             maxVideoHeight,
         )
+    }
+
+    LaunchedEffect(abrMaxBitrate) {
+        // ABR 码率上限只有这一个应用点：重缓冲把它压下去、恢复循环把它抬回来，
+        // 都落在这里写进 trackSelectionParameters —— 不再另开一条直写参数的路。
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setMaxVideoBitrate(
+                if (abrMaxBitrate == Long.MAX_VALUE) Int.MAX_VALUE
+                else abrMaxBitrate.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            )
+            .build()
     }
 
     LaunchedEffect(hint) {
@@ -648,12 +779,26 @@ fun PlayerScreen(
     }
 
     fun stepEpisode(delta: Int) {
-        val i = episodes.indexOfFirst { it.index == playing?.episodeIndex }
-        // 当前这一集在本条线路的清单里找不到（线路之间集号对不上）时不动。
+        // 查法交给 nextEpisodeOf：当前集在本条线路的清单里找不到（线路之间集号对不上）时不动。
         // 以前 -1 加一挡就落到清单第一集，用户按「下一集」看到的是第 1 集。
-        if (i < 0) return
-        val next = episodes.getOrNull(i + delta) ?: return
+        val next = nextEpisodeOf(episodes, playing?.episodeIndex ?: -1, delta) ?: return
         playEpisode(next)
+    }
+
+    /** 本条线路里正在播的这集后面还有没有：连播横幅与倒计时共用这一份判断。 */
+    val curInList = episodes.any { it.index == playing?.episodeIndex }
+    val nextEp = if (curInList) nextEpisodeOf(episodes, playing?.episodeIndex ?: -1, 1) else null
+
+    // 自动连播：这一集真播到结尾后留 3 秒反悔窗口，到点接下一集。
+    //
+    // 键里带上「播完没有、开关、取消位、哪一集哪个源哪条线路」：换集/换线路时这一轮
+    // 自动作废，不会出现旧那一集的倒计时切新那一集的下一集。醒来时再核一遍
+    // **播放器此刻真的还在 ENDED**（协程闭包里的 playerEnded 是创建那一刻的快照，
+    // 用户在窗口里拖回进度条重新播了，这里就不该抢切），才真的动。
+    LaunchedEffect(playerEnded, autoNext, autoNextCancelled, nextEp, playing?.episodeIndex, playing?.sourceId, lineIndex) {
+        if (!playerEnded || !autoNext || autoNextCancelled || nextEp == null) return@LaunchedEffect
+        delay(AUTO_NEXT_MS)
+        if (player.playbackState == Player.STATE_ENDED) stepEpisode(1)
     }
 
     fun seekBy(deltaMs: Long) {
@@ -687,7 +832,9 @@ fun PlayerScreen(
                     factory = { c ->
                         PlayerView(c).apply {
                             useController = false
-                            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                            // this. 不能省：外层那个同名 val（全局偏好，String）
+                            // 会把这里的 PlayerView.resizeMode（Int）整个遮掉
+                            this.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -695,7 +842,16 @@ fun PlayerScreen(
                             setShutterBackgroundColor(android.graphics.Color.BLACK)
                         }
                     },
-                    update = { it.player = player },
+                    update = { view ->
+                        view.player = player
+                        // 画面比例跟着全局偏好走：update 每次重组都会跑，
+                        // 值没变时 setFrameLayoutResizeMode 内部自己去重
+                        view.resizeMode = when (resizeMode) {
+                            "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                            "zoom" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                        }
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
@@ -1031,6 +1187,52 @@ fun PlayerScreen(
                         )
                     }
                 }
+            } else if (playerEnded && !inPip && (nextEp != null || curInList)) {
+                // 这一集播到结尾：有下一集就摆连播倒计时（和上面那条 effect 同一个闸门：
+                // 开关关着、或本集已取消，这里也不谎称「3 秒后」，只说播放完成）；
+                // 没下一集就老实说播完了。这里**不看 wantsPlay**：ExoPlayer 到结尾会
+                // 自动把 playWhenReady 翻成 false，认它等于横幅永远不出现。
+                // 用户把进度条拖回去，STATE 离开 ENDED、playerEnded 跟着归位，这句自然消失。
+                Column(
+                    Modifier.align(Alignment.Center)
+                        .clip(R.md).background(Color.Black.copy(alpha = .55f))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    when {
+                        nextEp != null && autoNext && !autoNextCancelled -> {
+                            Text(
+                                "${AUTO_NEXT_MS / 1000} 秒后播放下一集：${nextEp.name}",
+                                color = Color.White,
+                                fontSize = Fs.sm,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer4()
+                            Text(
+                                "取消",
+                                color = T.Src400,
+                                fontSize = Fs.xs,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clip(R.full)
+                                    .border(1.dp, T.Src500.copy(alpha = .5f), R.full)
+                                    .clickable { autoNextCancelled = true }
+                                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                            )
+                        }
+                        nextEp == null && curInList -> Text(
+                            "已是最后一集",
+                            color = Color.White,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        else -> Text(
+                            "播放完成",
+                            color = Color.White,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
             } else if (!wantsPlay && !buffering) {
                 Box(
                     Modifier.align(Alignment.Center).size(64.dp).clip(CircleShape)
@@ -1042,9 +1244,11 @@ fun PlayerScreen(
                     Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(27.dp))
                 }
             } else if (buffering && playing?.streamUrl != null) {
-                // 只有「点了播放但还没出首帧」才提示缓冲
+                // 缓冲提示报两件分开的事实，不报百分比 ——
+                // 为什么百分比在这条链路上没有意义，见 PlayerBuffering.bufferingLabel 的注释
+                // （一句话：ExoPlayer 拿数据是成批灌满几十秒的，百分比成了阶跃函数）。
                 Text(
-                    "缓冲中…",
+                    PlayerBuffering.bufferingLabel(bufAheadMs, bufferingSec),
                     color = Color.White,
                     fontSize = Fs.xs,
                     modifier = Modifier.align(Alignment.Center),
@@ -1144,6 +1348,7 @@ fun PlayerScreen(
                         SeekBar(
                             positionSec = shownPos,
                             durationSec = dur,
+                            bufferedSec = buf,
                             modifier = Modifier.weight(1f),
                             onScrub = { sec -> previewSec = sec },
                             onCommit = { sec ->
@@ -1176,6 +1381,12 @@ fun PlayerScreen(
                                 Chip("选集") { panel = Panel.Episodes }
                                 Spacer8()
                                 Chip("倍速 ${fmtSpeed(speed)}") { panel = Panel.Speed }
+                                Spacer8()
+                                // 画面比例三档轮换：一次点击在 自适应 → 铺满 → 裁切 之间走一圈。
+                                // 不开面板 —— 一个三档的小选择犯不着一层浮层，芯片上的字就是档位名。
+                                Chip("画面 ${resizeLabel(resizeMode)}") {
+                                    vm.setPlaybackResizeMode(vm.nextResizeMode(resizeMode))
+                                }
                                 Spacer8()
                                 if (siblings.size > 1 || sibQuery != SiblingsQuery.Done) {
                                     // 「源」和「线路」不是一回事：源是懂片帝AI、4kku 这种一整个站，
@@ -1346,6 +1557,30 @@ fun PlayerScreen(
                                         fontWeight = FontWeight.SemiBold,
                                     )
                                 }
+                            }
+                            // 自动连播就设在倍速面板底下：这一屏的播放偏好全在这一份里
+                            // （见 PlaybackRepository），不再单开一个 Panel 多一个入口要学。
+                            // 点了不关面板：这是个开关，用户会盯着「开/关」那一格确认它真的翻了。
+                            Spacer8()
+                            Row(
+                                Modifier.fillMaxWidth().clip(R.sm)
+                                    .clickable { vm.setAutoPlayNext(!autoNext) }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "自动连播",
+                                    color = T.Text,
+                                    fontSize = Fs.sm,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text(
+                                    if (autoNext) "开" else "关",
+                                    color = if (autoNext) T.Play400 else T.TextDim,
+                                    fontSize = Fs.sm,
+                                    fontWeight = FontWeight.Bold,
+                                )
                             }
                         }
 
@@ -1722,6 +1957,7 @@ private fun SeekBar(
     positionSec: Long,
     durationSec: Long,
     modifier: Modifier = Modifier,
+    bufferedSec: Long = 0L,
     onScrub: (targetSec: Long) -> Unit,
     onCommit: (targetSec: Long) -> Unit,
 ) {
@@ -1732,6 +1968,11 @@ private fun SeekBar(
         durationSec > 0 -> (positionSec.toFloat() / durationSec).coerceIn(0f, 1f)
         else -> 0f
     }
+    // 缓冲段：始终画（起播后它通常领先播放位置一大截）；拖动中收掉，
+    // 拖的是「要去哪儿」，缓冲段的参考意义反而碍事
+    val bufFrac = if (!dragging && durationSec > 0) {
+        (bufferedSec.toFloat() / durationSec).coerceIn(frac, 1f)
+    } else 0f
     Box(
         modifier.height(22.dp).pointerInput(durationSec) {
             awaitEachGesture {
@@ -1768,6 +2009,13 @@ private fun SeekBar(
             Modifier.fillMaxWidth().height(4.dp).clip(CircleShape)
                 .background(Color.White.copy(alpha = .22f)),
         )
+        if (bufFrac > 0f) {
+            // 已缓冲段：比轨道亮、比播放位置暗 —— 它说的是「这些已经在本地了」
+            Box(
+                Modifier.fillMaxWidth(bufFrac).height(4.dp).clip(CircleShape)
+                    .background(Color.White.copy(alpha = .42f)),
+            )
+        }
         Box(
             Modifier.fillMaxWidth(frac).height(if (dragging) 6.dp else 4.dp).clip(CircleShape)
                 .background(Brush.horizontalGradient(listOf(T.Play400, T.Play500))),
@@ -1850,6 +2098,13 @@ private fun fmt(sec: Long): String {
 
 private fun fmtSpeed(s: Float): String =
     if (s % 1f == 0f) "%.1f".format(s) else "%.2f".format(s).trimEnd('0')
+
+/** 「画面」芯片上的档位名。认不出的值按自适应说 —— 和仓库那一侧的兜底同一个口径。 */
+private fun resizeLabel(mode: String): String = when (mode) {
+    "fill" -> "铺满"
+    "zoom" -> "裁切"
+    else -> "自适应"
+}
 
 /**
  * 画面现在的宽高比，交给小窗决定那颗的形状；还没解出画面就是 null。
