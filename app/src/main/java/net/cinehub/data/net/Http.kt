@@ -543,29 +543,28 @@ object Http {
  *
  * 响应体交给调用方 `use`：这里不读，读是阻塞的，得留在 IO 线程上。
  * 缓存那边也用它 —— 暂停要的是「这一片立刻停」，不是「等这一片下完再说」。
+ *
+ * **v1.4.4 在这里崩过，两处教训都钉在这段代码里：**
+ * 1. `suspendCancellableCoroutine` 的协程还挂着时**只许注册一颗**取消 handler，
+ *    第二次注册直接抛 `IllegalStateException: It's prohibited to register multiple
+ *    handlers`。上一版为了「响应也得在取消时关掉」在 onResponse 里又注册了一颗 ——
+ *    等于每一次请求响应到达时都炸，开机首轮健康扇出就把应用掀了（真机闪退）。
+ * 2. 想避免 `isCancelled` 查与 `resume` 之间的 TOCTOU，用**公开**的
+ *    `resume(value, onCancellation)`：转不出去（已被取消）时 onCancellation 被调用、
+ *    value 被丢弃。不需要 `tryResume/completeResume`，更不需要第二颗 handler。
  */
 suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
     cont.invokeOnCancellation { runCatching { cancel() } }
     enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
-            // 这里不用 tryResumeWithException：抛异常那条路没有「资源没人接手」的问题，
-            // 而协程已经取消时这个 resume 是空操作（挂起的续体不会醒）。
+            // 抛异常那条路没有「资源没人接手」的问题：协程已经取消时这个 resume 是空操作。
             if (!cont.isCancelled) cont.resumeWithException(e)
         }
 
         override fun onResponse(call: Call, response: Response) {
-            // 取消与交付在同一条状态机上竞争，谁先谁赢 —— 先登记「取消就把这条响应关掉」：
-            //  - **交付赢**：状态转成 Resumed，此后 cancel() 不会再成功，这个 handler 不会跑，
-            //    响应交给调用方的 `use {}` 关；
-            //  - **取消赢**：状态转成 Cancelled，handler 立刻被调用（`invokeOnCancellation` 的
-            //    语义就是「已经取消时当场执行」），响应在这里关掉，随后那次 resume 是空操作。
-            //
-            // 两边都调 close()，而 `Response.close()` 是幂等的（OkHttp 内部就是 closeQuietly），
-            // 所以不需要再判一次「究竟谁赢了」—— 原来那句 `if (cont.isCancelled) … else resume`
-            // 的竞态恰恰就出在这一次判断上：取消落在判断和 resume 之间时，
-            // resume 被丢进已取消的续体、调用方的 `use {}` 永不执行，这条连接没人关。
-            cont.invokeOnCancellation { runCatching { response.close() } }
-            cont.resume(response)
+            // 转手与取消在 resume 内部一次定胜负：转手成功，响应归调用方的 `use {}`；
+            // 转不出去（取消先到），这个回调里当场关掉，连接不漏。close 幂等，重复调无害。
+            cont.resume(response) { runCatching { response.close() } }
         }
     })
 }
