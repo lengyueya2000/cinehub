@@ -16,13 +16,31 @@ import kotlinx.serialization.json.JsonPrimitive
 internal object MinoProtocol {
 
     /**
+     * 信封认出来了、但解不开（密钥不对 / payload 截断 / GCM tag 验不过）。
+     *
+     * 这是一个**响的**失败：调用方不能拿密文当明文继续解析（那会解出一份没有
+     * videos/hits 的合法 JSON，界面就照着说「这个源里没有这部片」—— 一句假话），
+     * 也不能把它混进「答的样子不认识」那一类里含糊过去。消息本身就是给用户看的。
+     */
+    internal class EnvelopeFailure(message: String) : IllegalStateException(message)
+
+    /** 外层 JSON 里 data 那一段的锚点：冒号两侧的空格是合法 JSON（`"data" :`）。 */
+    private val DATA_KEY = Regex("\"data\"\\s*:")
+
+    /**
      * 拆响应信封：`{"code":1,"data":{"enc":1,"payload":"base64"},"msg":"ok"}`。
      *
      * 后端只加密 `data` 那一段，外层 code/msg 是明文 —— 解出来的明文要**拼回 data 的
      * 位置**，调用方看到的才仍是一份完整 JSON（站点自己的前端也是这么做的）。
      *
-     * 四种「不像信封」都原样带回，让上层按「接口答的样子不认识」去说，不拿半份东西
-     * 往下解析：没带钥、外层解不出 JSON、`enc` 不是 1、payload 解不开或 tag 验不过。
+     * 认不出这是信封的几种情形都原样带回，让上层按「接口答的样子不认识」去说，
+     * 不拿半份东西往下解析：没带钥、正文里没有 `"enc"`、外层解不出 JSON 对象、
+     * `data` 不是对象、`enc` 不是 1、没有 payload。
+     *
+     * 但**认出来了却打不开**是另一件事：`enc == 1` 而 base64 解不开、或 AES-GCM
+     * 解不开/tag 验不过时抛 [EnvelopeFailure]，不把密文原样交出去。原样交出去的话
+     * 上层会拿一段合法 JSON 去找 `data.videos`，找不到就报「这个源里没有这部片」——
+     * 而真相是接口改了或密钥不对，那是句假话。
      */
     fun unwrapEnvelope(text: String, bodyKey: ByteArray?): String {
         if (bodyKey == null || !text.contains("\"enc\"")) return text
@@ -30,18 +48,22 @@ internal object MinoProtocol {
         val data = root["data"] as? JsonObject ?: return text
         if (data.intOf("enc") != 1) return text
         val payload = data.str("payload") ?: return text
-        val blob = MinoSign.decodeBase64(payload) ?: return text
-        val plain = MinoSign.decryptGcm(blob, bodyKey) ?: return text
-        val at = text.indexOf("\"data\":")
-        if (at < 0) return text
-        // 拼回到 data: 之后 —— 那七个字符（"data":）保留，后面的整个对象换成明文
-        return text.substring(0, at + "\"data\":".length) + String(plain, Charsets.UTF_8) + text.substring(envelopeEnd(text))
+        val blob = MinoSign.decodeBase64(payload) ?: throw EnvelopeFailure(
+            "这个后端的响应解不开（信封解密失败）—— 接口多半改了，换一个源试试",
+        )
+        val plain = MinoSign.decryptGcm(blob, bodyKey) ?: throw EnvelopeFailure(
+            "这个后端的响应解不开（信封解密失败）—— 接口多半改了，换一个源试试",
+        )
+        val at = DATA_KEY.find(text) ?: return text
+        // 拼回到 data: 之后 —— 锚点本身（`"data":` 或 `"data" :`）保留，后面的整个对象换成明文
+        return text.substring(0, at.range.last + 1) + String(plain, Charsets.UTF_8) +
+            text.substring(envelopeEnd(text))
     }
 
     /** 信封那个对象在原文里结束的位置（配平的 `}` 之后）；配不上时退回文本末尾。 */
     internal fun envelopeEnd(text: String): Int {
-        val i = text.indexOf("\"data\":")
-        if (i < 0) return text.length
+        val m = DATA_KEY.find(text) ?: return text.length
+        val i = m.range.last
         val brace = text.indexOf('{', i)
         if (brace < 0) return text.length
         var depth = 0

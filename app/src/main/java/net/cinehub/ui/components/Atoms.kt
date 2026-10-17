@@ -50,9 +50,9 @@ fun StatusDot(health: Health, size: Int = 6) {
 @Composable
 fun Pill(
     text: String,
+    modifier: Modifier = Modifier,
     cyan: Boolean = false,
     ghost: Boolean = false,
-    modifier: Modifier = Modifier,
 ) {
     val bg = when {
         cyan -> T.Src500.copy(alpha = .14f)
@@ -103,7 +103,7 @@ fun SectionHead(
     onTrailing: (() -> Unit)? = null,
 ) {
     Row(
-        modifier = modifier.fillMaxWidth().padding(vertical = 0.dp),
+        modifier = modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(title, color = T.Text, fontSize = Fs.sec, fontWeight = FontWeight.Bold)

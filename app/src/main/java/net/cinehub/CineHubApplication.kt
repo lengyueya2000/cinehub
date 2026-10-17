@@ -47,7 +47,10 @@ class CineHubApplication : Application(), ImageLoaderFactory {
     private class DoubanImageHeaders : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val req = chain.request()
-            if (!req.url.host.endsWith("doubanio.com")) return chain.proceed(req)
+            // 必须是 doubanio.com 自己或它的子域。只写 `endsWith` 是不够的：
+            // 那样 `evil-doubanio.com` / `xdoubanio.com` 这些**别的域名**也被当成豆瓣，
+            // 凭空收到一份伪造的 Referer + 浏览器 UA —— 这套头是专为豆瓣那条规则准备的。
+            if (!isDoubanHost(req.url.host)) return chain.proceed(req)
             return chain.proceed(
                 req.newBuilder()
                     .header("Referer", DOUBAN_PAGE)
@@ -55,6 +58,9 @@ class CineHubApplication : Application(), ImageLoaderFactory {
                     .build(),
             )
         }
+
+        private fun isDoubanHost(host: String): Boolean =
+            host == "doubanio.com" || host.endsWith(".doubanio.com")
     }
 
     private companion object {

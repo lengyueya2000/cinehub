@@ -48,6 +48,7 @@ import net.cinehub.ui.components.GroupDivider
 import net.cinehub.ui.components.PosterCard
 import net.cinehub.ui.components.SectionHead
 import net.cinehub.ui.components.StatusDot
+import net.cinehub.ui.components.UnreadableNotice
 import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
@@ -79,9 +80,16 @@ fun MineScreen(
     val history by vm.watchHistory.collectAsState()
     val downloads by vm.downloads.collectAsState()
     val segParallel by vm.segParallel.collectAsState()
+    // 这一页是收藏 / 观看记录 / 缓存三份本机数据的落地页，三份都可能读不通：
+    // 读不通时仓库回落成空列表，不说清楚的话空态会被读成「我自己删光了」。
+    // （源那一份这一页不摆原文，只在设置行里报个数，SourceScreen 会把话说全。）
+    val watchUnreadable by vm.watchUnreadable.collectAsState()
+    val downloadsUnreadable by vm.downloadsUnreadable.collectAsState()
 
     val cached = downloads.filter { it.status == DownloadStatus.Done }
-    val enabled = sources.filter { it.enabled }
+    // 这一页自己排一次优先级：SourceRepository.sources 落盘那份不保证有序，
+    // 而下面对比的「页面上的顺序」是源管理页按 priority 排出来的那份。
+    val enabled = sources.filter { it.enabled }.sortedBy { it.priority }
     val down = enabled.count { health[it.id]?.health == Health.Down }
     val slow = enabled.count { health[it.id]?.health == Health.Slow }
     val ok = enabled.count { health[it.id]?.health == Health.Ok }
@@ -98,6 +106,11 @@ fun MineScreen(
         contentPadding = PaddingValues(top = Sp.s5, bottom = Sp.s7),
     ) {
         // ---------- 收藏 ----------
+        // 告示排在「收藏」标题之前：读不通时下面那三栏显示的其实都是回落出来的空列表，
+        // 先说明白，用户才不会把「还没有收藏」读成自己删过。
+        if (watchUnreadable) {
+            item { UnreadableNotice("收藏和观看记录") }
+        }
         item {
             SectionHead(
                 "收藏",
@@ -163,6 +176,11 @@ fun MineScreen(
         }
 
         // ---------- 离线缓存 ----------
+        // 读不通时缓存轨是空的、下面设置行还写着「还没有缓存好的集」—— 两句都像用户自己删的。
+        // 告示必须无条件摆出来：这一栏本身在空列表下不渲染，把告示挂在它里面就等于没说。
+        if (downloadsUnreadable) {
+            item { UnreadableNotice("缓存任务清单") }
+        }
         if (cached.isNotEmpty()) {
             item {
                 // 这一栏不再挂「管理 ›」：下面设置组里那行「离线缓存」去的就是同一页，
@@ -231,8 +249,9 @@ fun MineScreen(
         item {
             Text(
                 buildString {
-                    if (version != null) append("影枢 v$version")
-                    append(" · 收藏、进度与凭证只存这台设备")
+                    // 版本号读不到时（versionName 为空的包）不能留下一个开头的「 · 」
+                    if (version != null) append("影枢 v$version · ")
+                    append("收藏、进度与凭证只存这台设备")
                 },
                 color = T.TextDim,
                 fontSize = Fs.xs,
@@ -311,6 +330,9 @@ private fun SettingRow(
  *
  * 结论必须是字，圆点只是让它更快扫到 —— 单靠颜色传达状态是不合格的。
  * 有源不可用时要点名：否则用户是到了详情页播放失败才发现的。
+ *
+ * [enabled] 必须已按 priority 排好（调用处排的）：这颗圆点和结论里点名的那一个
+ * 都要和源管理页上的顺序对得上，否则两边说的是两个「第一个」。
  */
 @Composable
 private fun SourceHealthStrip(
@@ -347,10 +369,17 @@ private fun SourceHealthStrip(
             },
             fontSize = Fs.xxs,
         )
-        Row(Modifier.padding(top = Sp.s2)) {
+        Row(Modifier.padding(top = Sp.s2), verticalAlignment = Alignment.CenterVertically) {
             shown.forEachIndexed { i, s ->
                 StatusDot(health[s.id]?.health ?: Health.Unknown, size = 6)
                 if (i < shown.lastIndex) Spacer(Modifier.width(Sp.s2))
+            }
+            // 圆点只画得下前六个：多出来的必须自己报数。
+            // 不报的话七个源的界面看着就是「一共六个」，那排点会替剩下的源作保。
+            val more = enabled.size - shown.size
+            if (more > 0) {
+                Spacer(Modifier.width(Sp.s2))
+                Text("+$more", color = T.TextDim, fontSize = Fs.xxs)
             }
         }
     }

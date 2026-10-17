@@ -5,8 +5,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -84,6 +87,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setSegParallel(n: Int) = downloadRepo.setSegParallel(n)
 
+    /**
+     * VM 没了（Activity 真的销毁）就把下载引擎也关掉。
+     *
+     * 不关的话，退出应用再进来会得到第二颗引擎：两份内存清单指向同一批目录和同一个
+     * DataStore 键，而「同时最多 3 集」那个闸门变成每颗一份 —— 实际并发翻倍。
+     * 盘上已缓存的东西一律不动，用户下次进来照旧能离线播。
+     */
+    override fun onCleared() {
+        downloadRepo.close()
+        super.onCleared()
+    }
+
     // ---------- 播放偏好 ----------
 
     /** 全局倍速：不分作品、不分源，起播/换线路/换集都读它，用户调一次就一直是那一档。 */
@@ -108,6 +123,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _inPip = MutableStateFlow(false)
     val inPip: StateFlow<Boolean> = _inPip.asStateFlow()
     fun setInPip(on: Boolean) { _inPip.value = on }
+
+    /**
+     * 「小窗被关掉了（不看了）」这一声。
+     *
+     * 点小窗那个 × 有两种收场，取决于系统：有的直接把 Activity 收掉，有的只是把窗口藏起来、
+     * 进程和 Activity 都留着。后一种才是会出事的那条 —— 播放器那一屏的「退后台就停」
+     * 依赖 ON_STOP，而进小窗时那次 ON_STOP 已经被「在小窗里」豁免掉了，关小窗时
+     * 又不会再收到一次，于是声音留在后台一直响，用户还找不到任何入口关掉它。
+     *
+     * Activity 在离开小窗后确认「没回到前台」时递一声过来（见 MainActivity），
+     * 播放器那一屏据此暂停并把最后那一段位置补写一次。
+     *
+     * 这是一件**一次性的事**，所以用 SharedFlow 而不是 StateFlow 里存一个时间戳。
+     * 存时间戳那版有个致命的坑：值只增不清，而播放器那一屏是按 `route` 装卸的 ——
+     * 下一次进播放器（新组合）时 `LaunchedEffect(key)` 会拿着这个**陈旧的**值再跑一遍，
+     * 于是用户刚点的这一集起播就被暂停，屏上还没有任何解释；顺便把跨源续播的锚点
+     * 也冲成 0（见 [updatePosition]，它在 `sec <= 0` 早退之前就写了 `_resumePosition`）。
+     * `replay = 0` 正是要的语义：没人听的时候这一声就丢掉 —— 那一屏都不在了，
+     * 播放器也早就 release 了，没有什么可停的。
+     */
+    private val _pipDismissed = MutableSharedFlow<Unit>(replay = 0, extraBufferCapacity = 1)
+    val pipDismissed: SharedFlow<Unit> = _pipDismissed.asSharedFlow()
+    fun notePipDismissed() { _pipDismissed.tryEmit(Unit) }
 
     /** 收藏与最近观看。名字避开 [history] —— 那个是搜索历史。 */
     val favorites: StateFlow<List<Favorite>> = watchRepo.favorites
@@ -196,6 +234,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _history = MutableStateFlow<List<String>>(emptyList())
     val history: StateFlow<List<String>> = _history.asStateFlow()
+
+    /**
+     * 上一次**真的发出去**搜过的那个词；`null` = 这一屏还没搜过。
+     *
+     * 搜索页要判断「说『都没有〈关键词〉』有没有依据」。以前它拿搜索历史兜底
+     * （`history.firstOrNull() == query`），而历史是**跨会话持久**的：成功搜过「三体」
+     * 之后，重进搜索页、只在框里再打一遍这三个字（一个请求都没发），屏上就会写
+     * 「检索了 N 个播放源，都没有「三体」」—— 正是那一行注释声称要避免的假话。
+     * 所以这个信号只在 [search] 里立、在框子改了字或这一屏被擦掉时落。
+     */
+    private val _searchedTerm = MutableStateFlow<String?>(null)
+    val searchedTerm: StateFlow<String?> = _searchedTerm.asStateFlow()
 
     // ---------- 详情 ----------
     private val _detail = MutableStateFlow<MediaDetail?>(null)
@@ -321,22 +371,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun closeSiteBrowser() { _browser.value = null }
 
     /**
-     * 收下站点自己解析出来的那条地址。
+     * 把站点页面里接住的地址交给当前这一集。
      *
      * 只换 streamUrl，源、Referer、这一集都不动 —— 换源会让 Referer 对不上，
      * 而这条地址恰恰是原来那个源给出来的。
-     */
-    /**
-     * 把站点页面里接住的地址交给当前这一集。
      *
      * [headers] 是那条地址被页面请求时带的条件（Referer / Cookie）。
      * 一起带过去，播放器才可能拿到和页面一样的响应 —— 只抄 URL 过去，
      * 那些「只认自己页面」的地址会 404。
+     *
+     * **位置要跟着挪**：`resumeFrom` 是起播那一刻冻结的（换源时必须冻结，见那一段注释），
+     * 而这条路是「同一集换一条地址」，不是换源。不把当前位置并进去，一个看到 45:00
+     * 的人挑对了地址之后会被送回这一集开头 —— 「接住站点给的地址在本机接着播」就成了空话。
+     * 取两边的较大值：用户可能刚拖过进度条（活值更大），也可能活值还没建起来（冻结值更大）。
      */
     fun useSiteLink(link: String, headers: Map<String, String> = emptyMap()) {
         val cur = _playing.value ?: return
         if (!link.startsWith("http")) return
-        _playing.value = cur.copy(streamUrl = link, note = null, streamHeaders = headers)
+        _playing.value = cur.copy(
+            streamUrl = link,
+            note = null,
+            streamHeaders = headers,
+            resumeFrom = maxOf(cur.resumeFrom, _resumePosition.value),
+        )
     }
 
     init {
@@ -652,6 +709,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (q == _query.value) return
         ++searchGen
         _query.value = q
+        // 改了词 = 这一趟不作数了，连同「搜过没有」一起落下来
+        _searchedTerm.value = null
         _searching.value = false
         _results.value = emptyList()
         _searchFailures.value = emptyList()
@@ -673,6 +732,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val mine = ++searchGen
         searchJob?.cancel()
         _query.value = q
+        // 立起「这一词真的发出去过」——搜索页只有拿它才敢说「都没有〈关键词〉」。
+        // 立在这里而不是拿搜索历史兜底，见 [_searchedTerm]。
+        _searchedTerm.value = q
         _results.value = emptyList()
         _searchFailures.value = emptyList()
         searchJob = viewModelScope.launch {
@@ -702,6 +764,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         searchJob = null
         _searching.value = false
         _query.value = ""
+        _searchedTerm.value = null
         _results.value = emptyList()
         _searchFailures.value = emptyList()
     }
@@ -712,6 +775,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         searchJob?.cancel()
         _searching.value = false
         _query.value = ""
+        _searchedTerm.value = null
         _results.value = emptyList()
         _searchFailures.value = emptyList()
     }
@@ -814,6 +878,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 在详情页切源：拿新源里同一部片的详情。 */
     fun switchDetailSource(av: SourceAvailability) {
+        // 点的就是现在这个源：什么也不用做。原来它会照走一遍（把详情整个撤成 null、
+        // 再发一次详情请求 + 一遍跨源扇出），用户看到的是手指下这一格把整页清空重来 ——
+        // 代价是白等一轮网络，收益是零。
+        if (av.sourceId == _activeSourceId.value && _detail.value != null) return
         val mine = ++detailGen
         detailJob?.cancel()
         _switchError.value = null
@@ -1680,20 +1748,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 退出播放（[stopPlaying]）时再补一次，所以最多丢 10 秒。
      */
     fun updatePosition(sec: Long, durationSec: Long = 0L) {
-        _resumePosition.value = sec.coerceAtLeast(0L)
-        // Media3 在没解出时长时给的是 C.TIME_UNSET（Long.MIN_VALUE+1）。轮询那里现在会先归 0，
-        // 但这条是通向落盘的唯一入口，判一下比依赖上游的算术更稳 ——
-        // 那个哨兵值一旦写进记录，「看完了没」就是拿一个负的天文数字在算。
+        // 先归零再写：这一条是通向落盘的唯一入口，负值（C.TIME_UNSET 那一类哨兵）
+        // 一旦写进记录，「看完了没」就是拿一个负的天文数字在算。
+        // 但**0 也要写**：早先这里把 `_resumePosition` 的赋值排在下面那句
+        // `if (sec <= 0L) return` 之前，于是「位置还没解出来」这一拍会把跨源续播的锚点
+        // 冲成 0 —— 换源/重试就从 0:00 重来了。现在负值直接不写，0 照写（那本来就是
+        // 「这一集还没看到哪儿」的诚实答案）。
+        val pos = sec.coerceAtLeast(0L)
+        if (sec >= 0L) _resumePosition.value = pos
         val dur = durationSec.takeIf { it > 0L && it <= MAX_DURATION_SEC } ?: 0L
         if (dur > 0L) lastDurationSec = dur
-        if (sec <= 0L) return
+        if (pos <= 0L) return
         val now = System.currentTimeMillis()
         if (now - lastRecordAt >= 10_000L) {
             lastRecordAt = now
             // 写 lastDurationSec 而不是这一次上报的 dur：换集刚起播那几秒 Media3 常常
             // 只有位置、还没有时长（TIME_UNSET 归 0），拿 dur 写就等于把记录里已经存好的
             // 时长冲成 0 —— 而「看完没看完」「还剩多少」全是拿时长算的。
-            recordWatch(sec, lastDurationSec)
+            recordWatch(pos, lastDurationSec)
         }
     }
 
@@ -1702,6 +1774,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         /** 一集再长也不会超过一天。长过这个的就是哨兵值而不是时长。 */
         const val MAX_DURATION_SEC = 24 * 3600L
+
+        /**
+         * 片库这一份榜单多久算「还新鲜」。
+         *
+         * 豆瓣那些榜本来就是按天的，十分钟不会变出第二种答案；而片库是个 Tab，
+         * 切过去切回来都会重新组合、每次重取就是白敲一趟。
+         */
+        const val DOUBAN_TTL_MS = 10 * 60_000L
     }
 
     /**
@@ -1937,8 +2017,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _doubanItems.value = it.items
             _doubanAt.value = it.at
         }
-        // 每次进片库都去敲豆瓣的门没道理，但也不能拿一个布尔当门闩：
-        // 那一笔要是中途被切榜顶掉了，标记留在 true 上，片库从此不再自动刷新。
+        // 每次进片库都去敲豆瓣的门没道理（这一屏是 Tab，切来切去都会重新组合），
+        // 但也不能拿一个布尔当门闩：那一笔要是中途被切榜顶掉了，标记留在 true 上，
+        // 片库从此不再自动刷新。所以判据是**这一份是什么时候取回来的**：
+        // 还在有效期内就不动，工具栏那颗刷新按钮走 refreshDouban() 强制重取。
+        val fresh = _doubanItems.value.isNotEmpty() &&
+            _doubanAt.value != 0L &&
+            System.currentTimeMillis() - _doubanAt.value < DOUBAN_TTL_MS
+        if (fresh) return
         if (doubanJob?.isActive != true) refreshDouban()
     }
 

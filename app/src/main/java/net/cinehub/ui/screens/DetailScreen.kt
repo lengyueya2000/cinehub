@@ -80,6 +80,7 @@ import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
+import net.cinehub.ui.theme.Touch
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -112,6 +113,15 @@ fun DetailScreen(
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 if (loading) {
                     Text("正在解析详情…", color = T.TextDim, fontSize = Fs.body2)
+                    Spacer12()
+                    // 加载这一支也要给出口：卡住时（源不回话、探测慢）屏上只剩系统返回键，
+                    // 而这一屏连顶栏都还没画出来。错误那一支一直有「返回」，两支摆齐。
+                    Text(
+                        "返回",
+                        color = T.Src500,
+                        fontSize = Fs.sm,
+                        modifier = Modifier.heightIn(min = Touch.min).clickable(onClick = onBack),
+                    )
                 } else {
                     Text(error ?: "没有数据", color = T.Err, fontSize = Fs.body2)
                     Spacer12()
@@ -119,7 +129,8 @@ fun DetailScreen(
                         "返回",
                         color = T.Src500,
                         fontSize = Fs.sm,
-                        modifier = Modifier.clickable(onClick = onBack),
+                        // 同样补足可点高度：这一颗是这一屏唯一的出路
+                        modifier = Modifier.heightIn(min = Touch.min).clickable(onClick = onBack),
                     )
                 }
             }
@@ -207,11 +218,23 @@ fun DetailScreen(
         }
     }
 
-    fun taskFor(ep: Episode) = downloads.firstOrNull {
-        it.sourceId == sid && it.mediaId == d.media.id && it.episodeIndex == ep.index
+    fun cache(ep: Episode) = vm.cache(sid, d.media, ep)
+
+    /**
+     * 这一部在**当前源**下的缓存任务，按集号索引好。
+     *
+     * 原来是每格各自 `downloads.firstOrNull { ... }` 扫一遍：选集是个固定高度、
+     * `userScrollEnabled = false` 的网格（整块就是一个 item，视口等于全部），
+     * 200 集就是 200 次线性扫，而 `downloads` 每来一次进度就换一份新列表 ——
+     * 下载中这里会按进度频率把 O(集数 × 任务数) 重算一遍，底部那颗按钮还再扫一次。
+     * 扫一次建个表，两边都查它。
+     */
+    val taskByEp = remember(downloads, sid, d.media.id) {
+        downloads.filter { it.sourceId == sid && it.mediaId == d.media.id }
+            .associateBy { it.episodeIndex }
     }
 
-    fun cache(ep: Episode) = vm.cache(sid, d.media, ep)
+    fun taskFor(ep: Episode) = taskByEp[ep.index]
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -267,8 +290,13 @@ fun DetailScreen(
                     Text("选集", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
                     Spacer8()
                     Text(
-                        "共 ${d.episodeCount} 集",
-                        color = T.TextFaint,
+                        // 报的必须是**下面这一格真的列出来的**集数。
+                        // episodeCount 是全剧各线路里的最大值，而这一格只渲染当前线路的 eps ——
+                        // 第一条线路只有 12 集、另有线路 28 集时，屏上写着「共 28 集」而底下 12 格，
+                        // 旁边那颗「缓存全部」也只作用于这 12 集。数字和动作都得说同一件事。
+                        if (d.lines.size <= 1) "共 ${eps.size} 集"
+                        else "本线路 ${eps.size} 集 · 全剧共 ${d.episodeCount} 集",
+                        color = T.TextDim,
                         fontSize = Fs.xs,
                     )
                     Box(Modifier.weight(1f))
@@ -279,7 +307,7 @@ fun DetailScreen(
                             fontSize = Fs.xs,
                             fontWeight = FontWeight.SemiBold,
                             // 这一行原来只有 ~20dp 高：它是整条线路唯一的批量入口，点不准就等于没有
-                            modifier = Modifier.clip(R.sm).heightIn(min = 44.dp).clickable {
+                            modifier = Modifier.clip(R.sm).heightIn(min = Touch.min).clickable {
                                 vm.cacheLine(sid, d.media, eps)
                             }.padding(horizontal = 8.dp, vertical = 8.dp),
                         )
@@ -376,7 +404,10 @@ fun DetailScreen(
                     Text("简介", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
                     Spacer8()
                     Text(
-                        cleanIntro(d.intro ?: d.media.intro) ?: "暂无简介",
+                        // 简介的清洗要 remember：这一屏会随 downloads / health / watchHistory
+                        // 的每一次发射重组（下载中就是每秒好几次），而 cleanIntro 里
+                        // 走 24 个实体替换 + 四趟正则 —— 每帧重跑一遍纯属白烧。
+                        remember(d.intro, d.media.intro) { cleanIntro(d.intro ?: d.media.intro) } ?: "暂无简介",
                         color = T.TextDim,
                         fontSize = Fs.sm,
                         lineHeight = Fs.sm * 1.78f,
@@ -657,7 +688,6 @@ private fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
     DownloadStatus.Failed -> "重试缓存"
     null -> "缓存"
 }
-
 /** 播放源面板：横排源卡片，带健康状态与延迟。 */
 @Composable
 private fun SourcePanel(
@@ -678,8 +708,11 @@ private fun SourcePanel(
             Text("播放源", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
             Box(Modifier.weight(1f))
             // 探测要跑好几秒，不给动静的话这按钮看着就是坏的
+            // 高度必须够 44dp：图标 12dp + Fs.xxs 的字，撑起来只有二十来像素，
+            // 而这是这一栏唯一的重测入口 —— 点不准就等于没有（下面「缓存全部」同一条规矩）
             Row(
-                Modifier.clickable(enabled = !checking, onClick = onRescan)
+                Modifier.heightIn(min = Touch.min)
+                    .clickable(enabled = !checking, onClick = onRescan)
                     .padding(horizontal = Sp.s2, vertical = Sp.s1),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -793,6 +826,8 @@ private val ENTITIES = mapOf(
 private val NUMERIC = Regex("&#(x?)([0-9a-fA-F]+);")
 private val TAG = Regex("<[^>]{0,300}>")
 private val BR = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
+/** 行尾的空格/制表符。要 hoist：原来它每次调用现编一个 Pattern。 */
+private val WS_BEFORE_NL = Regex("[ \t]+\n")
 
 /**
  * 源站的简介是 HTML：实体和 `<br/>` 都混在正文里。
@@ -808,5 +843,5 @@ private fun cleanIntro(raw: String?): String? {
         val n = if (hex) m.groupValues[2].toLongOrNull(16) else m.groupValues[2].toLongOrNull()
         if (n != null && n in 1..0x10FFFFL) String(Character.toChars(n.toInt())) else ""
     }
-    return t.replace(Regex("[ \t]+\n"), "\n").trim().takeIf { it.isNotEmpty() }
+    return t.replace(WS_BEFORE_NL, "\n").trim().takeIf { it.isNotEmpty() }
 }

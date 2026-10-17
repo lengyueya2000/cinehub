@@ -3,6 +3,7 @@ package net.cinehub.data.source
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -60,11 +61,39 @@ class MinoProtocolTest {
     }
 
     @Test
-    fun wrongKeyLeavesTextAlone() {
+    fun wrongKeyThrowsInsteadOfReturningCiphertext() {
         val text = """{"code":1,"data":{"enc":1,"payload":"$payload"},"msg":"ok"}"""
         val other = ByteArray(32) { (it + 1).toByte() }
-        // tag 验不过 → 原样带回，由上层说「答的样子不认识」，而不是拿乱码继续解析
-        assertEquals(text, MinoProtocol.unwrapEnvelope(text, other))
+        // **不**原样带回：原样带回的话上层会拿这段密文当明文去解析 —— 它是一份合法 JSON、
+        // code 也是 1，只是找不到 data.videos，于是界面报「这个源里没有这部片」。
+        // 真相是密钥不对/接口改了，那是句假话。所以这里必须响。
+        assertThrows(MinoProtocol.EnvelopeFailure::class.java) {
+            MinoProtocol.unwrapEnvelope(text, other)
+        }
+    }
+
+    @Test
+    fun undecodablePayloadThrowsInsteadOfReturningCiphertext() {
+        // 信封认出来了（enc == 1 且有 payload），但 payload 不是 base64：
+        // 同样是「认出来了却打不开」，要响，不能静默退回密文
+        val text = """{"code":1,"data":{"enc":1,"payload":"!!!not-base64!!!"}}"""
+        assertThrows(MinoProtocol.EnvelopeFailure::class.java) {
+            MinoProtocol.unwrapEnvelope(text, bodyKey)
+        }
+    }
+
+    @Test
+    fun envelopeWithWhitespaceBeforeColonSplicesCorrectly() {
+        // `"data" :` 是合法 JSON。原来锚点用字面量 indexOf("\"data\":") 找，
+        // 找不到就静默退回密文 —— 后端只要在冒号前多打一个空格，整条链路就成了
+        // 「没有这部片」。两处 splice（unwrapEnvelope / envelopeEnd）都得认这个写法。
+        val text = """{"code":1,"data" :{"enc":1,"payload":"$payload"},"msg":"success"}"""
+        val out = MinoProtocol.unwrapEnvelope(text, bodyKey)
+        val root = out.jsonRootOrNull() ?: return assertTrue("拆完解不出 JSON：$out", false)
+        assertEquals(1, root.intOf("code"))
+        assertEquals("success", root.str("msg"))
+        val data = root["data"]?.asObjectOrNull() ?: return assertTrue("data 不是对象：$root", false)
+        assertEquals(1535960L, data["vod_id"]?.asPrimitiveOrNull()?.content?.toLongOrNull())
     }
 
     @Test

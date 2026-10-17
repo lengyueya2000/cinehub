@@ -115,7 +115,10 @@ fun HomeScreen(
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(bottom = Sp.s6),
+            // 豆瓣对不上时那条横幅贴在底部，会盖住最后一行海报：它不在滚动流里，
+            // 只留 Sp.s6 的话最后一行既被挡住、又没有可滚的余量把它挪出来。
+            // 横幅起来时把底垫加高（横幅本身约 70~80dp），松手后恢复原样。
+            contentPadding = PaddingValues(bottom = if (miss != null) 96.dp else Sp.s6),
         ) {
             item {
                 Row(
@@ -235,7 +238,7 @@ fun HomeScreen(
                             contentPadding = PaddingValues(horizontal = Sp.s4),
                             horizontalArrangement = Arrangement.spacedBy(Sp.s3),
                         ) {
-                            items(resume) { e ->
+                            items(resume, key = { it.key }) { e ->
                                 ResumeCard(e) { vm.resumeFromHistory(e) }
                             }
                         }
@@ -471,7 +474,10 @@ private fun ResumeCard(e: HistoryEntry, onClick: () -> Unit) {
         Spacer4()
         Text(
             e.where,
-            color = T.TextFaint,
+            // 这一行说的是「第几集 · 看到第几分钟」，是这张卡的重点信息，
+            // 和 PosterCard 的副标题同一条规矩：承载信息的文字一律 TextDim，
+            // TextFaint 在 T.Surface2 上只有 3.02:1，够不上正文地板
+            color = T.TextDim,
             fontSize = Fs.tiny,
             maxLines = 1,
             modifier = Modifier.padding(horizontal = 6.dp).padding(bottom = 7.dp),

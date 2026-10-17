@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import net.cinehub.data.model.AuthMode
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
@@ -12,7 +13,6 @@ import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.StreamUrls
 import net.cinehub.data.model.VideoPlatforms
-import net.cinehub.data.model.userNote
 import net.cinehub.data.net.Http
 import net.cinehub.data.quietly
 import net.cinehub.data.shortReason
@@ -77,9 +77,29 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
 
     private val base: String = config.baseUrl.trim().trimEnd('/')
 
-    /** 站点给本机签发的匿名会话 Cookie。只保存站点自己发回来的东西。 */
+    /**
+     * 站点给本机签发的匿名会话 Cookie。只保存站点自己发回来的东西。
+     *
+     * 用户填的凭证只有选了 **[AuthMode.Cookie]** 时才落进这一份（那样它确实是以 Cookie
+     * 的形式发出去的）；选了 [AuthMode.Bearer] 的那份走 [userAuth] 的 `Authorization`
+     * 头，**不在这里** —— 原来不管用户选什么，token 都从这个字段当成 Cookie 发出去，
+     * 于是一个只认 Bearer 的站点永远收不到它，而界面上只是「填了凭证还是没权限」，
+     * 查不出原因。这一份还兼着站点下发的匿名会话，两者是两件事。
+     */
     @Volatile
-    private var sessionCookie: String? = config.authToken?.takeIf { it.isNotBlank() }
+    private var sessionCookie: String? =
+        if (config.authMode == AuthMode.Bearer) null
+        else config.authToken?.takeIf { it.isNotBlank() }
+
+    /**
+     * 用户填的凭证里，需要以**独立请求头**发出去的那一份。
+     *
+     * 只有 Bearer 走这里（[Http.authHeaders] 给的是 `Authorization: Bearer …`）；
+     * Cookie 那一份已经并进 [sessionCookie]，再带上一次就是同一个凭据发两颗。
+     * 站点下发的匿名会话仍按原来的方式跟在 Cookie 头上，两者互不顶替。
+     */
+    private val userAuth: Map<String, String>
+        get() = if (config.authMode == AuthMode.Bearer) Http.authHeaders(config) else emptyMap()
 
     /**
      * 把站点新发回来的 Cookie 并进已有那一份，而不是整条替换。
@@ -126,11 +146,13 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * 带签名地取一次 JSON。
      *
      * 第一次调用会先建匿名会话（站点自己的流程，等于浏览器里的未登录访客），
-     * 之后带上它发回来的 Cookie。
+     * 之后带上它发回来的 Cookie。用户选了 Bearer 的那份凭证另走 `Authorization`
+     * 头（见 [userAuth]），与站点的匿名会话并存、互不顶替。
      */
     private suspend fun api(pathAndQuery: String, method: String = "GET"): String {
         val headers = AiMovieSign.headers(method, pathAndQuery).toMutableMap()
         sessionCookie?.let { headers["Cookie"] = it }
+        headers.putAll(userAuth)
         val body = Http.getWithHeaders(
             url = base + pathAndQuery,
             headers = headers,
@@ -152,6 +174,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
         val headers = AiMovieSign.headers("POST", pathAndQuery).toMutableMap()
         headers["Content-Type"] = "application/json"
         sessionCookie?.let { headers["Cookie"] = it }
+        headers.putAll(userAuth)
         val r = Http.post(
             url = base + pathAndQuery,
             json = payload,
@@ -331,7 +354,6 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
         val label: String,
         val url: String,
         val kind: String,
-        val resolved: Boolean,
         val weight: Long,
         /**
          * 官方线路的票证。
@@ -472,7 +494,6 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
                 label = labelOf(o) ?: "线路",
                 url = url,
                 kind = o.str("url_kind") ?: "",
-                resolved = o["resolved"]?.primitiveOrNull()?.content == "true",
                 weight = o["preference_weight"]?.primitiveOrNull()?.content?.toLongOrNull() ?: 0L,
                 // 站点自己的取票顺序（抄它前端那套判断）：显式的 resolve_ticket 字段，
                 // 或者 url 就是 resolve://<票>，或者它自己标了 url_kind == resolve_ticket

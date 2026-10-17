@@ -121,7 +121,7 @@ private const val SETTLED_NOTICE_MS = 10_000L
  * 这里先认出来再换算 —— 这两个值一路会写进观看记录，
  * 而「看完了没」是拿时长算的，靠「除一千再取非负」刚好抹平是在赌上游不改。
  */
-private fun msToSec(ms: Long): Long = if (ms < 0L || ms == androidx.media3.common.C.TIME_UNSET) 0L else ms / 1000
+private fun msToSec(ms: Long): Long = if (ms < 0L) 0L else ms / 1000
 
 /**
  * 播放器。
@@ -150,13 +150,14 @@ fun PlayerScreen(
     val sibGaps by vm.playingSiblingsGaps.collectAsState()
     val health by vm.health.collectAsState()
     val detail by vm.playingDetail.collectAsState()
-    val resumeFrom by vm.resumePosition.collectAsState()
     val resolving by vm.resolving.collectAsState()
     val fallback by vm.fallback.collectAsState()
     /** 此刻在小窗里吗 —— 由 Activity 写进来，界面读它决定控件摆不摆。 */
     val inPip by vm.inPip.collectAsState()
 
-    var pos by remember { mutableLongStateOf(resumeFrom) }
+    // 只取**此刻**那个值当初始位置，不订阅：vm.resumePosition 是播放器每 500ms 报一次的
+    // 活值，collectAsState 会让这整屏（1800 行）跟着以 2 Hz 全量重组，而这里只用得上一次。
+    var pos by remember { mutableLongStateOf(vm.resumePosition.value) }
     var dur by remember { mutableLongStateOf(0L) }
     /** 用户意图，不是 player.isPlaying —— 后者在 HLS seek/buffer 期间会短暂为 false，按钮会闪成「已暂停」。 */
     var wantsPlay by remember { mutableStateOf(true) }
@@ -171,6 +172,13 @@ fun PlayerScreen(
     var attemptUrl by remember { mutableStateOf<String?>(null) }
     /** 这一次播放渲染过第一帧没有 —— 起播看门狗只看这一位。 */
     var firstFrame by remember { mutableStateOf(false) }
+    /**
+     * 用户在这一笔上手点了「重试」几次。
+     *
+     * 它只用来给看门狗换一个键（见下面那条 effect）：重试时地址/集号/源一个都没变，
+     * 而看门狗那 20 秒早就走完了 —— 不做这件事，重试后的流卡在缓冲里就再没人管。
+     */
+    var attemptTick by remember { mutableIntStateOf(0) }
     /** 告知横幅上的「一路试过哪些源」展开没有。 */
     var fbExpanded by remember { mutableStateOf(false) }
 
@@ -238,9 +246,12 @@ fun PlayerScreen(
 
                     override fun onPlayerError(e: PlaybackException) {
                         val why = "播放失败：${e.message ?: e.cause?.message ?: "未知错误"}"
-                        errText = why
-                        // 交给自动换源：还有没试过的线路或源就往下走，界面这条错误只是它没走通时的结果。
-                        // 报的是「当时在放哪条地址」，不是屏上现值 —— 见 attemptUrl 那段。
+                        // 换了线路之后，旧播放器还会**晚一拍**把上一条线路的错误送上来
+                        // （这一条在 reportPlaybackFailure 那段的注释里写着）。
+                        // 状态机靠 attemptUrl 把那一笔挡在账外；界面这一句也得一样挡 ——
+                        // 否则新那条线路明明已经在放，屏上却盖着一整页「播放失败」，
+                        // 底下还摆一颗会去 prepare 这条健康流的「重试」。
+                        if (attemptUrl == playing?.episodeUrl) errText = why
                         vm.reportPlaybackFailure(why, attemptUrl)
                     }
 
@@ -256,8 +267,6 @@ fun PlayerScreen(
     // 换源 / 换集 / 换线路时重建媒体源；用 resumeFrom 保证进度接续
     LaunchedEffect(playing?.streamUrl, playing?.episodeUrl, playing?.episodeIndex, playing?.sourceId) {
         val url = playing?.streamUrl
-        // 从这一刻起，播放器报错就算在这条地址头上（见 attemptUrl）
-        attemptUrl = playing?.episodeUrl
         // 右侧那栏「线路 N/M」得跟着换：自动换源现在会在同一个源里换线路，
         // 不跟着挪的话屏上写的是第 1 条、实际播的是第 2 条 —— 和当年换源不重置 lineIndex 是同一类谎。
         // 认不出这条地址属于哪一条线路时回到第 1 条（本地缓存那种就没有线路可选）。
@@ -328,6 +337,12 @@ fun PlayerScreen(
         // 上面那个 null 分支里 player.stop() 一次，才走到这里。stop() 对估计做了什么
         // 没有实测过 —— 原来这段注释断言的是「不 stop 所以估计留着、起播直接落到上一集
         // 那一档」，那句是没有依据的，留着只会让人以为这条优化已经生效。
+        //
+        // attemptUrl 就在**这里**认账，不能在 effect 开头：那一段里 vm.play() 刚发出来的
+        // null-URL 帧会让它先指着新地址，而播放器手里还是上一条媒体 —— 旧媒体晚一拍报错时
+        // 就会算到新那一笔头上，把一条从没试过的线路跳掉。放在换源这一刻，
+        // 「播放器在放哪一条」与「账上记着哪一条」才是同一件事。
+        attemptUrl = playing?.episodeUrl
         player.setMediaSource(source)
         player.prepare()
         // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 轮询会把那个活值写成 0，
@@ -344,7 +359,11 @@ fun PlayerScreen(
     // 从第 18 分钟续起来的这一笔，位置一上来就不是 0，看门狗于是永远不开火，
     // 而恰恰是这类源最需要在起不来时换走。纯音频流不回首帧回调是真的，
     // 但它会进 READY，那正是「确实播开了」的证据。
-    LaunchedEffect(playing?.streamUrl, playing?.episodeUrl, playing?.episodeIndex, playing?.sourceId) {
+    //
+    // 键里带上 attemptTick：用户在报错面板上点「重试」时，地址、集号、源都没变，
+    // 这一条 effect 的 delay 却早就走完了 —— 不重新起一轮的话，重试后的流要是
+    // 一直卡在 BUFFERING，就再没有看门狗会开火，屏上永远停在「缓冲中…」。
+    LaunchedEffect(playing?.streamUrl, playing?.episodeUrl, playing?.episodeIndex, playing?.sourceId, attemptTick) {
         if (playing?.streamUrl.isNullOrBlank()) return@LaunchedEffect
         delay(STARTUP_GRACE_MS)
         val st = player.playbackState
@@ -475,14 +494,43 @@ fun PlayerScreen(
      *
      * 唯一的例外是小窗：上面那三条抱怨的「看不见、关不掉」，那颗悬浮窗本身就把入口和
      * 关得掉都给了，所以它里面不许停。
+     *
+     * 判「在小窗里吗」读的是 **Activity 现在的真实状态**，不是 [AppViewModel.inPip] 那个标志位：
+     * 用户点小窗的 × 时，onStop 可能先于 onPictureInPictureModeChanged(false) 到达 ——
+     * 那一刻标志位还是 true，只认它就会把这一停豁免掉，声音于是留在后台。
      */
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && player.playWhenReady && !vm.inPip.value) player.pause()
+            if (event != Lifecycle.Event.ON_STOP) return@LifecycleEventObserver
+            val stillInPip = activity?.isInPictureInPictureMode == true
+            if (player.playWhenReady && !stillInPip) player.pause()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    /**
+     * 小窗被关掉时停住。
+     *
+     * 点小窗那个 ×，有的系统不把 Activity 收掉、只把窗口藏起来 —— 那条路上这里
+     * 收不到有效的 ON_STOP（进小窗时那次已被「在小窗里」豁免），于是画面没了、
+     * 声音还在后台响。Activity 确认「没回到前台」后递来这一声，这里停播放，
+     * 并把最后那一段位置补写一次（平时每 10 秒才落一次盘，不补就丢了）
+     * 和其余设置一并留给下次续播。
+     *
+     * 收的是 `SharedFlow`（replay = 0）而不是一个时间戳：这一声是一次性的，
+     * 没人听的时候就该丢掉。早先那版把它存在 StateFlow 里且从不清零，于是**下一次**
+     * 进播放器时这个 effect 会拿着陈旧的值再跑一遍，把用户刚点的这一集当场暂停。
+     */
+    LaunchedEffect(Unit) {
+        vm.pipDismissed.collect {
+            if (player.playWhenReady) {
+                // 先落一次盘：小窗里放到的位置不该因为「还没到那 10 秒」就丢掉
+                runCatching { vm.updatePosition(msToSec(player.currentPosition), msToSec(player.duration)) }
+                player.pause()
+            }
+        }
     }
 
     DisposableEffect(Unit) {
@@ -609,8 +657,14 @@ fun PlayerScreen(
     }
 
     fun seekBy(deltaMs: Long) {
-        val target = (player.currentPosition + deltaMs)
-            .coerceIn(0, (player.duration.coerceAtLeast(0)))
+        // 时长还没解出来时 `duration` 是 C.TIME_UNSET（负的哨兵）。原来那句
+        // `coerceAtLeast(0)` 把钳位变成 `coerceIn(0, 0)` —— 于是准备阶段双击、
+        // 按 ±10s 都会**跳到 0:00**，而提示还写着「快进 10 秒」。不知道总长就不许跳：
+        // 这一格本来就还没法定一个合法的落点。
+        val dur = player.duration
+        val cur = player.currentPosition
+        if (dur <= 0L || cur < 0L) return
+        val target = (cur + deltaMs).coerceIn(0L, dur)
         player.seekTo(target)
         hint = if (deltaMs > 0) "快进 ${deltaMs / 1000} 秒" else "快退 ${-deltaMs / 1000} 秒"
         controls = true; lastUi = System.currentTimeMillis()
@@ -953,6 +1007,11 @@ fun PlayerScreen(
                                             (playing?.resumeFrom ?: 0L) * 1000
                                         else it
                                     }
+                                    // 这一笔重新算一次「刚起播」：首帧标记归位、缓冲态挂上，
+                                    // 再看门狗换一个键重新起一轮 —— 不然重试后卡在缓冲里没人管
+                                    firstFrame = false
+                                    buffering = true
+                                    attemptTick++
                                     player.prepare()
                                     player.play()
                                     if (back > 0L) player.seekTo(back)

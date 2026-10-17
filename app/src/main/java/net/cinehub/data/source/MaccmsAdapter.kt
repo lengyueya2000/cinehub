@@ -5,9 +5,6 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
@@ -69,7 +66,8 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
         // id 是从列表页/别的源手里接过来的字符串，原样拼进查询串就等于让它替我们决定
         // 这次请求长什么样（带一个 `&` 就能多出个参数）。填之前编一次。
         val url = abs(rules.detailPath.replace("{id}", java.net.URLEncoder.encode(id, "UTF-8")))
-        val root = json.parseToJsonElement(fetch(url)).jsonObject
+        val root = jsonRootObject(fetch(url))
+            ?: error("详情接口答的不是一份 JSON 对象（这一路可能不是这一型接口，或它改版了）")
         val item = firstListItem(root) ?: error("详情接口无数据")
 
         val media = Media(
@@ -142,15 +140,30 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     private fun firstListItem(root: JsonObject): JsonObject? {
-        (root[rules.listField] as? JsonArray)?.firstOrNull()?.let { return it.jsonObject }
+        (root[rules.listField] as? JsonArray)?.firstOrNull()?.let { o ->
+            (o as? JsonObject)?.let { return it }
+        }
         // 有些接口直接把数据放在 data 下
         (root["data"] as? JsonObject)?.let { d ->
-            (d[rules.listField] as? JsonArray)?.firstOrNull()?.let { return it.jsonObject }
+            (d[rules.listField] as? JsonArray)?.firstOrNull()?.let { o ->
+                (o as? JsonObject)?.let { return it }
+            }
             if (d.containsKey(rules.titleField)) return d
         }
         if (root.containsKey(rules.titleField)) return root
         return null
     }
+
+    /**
+     * 正文解析成 JSON 对象；不是对象（或是无效 JSON）返回 null，不抛。
+     *
+     * 原来这里用的是 kotlinx 的 `jsonObject`：那是一句会抛的取值（合法 JSON、但长得是
+     * 数组/数字时抛 `IllegalArgumentException("Element class JsonArray is not a JsonObject")`），
+     * 于是「接口答的不是我们预期的那份形状」会被显示成一句内部实现的话。
+     * 未识别的形状由调用方按自己的话说清楚（见 [detail] / [parseList]）。
+     */
+    private fun jsonRootObject(body: String): JsonObject? =
+        runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull()
 
     /**
      * 把列表接口读成条目。
@@ -162,9 +175,8 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
      * 否则用户会拿着一句假话去换关键词、换源，而真正该改的是这个源的规则。
      */
     private fun parseList(body: String): List<Media> {
-        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrElse {
-            error("这个源给回来的不是 JSON，接口形态多半已经改了")
-        }
+        val root = jsonRootObject(body)
+            ?: error("这个源答的不是一份 JSON 对象（不是有效 JSON，或者根上是个数组/标量）—— 接口形态多半已经改了")
         val arr = (root[rules.listField] as? JsonArray)
             ?: ((root["data"] as? JsonObject)?.get(rules.listField) as? JsonArray)
         if (arr == null) {
@@ -196,8 +208,17 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     /**
-     * 从分集名字里认那个编号：`第12集`、`12期`、`HD 7 4K` 里那个 7 都算。
-     * 认不出来返回 null，由调用方退回按位置数。
+     * 从分集名字里认那个编号，认不出来返回 null，由调用方退回按位置数。
+     *
+     * 只认两种写法：
+     * - `第12集` / `12期` / `第 3 话` —— 编号带着集/期/话那个量词（[EP_NO]，数字前后
+     *   的空格也认）；
+     * - **以数字开头**的名字，取开头那个 1~3 位数（[EP_LEADING]），例如 `12`、`7 4K`。
+     *
+     * 注意第二种要求数字在**最前面**：`HD 7 4K` 这种编号夹在中间的写法**不认**，
+     * 它返回 null，于是这一集的 index 退回按位置数（i + 1）。这类名字上按位置数与
+     * 真实集号可能差着一格，这是明知的行为（见 detail() 里那段说明）—— 想认它得再加一条
+     * 正则，而位置回退是兜底的承重件，不动它。
      */
     private fun episodeNoOf(name: String): Int? {
         EP_NO.find(name)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }

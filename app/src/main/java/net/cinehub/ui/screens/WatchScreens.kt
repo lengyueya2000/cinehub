@@ -200,9 +200,11 @@ private fun FavoriteTile(fav: Fav, where: HistoryEntry?, onOpen: () -> Unit, onD
                     Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = .72f)), startY = 320f)
                 ),
             )
-            // 视觉是颗 24 的圆，可点区域 44 —— 小图标最容易点不中的就是这种角标
+            // 视觉是颗 20 的圆，可点区域 44 —— 这里不再垫 padding：
+            // 原来写的 `size(44.dp)…padding(2.dp)…clickable(...)` 把内边距算在 size 里面，
+            // 可点节点实际只有 40×40，够不着 44 这条下限。内圈那 20 的圆本来就居中，不需要垫。
             Box(
-                Modifier.size(44.dp).align(Alignment.TopEnd).padding(2.dp)
+                Modifier.size(44.dp).align(Alignment.TopEnd)
                     .clip(CircleShape).clickable(onClick = onDrop),
                 contentAlignment = Alignment.Center,
             ) {

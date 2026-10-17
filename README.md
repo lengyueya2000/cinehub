@@ -138,7 +138,7 @@ app/src/main/java/net/cinehub/
 
 两点实现取舍，避免看依赖清单时产生误会：
 
-- 路由是 `CineHubApp.kt` 里一个手写的 `sealed interface Route`（Home / Search / Detail / Player / Library / Sources / SourceManage / Downloads / Favorites / History），配 `BackHandler` 做逐级回退。`navigation-compose` 在依赖里但没被用到 —— 十来个屏、状态又都在一个 ViewModel 里，手写路由比引一套 NavHost 更直接。
+- 路由是 `CineHubApp.kt` 里一个手写的 `sealed interface Route`（Home / Search / Detail / Player / Library / Sources / SourceManage / Downloads / Favorites / History），配 `BackHandler` 做逐级回退。十来个屏、状态又都在一个 ViewModel 里，手写路由比引一套 `NavHost` 更直接 —— 所以 `navigation-compose` 那条依赖已经删掉了（它一行都没被用到，留着只是多拽几个传递依赖让 R8 处理）。
 - 播放器用的是 `DefaultHttpDataSource`（`PlayerScreen.kt`），不是 OkHttp 那个 datasource。抓取页面走 OkHttp，播放流走 Media3 自带实现，两者互不干扰。
 
 

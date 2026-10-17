@@ -144,11 +144,32 @@ fun SiteBrowserScreen(
                 // 那道题上，题的计时器被冻住就再也不会回话，30 秒暖机白等，最后报
                 // 「这个源接不进来了」，还把那个源在健康表里判死。全项目没有任何一处 onResume
                 // 能把它解开来，这份假死一直留到进程重启。
-                runCatching { wv.evaluateJavascript(PauseMediaJs, null) }
+                //
+                // 收尾必须等脚本跑完再拆。`evaluateJavascript` 是**异步**的：它把这段脚本
+                // 丢进渲染器就返回，结果（这里不关心）稍后才回调回主线程。紧接着就 destroy，
+                // 等于在脚本执行之前把渲染器拆了 —— 那一句「让页面自己把媒体停了」从来没执行过，
+                // 只剩 stopLoading()，而它管不住一个**已经在播**的 <video>。
+                // 所以收尾放进它的回调里，并留一条有界的兜底：WebView 已经死了就不会回调，
+                // 那种情况也不能把这次销毁漏掉。
+                var disposed = false
+                fun detachAndDestroy() {
+                    if (disposed) return
+                    disposed = true
+                    // 必须先从父布局摘出来再 destroy，否则 WebView 被父 view 引用着，销毁不掉、还泄漏
+                    runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
+                    runCatching { wv.destroy() }
+                }
                 runCatching { wv.stopLoading() }
-                // 必须先从父布局摘出来再 destroy，否则 WebView 被父 view 引用着，销毁不掉、还泄漏
-                runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
-                runCatching { wv.destroy() }
+                val posted = runCatching {
+                    wv.evaluateJavascript(PauseMediaJs) { detachAndDestroy() }
+                }.isSuccess
+                if (!posted) {
+                    detachAndDestroy()
+                } else {
+                    // handler 挂在 wv 自己身上，它要是已经被回收了这颗就永远不会跑 ——
+                    // 所以上面那条回调仍然是主路，这一颗只是兜底。
+                    runCatching { wv.postDelayed({ detachAndDestroy() }, 500L) }
+                }
             }
             // 会话要落盘，不能清。这一页有两个用处：接住直链，以及从「播放源管理 → 站点」
             // 进来登用户自己的账号 —— README 写的边界就是「凭证只留在本机 WebView 的 cookie 里」。

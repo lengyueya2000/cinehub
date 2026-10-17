@@ -54,11 +54,35 @@ internal object MacPlayerJson {
         return null
     }
 
-    /** 页面标题 —— 有的站把它当作签名原文的一部分（见 [MaccmsParseResolver]）。 */
-    fun title(html: String): String =
-        TITLE.find(html)?.groupValues?.get(1).orEmpty()
+    /**
+     * 页面标题 —— 有的站把它当作签名原文的一部分（见 [MaccmsParseResolver]）。
+     *
+     * 标题参与解析站的签名，所以读不到不能悄悄给一个空串：空标题算出来的签名是错的，
+     * 用户看到的是解析站一句笼统的失败，而真正的原因（这一版正则跟不上这页的写法）查不出来。
+     * 读不到时抛出去，由调用方按「这一页读不出标题」说清楚。
+     *
+     * `DOT_MATCHES_ALL` 是必需的：模板把 `<title>` 折行写、或者标题里有换行很常见，
+     * 少了它 `.` 不匹配换行，整段就匹配不上 —— 结果是一个空标题（上面说的那条错链）。
+     * 实体也要还原：页面上写的是 `&amp;`、`&#39;`、`&quot;`，而签名原文用的是字符本身。
+     */
+    fun title(html: String): String {
+        val raw = TITLE.find(html)?.groupValues?.get(1).orEmpty()
+        val text = unescape(raw).trim()
+        if (text.isEmpty()) error("播放页里读不出标题（它参与签名，空着算出来的签名是错的）—— 这个模板多半改版了")
+        return text
+    }
 
-    private val TITLE = Regex("""(?i)<title[^>]*>(.*?)</title>""")
+    /** 页面标题里最常见的几个 HTML 实体；认不出的原样留着（宁可多留一个字符，也别猜错）。 */
+    private fun unescape(s: String): String = s
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+
+    private val TITLE = Regex("""(?i)<title[^>]*>(.*?)</title>""", RegexOption.DOT_MATCHES_ALL)
 }
 
 /** 这段 JSON 全是 `{"key":"value"}`，取值按字符串拿就够了（`code` 那种数字也是字符串形式）。 */

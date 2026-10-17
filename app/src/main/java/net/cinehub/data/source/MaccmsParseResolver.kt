@@ -42,6 +42,9 @@ internal object MaccmsParseResolver {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
+    /** AES-128-CBC 的钥匙与 IV 都必须是 16 字节（分组长度）。 */
+    private const val AES_BLOCK_BYTES = 16
+
     /** 站点加载的那段 iframe 模板；解析站地址就写在自己的 `src` 里。 */
     private val IFRAME_SRC = Regex("""src="(https?://[^"']+?)/player/\?url=""")
 
@@ -98,7 +101,16 @@ internal object MaccmsParseResolver {
         val key = obj.field("aes_key")
         val iv = obj.field("aes_iv")
         if (key == null || iv == null) error("解析站没下发解密的钥匙")
-        val stream = aesDecrypt(cipher, deplay(rc4Key, key), deplay(rc4Key, iv))
+        // 空串也是「下发了」，但解出来是零长的 ByteArray：RC4 会撞上 key[i % 0]（报 / by zero），
+        // 长度不对的则会在 Cipher 里变成 InvalidKeyException。两句都不是用户能读懂的话，
+        // 也不是这条线路的真实成因。AES-128-CBC 只认 16 字节的钥匙与 16 字节的 IV，
+        // 所以按这个卡死，不合适的都归到同一句人话上。
+        val aesKey = deplay(rc4Key, key)
+        val aesIv = deplay(rc4Key, iv)
+        if (aesKey.size != AES_BLOCK_BYTES || aesIv.size != AES_BLOCK_BYTES) {
+            error("解析站没下发可用的解密钥匙 —— 换一条线路试试")
+        }
+        val stream = aesDecrypt(cipher, aesKey, aesIv)
         if (!stream.startsWith("http")) error("解析站解出来的不是一个地址")
         return StreamResolution.Ready(stream)
     }
@@ -185,8 +197,13 @@ internal object MaccmsParseResolver {
      * RC4（KSA 摆表 + PRGA 出字节）。脚本里这个函数叫 `aesplay` —— 名字是它自己叫错的。
      *
      * JS 那边 key/data 走的是 charCodeAt 的字符码；这几处的输入全是 ASCII，按字节走与它一字不差。
+     *
+     * 空 key 直接拒绝：`key[i % key.size]` 会抛 `ArithmeticException: / by zero`，
+     * 那是一条会显示给用户看的内部错误。空 key 只可能来自一份没下发的钥匙，
+     * 调用方（见 [resolve]）本来就该按「没下发可用的解密钥匙」去说。
      */
     private fun rc4(key: ByteArray, data: ByteArray): ByteArray {
+        require(key.isNotEmpty()) { "解析站没下发可用的解密钥匙 —— 换一条线路试试" }
         val s = IntArray(256) { it }
         var j = 0
         for (i in 0 until 256) {

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ 的备份 / 设备迁移规则（旧版本走下面的 fullBackupContent）。
+
+  要挡住的只有一份东西：`cinehub` 那份 DataStore 里的 `authToken` ——
+  用户为了让某个源能取到内容而填的站点凭证（Cookie / token）。
+  它明文躺在内部存储里，而默认的自动备份会把内部存储整个搬去云端，
+  等于把用户的凭证复制到这台设备之外。这一条和 Http 那份
+  「会话 cookie 只活在进程里、绝不落盘」是同一个取舍，所以在这里对齐。
+
+  收藏、观看进度、播放源列表、缓存任务清单都**照常备份** ——
+  那些是用户自己攒的东西，换机时正该跟着走。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="datastore/cinehub.preferences_pb" />
+        <exclude domain="file" path="datastore/cinehub_downloads.preferences_pb" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="datastore/cinehub.preferences_pb" />
+        <exclude domain="file" path="datastore/cinehub_downloads.preferences_pb" />
+    </device-transfer>
+</data-extraction-rules>

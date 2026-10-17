@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -30,6 +31,7 @@ import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.SourceConfig
 import net.cinehub.data.model.StreamResolution
+import net.cinehub.data.model.StreamUrls
 import net.cinehub.data.model.userNote
 import net.cinehub.data.net.Http
 import net.cinehub.data.net.await
@@ -66,6 +68,25 @@ class DownloadRepository(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
+     * 这一份仓库退休：把还在跑的下载全部停下。
+     *
+     * VM 是 activity 作用域的，而这个仓库持着一颗**独立的** CoroutineScope。
+     * 不关它的话，退出应用（Activity 销毁、进程还活着）再进来就会得到第二颗引擎：
+     * 两份内存清单指向同一批目录和同一个 DataStore 键，一边在写、另一边在算，
+     * 而「同时最多 3 集」那个闸门也变成每条一份 —— 实际并发翻倍。
+     *
+     * 这里只取消协程、不清理盘上任何东西：用户已缓存的那几集必须原样留着。
+     */
+    fun close() {
+        jobs.keys.toList().forEach { id ->
+            pausedByUser += id
+            runCatching { cancelCalls(id) }
+        }
+        jobs.clear()
+        scope.cancel()
+    }
+
+    /**
      * 在跑的那一笔。
      *
      * 用一层壳而不是直接存 Job：Job 要 launch 之后才拿得到，而协程可能在存进 map 之前
@@ -100,6 +121,17 @@ class DownloadRepository(
     private val KEY_SEG_PARALLEL = intPreferencesKey("seg_parallel")
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
+
+    /**
+     * 盘上那一份读回来了没有。
+     *
+     * 落盘是整份覆盖写（见 [saveNow]），而内存这份一开始是**空的** —— 读盘还没回来就让
+     * 一次用户操作落了盘，写下去的就是「一个任务都没有」，用户已存的任务清单当场没了；
+     * [load] 随后把盘上那份（已经被冲掉的那份）合并进来，也救不回来。
+     * 所以读回来之前一律不落盘。`PlaybackRepository` 一直是这么做的，这里补上。
+     */
+    @Volatile
+    private var loaded = false
 
     /**
      * 落盘那份读不通了。和 [SourceRepository.unreadable] 同一件事：
@@ -209,7 +241,15 @@ class DownloadRepository(
             runCatching { rootDir.listFiles()?.filter { it.isDirectory } ?: emptyList() }.getOrNull()
         } ?: return
         withContext(Dispatchers.IO) {
-            dirs.filterNot { it.name in live }.forEach { runCatching { it.deleteRecursively() } }
+            // 列目录之后到删之前是挂起的（上面那次 withContext），这期间用户完全可能刚排了
+            // 一个任务、mkdirs 已经落下 —— 只认开头抓的那份 `live` 就会把它当场删掉。
+            // 所以每删一条之前重新问一次：这一条现在还不在册吗。
+            dirs.forEach { d ->
+                if (live.contains(d.name)) return@forEach
+                // 不在开头那份名单里、但现在已经在册了 —— 是刚排上的，留着
+                if (_tasks.value.any { it.id == d.name }) return@forEach
+                runCatching { d.deleteRecursively() }
+            }
         }
     }
 
@@ -315,7 +355,14 @@ class DownloadRepository(
         scope.launch {
             // 先等这一条真正停下来再清目录，否则它手上那半截写入会把删空的目录又填回去
             run?.job?.join()
-            runCatching { dirOf(id).deleteRecursively() }
+            // 等它停的这段时间里用户完全可能又点了同一集的「缓存」—— 任务 id 是按
+            // （源、片、集）算出来的，重下的就是同一个 id、同一个目录。
+            // 不看一眼就 deleteRecursively，删掉的是**新那一笔**刚写下的文件
+            // （HLS 那边 index.m3u8 还会晚一步落盘，于是任务标成 Done /「可离线播放」，
+            // 而分片已经不在盘上了）。所以只有「这一条确实还不在册」才清目录。
+            if (!_tasks.value.any { it.id == id }) {
+                runCatching { dirOf(id).deleteRecursively() }
+            }
             // 任务没了，名字也得跟着从「用户自己按的暂停」里摘掉：id 是按（源、片、集）算的，
             // 留着它，以后重下同一集时真失败会被当成用户暂停而一句原因都不写。
             pausedByUser -= id
@@ -367,6 +414,11 @@ class DownloadRepository(
     }
 
     private suspend fun runTask(id: String, self: Run) {
+        // 动手之前先认一次自己还是不是当代那一笔。
+        // pump 是「先占位、再发射」，而 pause()/delete() 在占位与协程真正跑起来之间
+        // 完全可能已经把这一笔摘掉了 —— 那时先写下去的那句 `Running` 会盖在用户刚看到的
+        // 「已暂停」上，状态停在「下载中」而后面再没有任何 job 会动它（pump 只会调度 Queued）。
+        if (jobs[id] !== self) return
         patch(id, persist = true) { it.copy(status = DownloadStatus.Running, error = null) }
         try {
             download(id)
@@ -496,16 +548,14 @@ class DownloadRepository(
     }
 
     /**
-     * 只看后缀名会漏：列表地址也可能长成 `/m3u8/xxxxx`，末尾没有 `.m3u8`。
-     * 那种地址落到单文件分支，存下来的就是 playlist 正文冒充的 video.mp4 ——
-     * 进度走到 100%、标着「可离线播放」，点开是坏的，看起来正是「缓存没起作用」。
+     * 判法只有一份（[net.cinehub.data.model.StreamUrls.isHls]）—— 播放器那边走的是同一个函数。
+     *
+     * 原来这里是手抄的一份，注释还写着「和 PlayerBuffering 那一份保持同一套」；
+     * 两处各改各的，早晚有一处会把 `/m3u8/xxxxx`（没有后缀的列表地址）判成单文件，
+     * 那时存下来的就是 playlist 正文冒充的 video.mp4 —— 进度走到 100%、
+     * 标着「可离线播放」，点开是坏的，看起来正是「缓存没起作用」。
      */
-    private fun isHls(url: String): Boolean {
-        val path = url.substringBefore('?').substringBefore('#')
-        return pathExt(url, "").equals(".m3u8", true) ||
-            path.substringAfterLast('/', path).contains("m3u8", true) ||
-            path.contains("/m3u8/", true)
-    }
+    private fun isHls(url: String): Boolean = StreamUrls.isHls(url)
 
     /**
      * 单文件缓存。整块套在 [withRetry] 里：这一条本来就从 .part 的末尾按 Range 续，
@@ -638,6 +688,12 @@ class DownloadRepository(
      * 只认 206：它明确回答「这些字节我还有」。416 是「你要的起点已经越过结尾」，也就是完了；
      * 200 说明对方不理 Range，那这次探测给不出任何结论，宁可可疑地收下，
      * 也不能因为「问不出答案」就把一整集重下一遍 —— 那个循环用户等不起。
+     *
+     * **206 但没有 Content-Length**（chunked 那种）也算「还有」：它回了 206 就是承认
+     * 你要的那个区间存在、且从那里开始有内容。原来这里回 `left > 0L`，
+     * 而 `contentLength()` 对 chunked 给的是 -1 —— 于是「还有」被读成「没有了」，
+     * 一份被拦腰截断的文件照样 promote 成正式名字、标成已缓存。
+     * 多问一轮的代价是隔一会儿再要一次，比留一个「能播但放到一半就停」的文件小得多。
      */
     private suspend fun tailWaiting(id: String, url: String, cfg: SourceConfig, haveAt: Long): Boolean =
         withContext(Dispatchers.IO) {
@@ -647,7 +703,8 @@ class DownloadRepository(
                 call.await().use { r ->
                     if (r.code != 206) return@use false
                     val left = r.body?.contentLength() ?: -1L
-                    left > 0L
+                    // 没给长度（chunked）也算「还有」—— 见上面那段
+                    left != 0L
                 }
             } catch (e: Exception) {
                 // 探不出结论就当没有：探测失败不该把一集已经落盘的视频判成没下完
@@ -874,7 +931,12 @@ class DownloadRepository(
                         if (r.code in 500..599 || r.code == 429) throw Transient(why)
                         error(why)
                     }
-                    val bytes = r.body?.bytes() ?: error("空响应")
+                    // 不能 `bytes()`：那是「有多少读多少」，而这条路上一集会有 8 个 worker
+                    // 同时进来。站点把某个分片地址接成一个大文件（或者干脆接错）时，
+                    // 8 × 几百 MB 直接就是 OOM —— 表现成「缓存的时候闪退」。
+                    // 分片本身有上限（[MAX_SEGMENT_BYTES]），超了就当这一片坏了：
+                    // 记成一次可重试的瞬时故障，而不是把它搬进堆里。
+                    val bytes = readCapped(r.body ?: error("空响应"))
                     val plain = if (key == null) bytes else aesCbcDecrypt(bytes, key.first, key.second)
                     // 先落到 .part 再改名：这一段的完成判据是「正式名字的文件的字节非空」，
                     // 直接写进正式名字，就是让一段半截的分片冒充一片完整的。
@@ -887,6 +949,37 @@ class DownloadRepository(
                 untrackCall(id, call)
             }
         }
+    }
+
+    /**
+     * 把一个响应体读进内存，超过 [MAX_SEGMENT_BYTES] 就报错。
+     *
+     * 和 [Http] 那份 `bodyText()` 同一个道理（那边也有自己的上限）：不设上限的
+     * 「读到 EOF」在一个能把地址接错的源面前等于把堆交给对方。这里**不截断** ——
+     * 半片内容写下去，文件在、字节非空，于是被当成一片好的，最后整集是花的。
+     */
+    private fun readCapped(body: okhttp3.ResponseBody): ByteArray {
+        val declared = body.contentLength()
+        if (declared > MAX_SEGMENT_BYTES) error(
+            "这一段回的内容超过 ${MAX_SEGMENT_BYTES / 1000 / 1000} MB，不像一个分片 —— " +
+                "多半是这一条的地址指到了别的东西上",
+        )
+        val stream = body.byteStream()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val n = stream.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            total += n
+            // 声明长度不可信（chunked 那一类是 -1），所以边读边数
+            if (total > MAX_SEGMENT_BYTES) error(
+                "这一段回的内容超过 ${MAX_SEGMENT_BYTES / 1000 / 1000} MB，不像一个分片 —— " +
+                    "多半是这一条的地址指到了别的东西上",
+            )
+        }
+        return out.toByteArray()
     }
 
     /**
@@ -937,15 +1030,7 @@ class DownloadRepository(
             .header("Referer", referer(cfg))
         Http.authHeaders(cfg).forEach { (k, v) -> b.header(k, v) }
         if (rangeFrom != null && rangeFrom > 0) b.header("Range", "bytes=$rangeFrom-")
-        val call = Http.client.newBuilder()
-            .readTimeout(60, TimeUnit.SECONDS)
-            // 换一套自己的 Dispatcher。newBuilder() 是**拷贝**派发器的，而 OkHttp 默认
-            // maxRequestsPerHost=5：缓存一路一条集就并发开 4~8 条分片连接，全挤在同一个 host 上，
-            // 同一源的 search/detail 会被排在 ready queue 里出不来 —— 界面上就是
-            // 「正在查询…」一直转，看着像这个源挂了，其实是被自己正在下的那集堵的。
-            .dispatcher(DOWNLOAD_DISPATCHER)
-            .build()
-            .newCall(b.build())
+        val call = downloadClient.newCall(b.build())
         // 挂到这一组里，暂停 / 删除时才掐得住：分片并发之后一个任务同时有好几个连接在飞。
         //
         // 用 compute 而不是 getOrPut：后者是「先 get、没有就 put」，在 ConcurrentHashMap 上
@@ -991,7 +1076,10 @@ class DownloadRepository(
      */
     private fun reportBytes(id: String, totalBytes: Long) {
         val now = System.currentTimeMillis()
-        val dq = speedWin.getOrPut(id) { ArrayDeque() }
+        // compute 而不是 getOrPut：后者在 ConcurrentHashMap 上也不原子，而同一集的
+        // 8 路 worker 会几乎同时进这里 —— 两边各建一个 deque、后 put 的覆盖前一个，
+        // 于是有一半样本进了那个已经脱离 map 的 deque，算出来的速度是残的。
+        val dq = speedWin.compute(id) { _, existing -> existing ?: ArrayDeque() }!!
         synchronized(dq) {
             dq.addLast(now to totalBytes)
             while (dq.size > 2 && now - dq[1].first > SPEED_WINDOW_MS) dq.removeFirst()
@@ -1090,9 +1178,13 @@ class DownloadRepository(
                         val body = r.body ?: error("空响应")
                         // 密钥就 16 字节。站点回一整页 HTML 时（多半是被拦下了）
                         // 不能跟着把整页读进内存 —— 那既是假成功也是内存炸点。
+                        //
+                        // 声明长度那一条**不能当闸门**：chunked 响应根本没有 Content-Length
+                        // （`contentLength()` 回 -1），而这一路正是那种「回一整页」的形态。
+                        // 所以照 [readCapped] 那条边读边数的路走，超了当场停手。
                         val declared = body.contentLength()
                         if (declared > 64) error("站点给的密钥不是 16 字节（$declared 字节），解不了")
-                        val b = body.bytes()
+                        val b = readCappedSmall(body, 64L)
                         if (b.size != 16) error("站点给的密钥不是 16 字节（${b.size} 字节），解不了")
                         b
                     }
@@ -1101,6 +1193,27 @@ class DownloadRepository(
                 }
             }
         }
+
+    /**
+     * 读一个小响应（密钥那种），超过 [cap] 字节就报错。
+     *
+     * 与 [readCapped] 分开只是为了让上限可调：密钥的合法长度是 16，
+     * 那把 8 MB 的分片闸门套上去等于没闸。
+     */
+    private fun readCappedSmall(body: okhttp3.ResponseBody, cap: Long): ByteArray {
+        val stream = body.byteStream()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(1024)
+        var total = 0L
+        while (true) {
+            val n = stream.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            total += n
+            if (total > cap) error("站点回的内容不是它该有的样子（超过 $cap 字节）")
+        }
+        return out.toByteArray()
+    }
 
     /** AES-128-CBC。末字节是填充长度；对不上就原样留着（有的打包器不填）。 */
     private fun aesCbcDecrypt(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
@@ -1274,6 +1387,9 @@ class DownloadRepository(
      * 内存是唯一事实来源（`patch` 同步改它），事务里读到的自然是当下这一份。
      */
     private fun saveNow() {
+        // 读盘没回来之前不写：内存这份还是空的，写下去就是把用户的任务清单整个覆盖掉。
+        // 只跳过这一次落盘，不丢内存里那笔改动 —— load() 结束时会把两边合并并补一次盘。
+        if (!loaded) return
         lastSaveAt = System.currentTimeMillis()
         scope.launch {
             runCatching {
@@ -1331,6 +1447,11 @@ class DownloadRepository(
             _tasks.value = merged
             if (!unreadable && merged != stored) p[KEY] = json.encodeToString(merged)
         }
+        // 读完了才允许落盘（见 [loaded]），并把这一版重算过的结论补一次盘 ——
+        // 用户可能已在这一趟里排了个任务（上面合并进来的那一笔只有在 merged != stored
+        // 时才会被写下去，而 Running→Paused / Done-无文件 的修正也算数）。
+        loaded = true
+        saveNow()
     }
 
     private fun tasksOf(raw: String): List<DownloadTask>? =
@@ -1355,6 +1476,25 @@ class DownloadRepository(
         val DOWNLOAD_DISPATCHER = okhttp3.Dispatcher().apply {
             maxRequests = 64
             maxRequestsPerHost = 32
+        }
+
+        /**
+         * 下载专用的客户端。只建一次。
+         *
+         * 原来是在 [newCall] 里 `Http.client.newBuilder()….build()` —— 每要一个分片就
+         * 现建一颗 OkHttpClient（连带一条连接池和一套线程池）。一集上千片，那就是上千颗，
+         * 连接复用当场失效（每次都是新握手），而已建出来的那些还各自占着资源。
+         *
+         * `newBuilder()` 是**拷贝**派发器的，所以必须显式换上自己的 [DOWNLOAD_DISPATCHER]：
+         * OkHttp 默认 maxRequestsPerHost=5，而缓存一路一条集就并发开 4~8 条分片连接、
+         * 全挤在同一个 host 上 —— 同一源的 search/detail 会被排在 ready queue 里出不来，
+         * 界面上就是「正在查询…」一直转，看着像这个源挂了，其实是被自己正在下的那集堵的。
+         */
+        val downloadClient: okhttp3.OkHttpClient by lazy {
+            Http.client.newBuilder()
+                .readTimeout(60, TimeUnit.SECONDS)
+                .dispatcher(DOWNLOAD_DISPATCHER)
+                .build()
         }
         /** 同时在跑几集。多了没意义：带宽就那么宽，站点那边也容易把并发当成刷接口。 */
         const val MAX_PARALLEL = 3
@@ -1381,6 +1521,14 @@ class DownloadRepository(
         /** 一份播放列表最多读多少。超过就不当它是列表 —— 见 [fetchText]。 */
         const val MAX_PLAYLIST_BYTES = 2_000_000L
 
+        /**
+         * 单个分片允许读进内存的上限。
+         *
+         * 只是「明显不正常的信号」，不是优化：正常分片几 MB 到十几 MB（4K 的也有 20 MB 的），
+         * 这个闸门是防「地址指错、站点回一个大文件」时 8 个 worker 一起把堆撑爆。
+         */
+        const val MAX_SEGMENT_BYTES = 64_000_000L
+
         /** 长下载过程中刷新「共 x MB」的最小间隔：那是一次整树遍历。 */
         const val SPACE_REFRESH_MS = 15_000L
 
@@ -1393,6 +1541,19 @@ class DownloadRepository(
          */
         const val MAX_KEY_LEN = 96
 
+        /**
+         * 任务 id —— 同时也是盘上那个目录的名字。
+         *
+         * [sourceId] / [mediaId] 都是站点给的字符串（接口型源那边 mediaId 甚至就是一整条
+         * 带签名的地址），所以先消毒成文件名安全的字符，超长再压成定长摘要。
+         *
+         * **已知的局限**：消毒是多对一的（`"12 3"` 与 `"12_3"` 都变成 `12_3`），
+         * 于是两条只差「被替换字符」的 id 会算出同一个键，共用目录、互相覆盖。
+         * 这里**不动它**是有意的：这个键已经写进用户盘上那份任务清单、又是目录名，
+         * 改一次算法就等于把所有人已缓存完的那几集改名成「文件不在了」
+         * （长 id 的摘要只要换个输入就全变），而触发条件是这么具体的两个 id 同时出现。
+         * 真要治，得配一次带迁移的改名，不能顺手改。
+         */
         fun keyOf(sourceId: String, mediaId: String, episodeIndex: Int): String {
             val raw = "dl_${sourceId}_${mediaId}_$episodeIndex"
                 .replace(Regex("[^A-Za-z0-9_.-]"), "_")

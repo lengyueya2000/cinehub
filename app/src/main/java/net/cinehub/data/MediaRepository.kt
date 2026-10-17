@@ -13,7 +13,6 @@ import net.cinehub.data.model.qualityTagOf
 import net.cinehub.data.model.SearchOutcome
 import net.cinehub.data.model.SourceAvailability
 import net.cinehub.data.model.SourceConfig
-import net.cinehub.data.model.SourceKind
 import net.cinehub.data.model.StreamResolution
 import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.model.titleFingerprint
@@ -367,7 +366,13 @@ class MediaRepository(private val sources: SourceRepository) {
         if (!(year == null || otherYear == null || otherYear == year)) return false
         if (type == null) return true
         val otherType = m.category?.takeIf { it.isNotBlank() } ?: return true
-        return typeFingerprint(otherType) == type
+        // 认不出来和「没写」是同一件事：都没有信号，都不该分家。
+        // 原来这里直接 `typeFingerprint(otherType) == type`，而认不出来时那个函数返回 null，
+        // 于是 `null == type` 恒假 —— 另一源的分类是「科幻」这种表外的写法时，
+        // 一条其实对得上的条目被静默丢掉，详情页的「播放源」就少一格。
+        // [searchOnIo] 对同一个值用的是「分桶」而不是「丢弃」，两处口径在这里统一。
+        val otherFp = typeFingerprint(otherType) ?: return true
+        return otherFp == type
     }
 
     /** [Media.key] 尾上那四位年份；这一条没带年份就是 null。 */

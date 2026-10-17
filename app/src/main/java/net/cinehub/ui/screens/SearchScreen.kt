@@ -100,9 +100,12 @@ fun SearchScreen(
     val uncategorized = results.count { it.media.category?.trim().isNullOrEmpty() }
 
     // 「都没有〈关键词〉」这句话要有依据才能说：有源没答话就是搜过的硬证据，
-    // 否则比对搜索历史头一条 —— search() 会把这次的词放到最前。
+    // 否则看 VM 里那个「上一次真的发出去搜过的词」。
+    // **不能拿搜索历史兜底**（以前就是）：历史跨会话留着，成功搜过「三体」之后，
+    // 重进这一屏只在框里再打一遍这三个字、一个请求都没发，也会被当成搜过而写出那句假话。
     // 光在框里打字还没回车时不算搜过，不能声称搜过。
-    val searched = failures.isNotEmpty() || history.firstOrNull() == query
+    val searchedTerm by vm.searchedTerm.collectAsState()
+    val searched = failures.isNotEmpty() || searchedTerm == query
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -179,7 +182,7 @@ fun SearchScreen(
                 item {
                     CatChip("全部 ${results.size}", on = cat == null) { cat = null }
                 }
-                items(chips) { (name, count) ->
+                items(chips, key = { it.first }) { (name, count) ->
                     // 再点一次已选中的芯片 = 取消筛选，回到不过滤的原样
                     CatChip("$name $count", on = cat == name) {
                         cat = if (cat == name) null else name
@@ -279,7 +282,9 @@ fun SearchScreen(
                             }
                             Spacer8()
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                                items(history) { h ->
+                                // 键用词本身：长按删掉一条之后，靠位置认项会把邻居的
+                                // 组合槽位接过去（删的是第三个，动的却是第四个）。
+                                items(history, key = { it }) { h ->
                                     Text(
                                         h,
                                         color = T.TextDim,
@@ -312,12 +317,19 @@ fun SearchScreen(
                                 Text(cfg.name, color = T.Text, fontSize = Fs.body2, modifier = Modifier.weight(1f))
                                 Text(
                                     when (h) {
-                                        Health.Ok -> "${health[cfg.id]?.latencyMs ?: "-"}ms"
+                                        // 拿不到毫秒时写「已连通」，不拼出 "-ms" 这种不可能的字。
+                                        // washHealth 会给「探根路径没答话、但搜索答上了」的源
+                                        // 留下 latencyMs = null —— 那一格是绿的，数字却编不出来。
+                                        // 判法同详情页那一栏（见 DetailScreen 的同一段）。
+                                        Health.Ok -> if (health[cfg.id]?.latencyMs != null)
+                                            "${health[cfg.id]?.latencyMs}ms" else "已连通"
                                         Health.Slow -> "较慢"
                                         Health.Down -> "不可用"
                                         Health.Unknown -> "未检测"
                                     },
-                                    color = T.TextFaint,
+                                    // 这一格承载的是「哪个源没答上话」这个事实，不是装饰；
+                                    // TextFaint 在纯黑上只有 3.5:1，够不上正文 4.5:1 的门槛
+                                    color = T.TextDim,
                                     fontSize = Fs.xxs,
                                 )
                             }
@@ -548,7 +560,7 @@ private fun ResultRow(agg: AggregatedMedia, onClick: (net.cinehub.data.model.Sou
             )
             Spacer8()
             LazyRow(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                items(agg.availability) { av ->
+                items(agg.availability, key = { it.sourceId }) { av ->
                     val dim = av.health == Health.Down
                     Row(
                         Modifier.clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
@@ -561,6 +573,11 @@ private fun ResultRow(agg: AggregatedMedia, onClick: (net.cinehub.data.model.Sou
                                 if (dim) T.Border else T.Src500.copy(alpha = .30f),
                                 androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
                             )
+                            // 这一排芯片是这一行**唯一**说出「哪个源能播」的地方
+                            // （上面那句注释就写着「不用点进去就能判断」），点它却什么都不做 ——
+                            // 而整行是能点的、点下去进的是 firstOrNull() 那个源。
+                            // 用户点「源B 1080P」却被送进源A，且没有任何交代。所以这里接上。
+                            .clickable { onClick(av) }
                             .padding(horizontal = 7.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {

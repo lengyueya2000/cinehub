@@ -129,6 +129,11 @@ class MinoAdapter(override val config: SourceConfig) : SourceAdapter {
      *
      * ts 与 nonce 在**这里**一次生成、既进 canonical 又进头 —— 分两处生成会让签的那份
      * 和发的那份对不上（后端正是逐字节比这两样：签错回 4600，没签回 4604）。
+     *
+     * 用户在源配置里填的那份凭证也并进来。「添加播放源」那栏对每一种源都给一个凭证框，
+     * 而原来这一份头只有签名那五个字段：填了 Cookie/Bearer 的用户看到的是一个照样匿名
+     * 的请求 —— 表现是「填了凭证还是说没权限」，且查不出原因。签名与凭证是两件事，
+     * 后者由 [Http.authHeaders] 按用户选的方式给。
      */
     private suspend fun authHeaders(
         s: Session,
@@ -153,7 +158,7 @@ class MinoAdapter(override val config: SourceConfig) : SourceAdapter {
             "X-Body-Sha256" to bodySha,
             "X-App-Version" to APP_VERSION,
             "X-Device-Id" to deviceId,
-        )
+        ).apply { putAll(Http.authHeaders(config)) }
     }
 
     /** 一次签名 GET（pathAndQuery 是相对 base 的，含查询串）。 */
@@ -314,7 +319,13 @@ class MinoAdapter(override val config: SourceConfig) : SourceAdapter {
         }
     }
 
-    /** 问一个绝对地址：同域（自建源相对下发）时补签名头；外部解析接口裸 GET。 */
+    /**
+     * 问一个绝对地址：同域（自建源相对下发）时补签名头；外部解析接口裸 GET。
+     *
+     * 跨域那一条不带任何头是**故意的**：那是站点下发给第三方解析站的地址，
+     * 用户的凭证不该跟着去。这一条不经过 [apiJson]，所以 [MinoProtocol.EnvelopeFailure]
+     * 会照原样传到调用方（[finalUrlOf] 自己认 JSON，不用解信封）。
+     */
     private suspend fun apiGetAbsolute(absolute: String): String {
         val sameHost = runCatching {
             java.net.URI(absolute).host == java.net.URI(base).host
@@ -327,6 +338,10 @@ class MinoAdapter(override val config: SourceConfig) : SourceAdapter {
     private suspend fun apiJson(pathAndQuery: String): JsonObject {
         val body = quietly { apiGet(pathAndQuery) }
             .fold(onSuccess = { it }, onFailure = { e ->
+                // 信封解不开是一个**已经说清楚了**的失败（消息本身就是给用户看的，
+                // 见 MinoProtocol.EnvelopeFailure），再套一层「没取回来」等于把它改写成
+                // 一句更含糊的话；其余异常才按「没取回来」包装。
+                if (e is MinoProtocol.EnvelopeFailure) error(e.message ?: "这个后端的响应解不开")
                 error("向这个后端取数据时没取回来：${e.shortReason()}")
             })
         val root = body.jsonRootOrNull()

@@ -42,6 +42,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -111,8 +113,8 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     // 拖拽排序的临时状态：material3 这一版还没有可用的 reorderable 列表，只能自己接手势。
     // dragTo 只是「松手会落到第几位」，真正的顺序要等 vm.reorder 落库、sources 重新发一次才算数。
     var dragId by remember { mutableStateOf<String?>(null) }
-    var dragDy by remember { mutableStateOf(0f) }
-    var dragTo by remember { mutableStateOf(-1) }
+    var dragDy by remember { mutableFloatStateOf(0f) }
+    var dragTo by remember { mutableIntStateOf(-1) }
     // 行在哪、多高，一律从 listState 的当前布局里现读，不自建坐标表：
     // LazyColumn 会回收滑出屏幕的行，自己记的那份 HashMap 既不清理也不更新，
     // 滚到底再往回拖就会拿陈旧坐标算落点，把顺序落到完全不相干的位次上。
@@ -622,10 +624,14 @@ private fun SourceRow(
             // 状态：圆点 + 字。只给个颜色的点，色弱和强光下等于没说
             StatusDot(h, 6)
             Spacer4()
+            // 数字不能凭空补：探测失败后来又答上搜索的源，washHealth 会发出
+            // HealthReport(Ok, latencyMs = null) —— 那正是「连得上但没量到」，
+            // 写成 0ms 就是拿一个编出来的数替它作保（详情页那一栏同一条规矩）。
+            val ms = report?.latencyMs
             NumText(
                 when (h) {
-                    Health.Ok -> "${report?.latencyMs ?: 0}ms"
-                    Health.Slow -> "${report?.latencyMs ?: 0}ms 较慢"
+                    Health.Ok -> if (ms != null) "${ms}ms" else "已连通"
+                    Health.Slow -> if (ms != null) "${ms}ms 较慢" else "较慢"
                     Health.Down -> "不可用"
                     Health.Unknown -> "未检测"
                 },
@@ -840,6 +846,17 @@ private fun AddSourceSheet(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+                // 地址是用户自己加的源的必填项，留空时下面那颗按钮就是关着的。
+                // 按钮只是「不能按」，说不出为什么 —— 这句把原因补上，
+                // 不然用户只能靠反复按那颗灰按钮来猜（原来按下去还没反应）。
+                if (initial?.hiddenUrl != true && url.isBlank()) {
+                    Text(
+                        "填入站点地址后才能保存",
+                        color = T.TextDim,
+                        fontSize = Fs.xxs,
+                        modifier = Modifier.padding(top = Sp.s2),
+                    )
+                }
             }
 
             Field("接入方式", "不确定就选网页解析") {
@@ -969,6 +986,11 @@ private fun AddSourceSheet(
                 Spacer12()
             }
 
+            // 「能不能按」只有一个判据，渐变、字色、点击闸门三处都读它。
+            // 原来只有 clickable 读这个条件、渐变只读 busy，于是地址留空的用户看到的是一颗
+            // 满色、随时能按的按钮，按下去什么也不发生 —— 一个按了没反应却看着能按的格子，
+            // 比一个明写着「现在不行」的格子更让人反复试。语义与原来完全一致，只是样子跟上。
+            val canSave = !busy && (url.isNotBlank() || initial?.hiddenUrl == true)
             Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                 Box(
                     Modifier.weight(1f).height(46.dp).clip(R.md).background(T.Surface2)
@@ -983,14 +1005,14 @@ private fun AddSourceSheet(
                         .background(
                             Brush.verticalGradient(
                                 listOf(
-                                    if (busy) T.Surface4 else T.Play400,
-                                    if (busy) T.Surface4 else T.Play500,
+                                    if (canSave) T.Play400 else T.Surface4,
+                                    if (canSave) T.Play500 else T.Surface4,
                                 )
                             )
                         )
                         // 内置隐藏源允许地址栏留空（= 保留原地址）：按钮只看别的必填项。
                         // 用户自己加的源没有原地址可保，仍要求填。
-                        .clickable(enabled = !busy && (url.isNotBlank() || initial?.hiddenUrl == true)) {
+                        .clickable(enabled = canSave) {
                             val ready = tested
                             if (ready != null) {
                                 // 已经探测通过：这一步只负责落库
@@ -1014,7 +1036,9 @@ private fun AddSourceSheet(
                             tested != null -> if (initial == null) "保存并启用" else "保存"
                             else -> "测试并保存"
                         },
-                        color = Color.White,
+                        // 字色跟着 canSave 走：暗底上用纯白字读起来仍像一颗主按钮，
+                        // 那正是「看着能按、按了没反应」的观感本身
+                        color = if (canSave) Color.White else T.TextFaint,
                         fontSize = Fs.body,
                         fontWeight = FontWeight.Bold,
                     )

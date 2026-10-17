@@ -185,9 +185,13 @@ fun LibraryScreen(
             }
 
             when {
-                list.isEmpty() && loading -> CenterNote("正在向豆瓣取「${chart.name}」…")
+                // 「还没问过」和「问过但一条都没有」是两件事。首次进来时 loading 还是 false
+                // （_doubanLoading 初始为 false，只由 refreshDouban() 立起，而那一趟挂在
+                // LaunchedEffect 上）—— 原来这一帧会直接落到下面那句「这个榜豆瓣没回内容」，
+                // 而请求根本还没发出去，顶上那一行还同时写着「来自豆瓣的公开榜单」。
+                list.isEmpty() && (loading || error == null) ->
+                    CenterNote("正在向豆瓣取「${chart.name}」…")
                 list.isEmpty() && error != null -> CenterNote(error!!)
-                list.isEmpty() -> CenterNote("这个榜豆瓣没回内容")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(3),
                     modifier = Modifier.fillMaxSize().padding(horizontal = Sp.s4),
@@ -588,10 +592,17 @@ fun DownloadSettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                 )
                 Spacer8()
                 Text(
-                    // 这两个数从仓库拿：以前写死「3 集」「8 路」，常量一改这一句就说谎了
-                    "最多同时缓存 ${vm.downloadMaxParallel} 集，所以这一档是每集各开：" +
-                        "调到 ${vm.downloadMaxSegParallel} 路时总共会有 " +
-                        "${vm.downloadMaxParallel * vm.downloadMaxSegParallel} 条连接在飞。",
+                    // 这两个数从仓库拿：以前写死「3 集」「8 路」，常量一改这一句就说谎了。
+                    //
+                    // 报的必须是**选中的那一档**（`parallel`），不是上限：原来这句写的是
+                    // `downloadMaxSegParallel`，于是选了「1 路」它仍然说「每集各开 8 路」，
+                    // 两句话摆在同一屏上互相打架。上限只在后面那句「最多」里出现。
+                    "最多同时缓存 ${vm.downloadMaxParallel} 集。当前这一档是每集各开 " +
+                        "${parallel} 路，所以总共最多 " +
+                        "${vm.downloadMaxParallel * parallel} 条连接在飞" +
+                        (if (parallel < vm.downloadMaxSegParallel)
+                            "（调到 ${vm.downloadMaxSegParallel} 路时是 ${vm.downloadMaxParallel * vm.downloadMaxSegParallel} 条）。"
+                        else "。"),
                     color = T.TextDim,
                     fontSize = Fs.xs,
                     lineHeight = Fs.xs * 1.7f,

@@ -59,6 +59,17 @@ class WatchRepository(private val context: Context) {
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
 
+    /**
+     * 盘上那一份读回来了没有。
+     *
+     * 落盘是整份覆盖写（见 [snapshot]），而内存这份一开始是**空的** —— 读盘还没回来
+     * 就让用户的一次点收藏落了盘，写下去的就是「一条收藏都没有」，他攒了很久的
+     * 收藏和观看记录当场没了；[load] 随后合并的是盘上那份（已经被冲掉的那份），救不回来。
+     * 读回来之前一律不落盘。`PlaybackRepository` 一直是这么做的，这里补上。
+     */
+    @Volatile
+    private var loaded = false
+
     init {
         scope.launch { load() }
     }
@@ -69,8 +80,14 @@ class WatchRepository(private val context: Context) {
 
     /** 收藏/取消，返回切换后是不是「已收藏」。 */
     fun toggleFavorite(fav: Favorite): Boolean {
-        val had = isFavorite(fav.key)
-        _favorites.update { list -> if (had) list.filterNot { it.key == fav.key } else list + fav }
+        // 开关和「原来有没有」要在**同一次原子更新**里算出来。
+        // 原来先读 `isFavorite` 再单独 update：两次点击贴着来的时候，
+        // 两笔都读到「还没有」，于是都去加一条 —— 收藏没被切掉，反而重复了一遍。
+        var had = false
+        _favorites.update { list ->
+            had = list.any { it.key == fav.key }
+            if (had) list.filterNot { it.key == fav.key } else list + fav
+        }
         save()
         return !had
     }
@@ -116,6 +133,8 @@ class WatchRepository(private val context: Context) {
     // ---------- 落盘 ----------
 
     private fun save() {
+        // 读盘没回来之前不写（见 [loaded]）：内存这份还是空的，写下去就是清空用户的收藏。
+        if (!loaded) return
         lastSaveAt = System.currentTimeMillis()
         snapshot()
     }
@@ -196,6 +215,11 @@ class WatchRepository(private val context: Context) {
             if (!favBad) p[KEY_FAV] = json.encodeToString(nextFavs)
             if (!hisBad) p[KEY_HIS] = json.encodeToString(nextHis)
         }
+        // 读完了才允许落盘（见 [loaded]）。这一趟本身已经把合并结果写进事务了，
+        // 所以这里不必再补一次 —— 但用户可能在读盘途中点过收藏，那一笔卡在内存里，
+        // 得靠一次落盘补上（那时 loaded 已为真，save() 才会真的写）。
+        loaded = true
+        if (_favorites.value.isNotEmpty() || _history.value.isNotEmpty()) save()
     }
 
     private inline fun <reified T> decodeIt(raw: String): List<T>? =

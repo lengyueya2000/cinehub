@@ -91,4 +91,22 @@ object StreamUrls {
         val path = url.substringBefore('?').lowercase()
         return MEDIA_EXT.any { path.endsWith(it) }
     }
+
+    /**
+     * 这个地址是不是一份 HLS 列表。
+     *
+     * **只此一份判法**：播放器（[net.cinehub.playback.PlayerBuffering.isHlsUrl]）和
+     * 离线缓存（[net.cinehub.data.DownloadRepository]）都走这里。两边各写一套的时候，
+     * 同一集会出现「播放器按 HLS 解、缓存按单文件存」—— 用户没法对齐两边给的结论。
+     *
+     * 只看 `.m3u8` 后缀会漏掉 `/m3u8/xxxxx` 这种不给后缀的列表地址（实测有这类站），
+     * 所以三条都认。查询串与片段先摘掉 —— 时效签名就挂在 `?` 后面。
+     */
+    fun isHls(url: String): Boolean {
+        val path = url.substringBefore('?').substringBefore('#')
+        val last = path.substringAfterLast('/', path)
+        return path.endsWith(".m3u8", ignoreCase = true) ||
+            last.contains("m3u8", ignoreCase = true) ||
+            path.contains("/m3u8/", ignoreCase = true)
+    }
 }

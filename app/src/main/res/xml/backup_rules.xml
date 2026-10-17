@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 11 及以下的 `android:fullBackupContent`（12+ 用 data_extraction_rules.xml，
+  两份内容是同一件事：把用户填的站点凭证挡在备份之外）。
+
+  只排 `cinehub` 那一份 DataStore —— 里面装着 SourceConfig.authToken。
+  收藏 / 进度 / 缓存清单照常备份。
+-->
+<full-backup-content>
+    <exclude domain="file" path="datastore/cinehub.preferences_pb" />
+    <exclude domain="file" path="datastore/cinehub_downloads.preferences_pb" />
+</full-backup-content>

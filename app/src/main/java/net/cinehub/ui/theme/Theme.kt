@@ -25,25 +25,24 @@ private val CineHubColors = darkColorScheme(
 )
 
 private val CineHubType = Typography().let { base ->
-    // 只覆盖我们实际用到的几档，其余沿用默认
+    // 只覆盖我们实际用到的几档，其余沿用默认。
+    // color 一律不写：烘进 TextStyle 的颜色会盖掉 LocalContentColor，
+    // 任何用这几档样式的 Material3 组件就再也改不了自己的文字色。
     base.copy(
         titleLarge = TextStyle(
             fontFamily = FontFamily.Default,
             fontWeight = FontWeight.Bold,
             fontSize = Fs.title,
-            color = T.Text,
         ),
         bodyMedium = TextStyle(
             fontFamily = FontFamily.Default,
             fontWeight = FontWeight.Normal,
             fontSize = Fs.body,
-            color = T.Text,
         ),
         labelSmall = TextStyle(
             fontFamily = FontFamily.Default,
             fontWeight = FontWeight.SemiBold,
             fontSize = Fs.xxs,
-            color = T.TextDim,
         ),
     )
 }

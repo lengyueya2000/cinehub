@@ -3,6 +3,7 @@ package net.cinehub.data.net
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import net.cinehub.data.quietly
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.FormBody
@@ -141,7 +142,7 @@ object Http {
      * 按 host 取，绝不把 A 站的 cookie 带进 B 站 —— 站点下发的会话和用户填的凭证都是凭证。
      */
     private fun mergeCookies(url: String, provided: String?): String? {
-        val saved = hostOf(url)?.let { jar[it] }?.toMap().orEmpty()
+        val saved = synchronized(jar) { hostOf(url)?.let { jar[it] }?.toMap().orEmpty() }
         if (saved.isEmpty()) return provided
         if (provided.isNullOrBlank()) return saved.entries.joinToString("; ") { "${it.key}=${it.value}" }
         val have = provided.split(';').map { it.substringBefore('=').trim() }.toSet()
@@ -154,10 +155,56 @@ object Http {
      *
      * 只活在进程里、不落盘：这些站的下发 cookie 有效期就几个小时（实测高清点播那道题给的写的是
      * 2 小时），存到盘上既没用又留下一个能被人读走的东西。
+     *
+     * 两处上限，都是「别让一个站把这份表撑爆」：记住的 host 数、每个 host 记的名字数。
+     * 超了就丢最早插进来的那一条（[LinkedHashMap] 是插入序，重写一个已有的名字不会把它挪到后面，
+     * 所以「最早插入」是有定义的）。丢一条的下场只是那份会话重来一次，不设上限则是这个进程一直涨。
+     *
+     * 用 [LinkedHashMap] 而不是 ConcurrentHashMap，是为了留住插入序好做上面那件事；
+     * 因此这一份只在 `synchronized(jar)` 里读写（见 [mergeCookies] / [remember]），
+     * 而它的公开行为没有变。
      */
-    private val jar = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, String>>()
+    private val jar = LinkedHashMap<String, LinkedHashMap<String, String>>()
+
+    /** [jar] 的容量：记住几个 host、每个 host 记几个名字。 */
+    private const val JAR_MAX_HOSTS = 40
+    private const val JAR_MAX_NAMES = 48
 
     private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host }.getOrNull()
+
+    /**
+     * 两个 host 是不是同一个可注册域。
+     *
+     * 只比最后两段点分标签：`a.example.com` 与 `example.com` 同为 `example.com`，
+     * 这一条覆盖的正是 apex→www、http→https 那种**同站**重定向；`a.example.com` 与
+     * `b.other.com` 不算，于是跨站重定向的 cookie 不会再被抄给发起方。
+     *
+     * 不看公共后缀表：`a.co.uk` 与 `b.co.uk` 会被判成同域，于是多记一份。这个方向是安全的 ——
+     * 真正会伤人的那一步（把 B 站的 cookie 记到 A 站名下、下次发给 B）只在两颗域名最后两段
+     * 相同时也发生，而那时它们几乎必定是同一个站。
+     */
+    private fun sameSite(a: String, b: String): Boolean {
+        if (a.equals(b, ignoreCase = true)) return true
+        fun tail(h: String): String = h.lowercase().trimEnd('.').split('.').takeLast(2).joinToString(".")
+        return tail(a) == tail(b)
+    }
+
+    /**
+     * 往 [jar] 里记一条（value 为 null 表示作废这个名字）；超过上限就丢最早插入的那条。
+     *
+     * 调用方必须持有 [jar] 的锁。
+     */
+    private fun putCookie(host: String, name: String, value: String?) {
+        val m = jar.getOrPut(host) { LinkedHashMap() }
+        if (value == null) {
+            m.remove(name)
+        } else {
+            m[name] = value
+            while (m.size > JAR_MAX_NAMES) m.remove(m.keys.first())
+        }
+        // 新 host 是被 getOrPut 追加到末尾的，所以这里丢掉的总是最旧的那个，不会是自己
+        while (jar.size > JAR_MAX_HOSTS) jar.remove(jar.keys.first())
+    }
 
     /** 收下这一条响应下发的 cookie。 */
     private fun remember(url: String, r: Response) {
@@ -165,7 +212,18 @@ object Http {
         // apex→www、http→https 之后那条 Set-Cookie 属于链上最后一跳；原来只按请求 URL 的
         // 第一跳记账，于是重定向型站点的会话存到了一个再也不会被问到的 host 上 ——
         // 表现是「会话永远建立不起来」，而这一类失败在界面上查不出原因。
-        val hosts = listOfNotNull(hostOf(url), hostOf(r.request.url.toString())).distinct()
+        //
+        // 最初请求的那个 host 只在**与最后一跳同域**时才一并记：apex→www 这类同站重定向
+        // 两边共用一份会话，所以要都记上。跨站重定向不是这样 —— 把重定向**目标**下发的
+        // cookie 记到发起方名下，下次就会把 B 站的凭据发给 A 站，正是本文件
+        // 「绝不把 A 站的 cookie 带进 B 站」那条规矩要拦住的事，所以那种情况一个字都不记。
+        val requested = hostOf(url)
+        val finalHost = hostOf(r.request.url.toString())
+        val hosts = if (finalHost == null) listOfNotNull(requested)
+        else listOfNotNull(
+            finalHost,
+            requested?.takeIf { it != finalHost && sameSite(it, finalHost) },
+        ).distinct()
         if (hosts.isEmpty()) return
         for (raw in r.headers("Set-Cookie")) {
             val kv = raw.substringBefore(';').trim()
@@ -176,9 +234,8 @@ object Http {
             // 一条删除指令（Max-Age=0 / Expires 已过期）被当成新值存下来，等于把这个名字
             // 永久钉在一份早该作废的会话上
             val dead = isDeadCookie(raw)
-            hosts.forEach { host ->
-                val m = jar.getOrPut(host) { java.util.concurrent.ConcurrentHashMap() }
-                if (dead) m.remove(name) else m[name] = value
+            synchronized(jar) {
+                hosts.forEach { host -> putCookie(host, name, if (dead) null else value) }
             }
         }
     }
@@ -382,7 +439,7 @@ object Http {
         // 要不要被自动换源跳过。所以这里换走 page() 那条读全份正文的路：它自己会答一次题、
         // 答完在新会话上重发，通了我才量得到延迟，不通就照实把那张页的原因带回去。
         val t1 = System.currentTimeMillis()
-        val again = runCatching { page(url, referer, emptyMap(), 20, browserHeaders = true) }.getOrNull()
+        val again = quietly { page(url, referer, emptyMap(), 20, browserHeaders = true) }.getOrNull()
         if (again != null && again.status in 200..299) return System.currentTimeMillis() - t1
         return error(failureReason(again?.status ?: status, again?.body.orEmpty()))
     }
@@ -433,6 +490,12 @@ object Http {
         "safeline", "雷池", "chaitin", "access forbidden", "访问已被拦截",
         "just a moment", "attention required", "cf-chl", "cloudflare",
         "captcha", "验证码", "人机验证", "滑块",
+        // 滑动验证那道题的字样。它们本来就是 [SlideChallenge.isSlideGate] 的判据，
+        // 这里再列一遍是因为两者判的是两件事：那边判「要不要答这道题」，这边判
+        // 「答完还是 403 时该说哪一句话」。少了这两个词，一张没答过去的滑块页会掉进
+        // 下面那条通用 403 分支 —— 那句指引（站点页取链）恰恰是 [failureReason] 的
+        // KDoc 里说明的死路，等于把人支使得更久。
+        "滑动验证", "huadong_",
     )
 
     /** 另一类：明写按地区拒绝的。 */
@@ -485,16 +548,24 @@ suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
     cont.invokeOnCancellation { runCatching { cancel() } }
     enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
+            // 这里不用 tryResumeWithException：抛异常那条路没有「资源没人接手」的问题，
+            // 而协程已经取消时这个 resume 是空操作（挂起的续体不会醒）。
             if (!cont.isCancelled) cont.resumeWithException(e)
         }
 
         override fun onResponse(call: Call, response: Response) {
-            if (cont.isCancelled) {
-                // 协程已经走了，没人接手这个响应 —— 不 close 就是漏一个连接
-                runCatching { response.close() }
-            } else {
-                cont.resume(response)
-            }
+            // 取消与交付在同一条状态机上竞争，谁先谁赢 —— 先登记「取消就把这条响应关掉」：
+            //  - **交付赢**：状态转成 Resumed，此后 cancel() 不会再成功，这个 handler 不会跑，
+            //    响应交给调用方的 `use {}` 关；
+            //  - **取消赢**：状态转成 Cancelled，handler 立刻被调用（`invokeOnCancellation` 的
+            //    语义就是「已经取消时当场执行」），响应在这里关掉，随后那次 resume 是空操作。
+            //
+            // 两边都调 close()，而 `Response.close()` 是幂等的（OkHttp 内部就是 closeQuietly），
+            // 所以不需要再判一次「究竟谁赢了」—— 原来那句 `if (cont.isCancelled) … else resume`
+            // 的竞态恰恰就出在这一次判断上：取消落在判断和 resume 之间时，
+            // resume 被丢进已取消的续体、调用方的 `use {}` 永不执行，这条连接没人关。
+            cont.invokeOnCancellation { runCatching { response.close() } }
+            cont.resume(response)
         }
     })
 }

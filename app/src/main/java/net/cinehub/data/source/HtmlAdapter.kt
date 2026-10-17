@@ -31,10 +31,32 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
         else -> config.baseUrl.trimEnd('/') + "/" + path.trimStart('/')
     }
 
+    /**
+     * 这个地址跟本源的站是不是同一台主机。
+     *
+     * 用来决定要不要把用户在源配置里填的凭证带上：凭证只发给配置里那个站，
+     * 不发给页面自己指向的任何第三方地址（见 [authFor]）。
+     * 两边有一个解不出主机名时就按「不同站」处理 —— 宁可这次不带凭证被拒，也不能外发。
+     */
+    private fun sameHost(url: String): Boolean = runCatching {
+        java.net.URI(url).host == java.net.URI(config.baseUrl).host
+    }.getOrDefault(false)
+
+    /**
+     * 取这个地址时要带的凭证：**同站才有**。
+     *
+     * 页面里的 href 可能是别的域（广告位、图床、外链的播放页），而 [abs] 对绝对地址是
+     * 原样返回的 —— 一律附上凭证等于把用户填的 Cookie/Bearer 抄给这些第三方。
+     * 本层其余跨域取数（MaccmsParseResolver、MinoAdapter.apiGetAbsolute）都不带凭证，
+     * 这里跟上同一条规矩。
+     */
+    private fun authFor(url: String): Map<String, String> =
+        if (sameHost(url)) Http.authHeaders(config) else emptyMap()
+
     private suspend fun fetch(path: String, page: Int): Document {
         val url = abs(path.replace("{q}", "").replace("{page}", "$page"))
         return Jsoup.parse(
-            Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config)),
+            Http.get(url, referer = config.baseUrl, headers = authFor(url)),
             url,
         )
     }
@@ -81,7 +103,7 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
     override suspend fun detail(id: String): MediaDetail {
         val url = abs(rules.detailPath.replace("{id}", pathEncode(id)))
         val doc = Jsoup.parse(
-            Http.get(url, referer = config.baseUrl, headers = Http.authHeaders(config)),
+            Http.get(url, referer = config.baseUrl, headers = authFor(url)),
             url,
         )
 
@@ -124,13 +146,17 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
                 PlayLine(
                     name = doc.lineName(line, tab, ordinal),
                     episodes = anchors.mapIndexed { i, a ->
+                        val href = a.attr(rules.episodeUrlAttr).ifBlank { a.attr("href") }
                         Episode(
                             name = a.text().trim().ifBlank { "第 ${i + 1} 集" },
                             // 集数写在地址尾段里（44869-3-2 → 第 2 集），
                             // 取不到才按出现顺序数 —— 顺序数在倒序排的模板上会把集号排反
                             index = a.attr("data-episode").ifBlank { a.attr("data-idx") }
                                 .toIntOrNull() ?: a.playIndex() ?: (i + 1),
-                            playUrl = abs(a.attr(rules.episodeUrlAttr).ifBlank { a.attr("href") }),
+                            // 地址空着的锚点（导航锚、纯脚本锚）不能 abs("") —— 那会得到站点根，
+                            // 于是这一集"有地址"且指向首页，播放器拿它去要一份 HTML。
+                            // 给 null：这一集没有地址，调用方本来就按「没给出地址」处理。
+                            playUrl = href.takeIf { it.isNotBlank() }?.let { abs(it) },
                         )
                     },
                 )
@@ -184,7 +210,8 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
 
         // 2. 苹果 CMS 模板：地址写在播放页的 player_aaaa 里
         if (rules.resolveMode == HtmlRules.MODE_MACCMS_PLAYER) {
-            val html = Http.get(episodeUrl, referer = config.baseUrl, headers = Http.authHeaders(config))
+            // episodeUrl 可能是一个跨域的绝对地址（见 [abs]），凭证只跟着本站走
+            val html = Http.get(episodeUrl, referer = config.baseUrl, headers = authFor(episodeUrl))
             return MacPlayerJson.read(html)?.field("url")?.trim()
                 ?.takeIf { it.startsWith("http") }
                 ?.let { StreamResolution.Ready(it) }

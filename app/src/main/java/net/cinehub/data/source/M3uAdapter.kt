@@ -85,12 +85,28 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
         if (episodeUrl.startsWith("http")) StreamResolution.Ready(episodeUrl)
         else StreamResolution.Failed("播放列表里这一项不是可直接播放的地址")
 
+    /**
+     * 标题分隔符（第一个不在引号里的逗号）的下标；没有则 -1。
+     *
+     * 见 [parse]：只要一个 `indexOf(',')` 就够了，除非某个属性值里带逗号
+     * （`tvg-logo="…/a,b.png"` 这类地址）—— 那个逗号不属于语法，跳过它继续找。
+     */
+    private fun titleSeparator(body: String): Int {
+        var inQuote = false
+        for (i in body.indices) {
+            when (body[i]) {
+                '"' -> inQuote = !inQuote
+                ',' -> if (!inQuote) return i
+            }
+        }
+        return -1
+    }
+
     private fun parse(text: String): List<Media> {
         val out = ArrayList<Media>()
         var pendingTitle: String? = null
         var pendingLogo: String? = null
         var pendingGroup: String? = null
-        var idx = 0
 
         for (raw in text.lineSequence()) {
             val line = raw.trim()
@@ -99,15 +115,22 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
             when {
                 line.startsWith("#EXTINF", ignoreCase = true) -> {
                     val body = line.substringAfter(':', "")
-                    pendingTitle = body.substringAfterLast(',').trim().ifBlank { null }
-                    pendingLogo = Regex("""tvg-logo="([^"]*)"""").find(body)?.groupValues?.get(1)
-                    pendingGroup = Regex("""group-title="([^"]*)"""").find(body)?.groupValues?.get(1)
+                    // m3u 的语法是「时长,标题」—— 标题从**第一个**逗号之后开始。
+                    // 原来取的是最后一个逗号，片名自带逗号时（「老师，好」这类）会被截掉一截。
+                    // 没有逗号时按整段当标题（属性那几种写法只有带逗号的才合语法，这里不猜）。
+                    // 引号里的逗号不算分隔（`tvg-logo="http://…/a,b.png"` 这种地址里的逗号
+                    // 一按下去就会把属性尾巴连同标题一起当成标题）。
+                    val comma = titleSeparator(body)
+                    pendingTitle = (if (comma >= 0) body.substring(comma + 1) else body)
+                        .trim().ifBlank { null }
+                    // 这两条正则原来在循环里现建：一份几万条的公共列表就是几万次 Pattern.compile
+                    pendingLogo = LOGO.find(body)?.groupValues?.get(1)
+                    pendingGroup = GROUP.find(body)?.groupValues?.get(1)
                 }
 
                 line.startsWith("#") -> Unit
 
                 else -> {
-                    idx++
                     val url = line
                     out += Media(
                         id = url,
@@ -128,5 +151,9 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
     private companion object {
         /** 列表缓存的有效期。见 [load]。 */
         const val TTL_MS = 30 * 60_000L
+
+        /** `#EXTINF` 行里的 `tvg-logo="…"` 与 `group-title="…"`（循环外建好，见 [parse]）。 */
+        val LOGO = Regex("""tvg-logo="([^"]*)"""")
+        val GROUP = Regex("""group-title="([^"]*)"""")
     }
 }

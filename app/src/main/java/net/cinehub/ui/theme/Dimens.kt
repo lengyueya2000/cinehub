@@ -25,6 +25,9 @@ object R {
     val full = RoundedCornerShape(999.dp)
 }
 
+/** 最小可点区域。触摸目标是 44dp —— 别在各处再手写这个字面量。 */
+object Touch { val min = 44.dp }
+
 /** 字阶 */
 object Fs {
     val hero = 21.sp

@@ -3,6 +3,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+      allowBackup 留着：收藏、进度、播放源列表是用户自己攒的东西，换机时正该跟着走。
+      但用户填的站点凭证（SourceConfig.authToken）不能跟着走 —— 它明文躺在
+      `cinehub` 那份 DataStore 里，而默认的自动备份会把内部存储整个搬去云端。
+      两份规则文件（12+ 用 dataExtractionRules、更早用 fullBackupContent）
+      把那一份排除掉，其余照旧。
+    -->
     <application
         android:name=".CineHubApplication"
         android:allowBackup="true"
@@ -11,6 +18,8 @@
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:networkSecurityConfig="@xml/network_security_config"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:theme="@style/Theme.CineHub">
 
         <activity
