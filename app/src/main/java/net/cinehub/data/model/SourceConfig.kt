@@ -226,4 +226,24 @@ data class ApiRules(
     val playFromField: String = "vod_play_from",
     /** 详情接口路径，{id} 为影片 id。 */
     val detailPath: String = "/api.php/provide/vod/at/json/?ac=detail&ids={id}",
-)
+    /**
+     * 接口给的地址要不要再过一道解析器。
+     *
+     * 绝大多数 JSON 接口型源，`vod_play_url` 里就是能播的直链，留 [MODE_NONE]。
+     * 西瓜那一型例外：接口里存的是各家平台的播放页，站点自己的播放器靠一张
+     * 「麒麟解析器」把它换成 m3u8 —— 标上 [MODE_QILIN]，取链就走
+     * [net.cinehub.data.source.QilinResolver]。
+     *
+     * 放在 ApiRules 而不是新开一种 SourceKind：浏览、搜索、详情、分集那几件事
+     * 它和标准苹果 CMS 一字不差，不同的只有最后这一步换地址。为一步差异再开一型，
+     * 等于把前面那几件复制一份，早晚长成两套说法。
+     */
+    val resolveMode: String = MODE_NONE,
+) {
+    companion object {
+        const val MODE_NONE = "none"
+
+        /** 平台页地址要交给麒麟解析器换成流（见 [net.cinehub.data.source.QilinResolver]）。 */
+        const val MODE_QILIN = "qilin"
+    }
+}

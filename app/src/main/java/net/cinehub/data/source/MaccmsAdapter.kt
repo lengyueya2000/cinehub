@@ -131,12 +131,22 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
      * 苹果 CMS 的 `vod_play_url` 里混着两类地址：真正的媒体文件，
      * 以及爱奇艺 / 腾讯 / B 站那种「播放页」。后者交给播放器只会报错，
      * 所以这里按域名如实归类，让上层说清楚是哪个平台。
+     *
+     * 但「给的是平台页」有两种完全不同的下场，以前混成一种：
+     * 多数站就是这样、确实播不了（如实说，让用户换源）；而西瓜那一型是站点把
+     * 换流这一步交给了它自己的解析器 —— 我们照着走同一遍就能播。所以先问
+     * [ApiRules.resolveMode]：标了麒麟那一型就走 [QilinResolver]，其余照旧。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution = when {
-        StreamUrls.isMediaUrl(episodeUrl) -> StreamResolution.Ready(episodeUrl)
-        else -> VideoPlatforms.platformOf(episodeUrl)
-            ?.let { StreamResolution.ThirdPartyPage(episodeUrl, it) }
-            ?: StreamResolution.Failed("接口给的地址既不是媒体文件，也不是已知平台的播放页")
+    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+        if (rules.resolveMode == net.cinehub.data.model.ApiRules.MODE_QILIN) {
+            return QilinResolver.resolve(episodeUrl, config)
+        }
+        return when {
+            StreamUrls.isMediaUrl(episodeUrl) -> StreamResolution.Ready(episodeUrl)
+            else -> VideoPlatforms.platformOf(episodeUrl)
+                ?.let { StreamResolution.ThirdPartyPage(episodeUrl, it) }
+                ?: StreamResolution.Failed("接口给的地址既不是媒体文件，也不是已知平台的播放页")
+        }
     }
 
     private fun firstListItem(root: JsonObject): JsonObject? {

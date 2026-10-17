@@ -276,6 +276,26 @@ object Seed {
             tags = listOf("1080P", "AI 找片"),
             hiddenUrl = true,
         ),
+        SourceConfig(
+            // 这个 id 是新的，**不是**当年那个 "xiguazx"：那个已经进了下面的 retiredIds，
+            // 而 retiredIds 是在每次 mutate 时按 id 过滤的 —— 复用同一个号会让这一条
+            // 每次落盘都被静默删掉，界面上看着「加了又没了」，且一点报错都没有。
+            id = "xiguavod",
+            name = "西瓜影视",
+            baseUrl = "https://xiguazx.cc",
+            kind = net.cinehub.data.model.SourceKind.JsonApi,
+            priority = 5,
+            // 只写实测站得住的两条：片库量是接口自己报的 total（搜「凤凰」55 条、
+            // 整站数万条），线路数是同一部片详情里 vod_play_from 切出来的条数。
+            // 不写「全线路可播」—— 实测五条线路里 mgtv 与 youku 那两条解析器解不出来。
+            tags = listOf("10 万+ 片库", "五条线路"),
+            api = net.cinehub.data.model.ApiRules(
+                // 接口里存的是各家平台的播放页，要再过一道麒麟解析器才能播
+                // （见 QilinResolver）。浏览、搜索、详情仍是标准苹果 CMS，不用改。
+                resolveMode = net.cinehub.data.model.ApiRules.MODE_QILIN,
+            ),
+            hiddenUrl = true,
+        ),
     )
 
     /**

@@ -126,30 +126,60 @@ object PlayerBuffering {
     const val ABR_HEADROOM = 80L
 
     /**
-     * 网络恢复后逐步放开 ABR 上限，返回新的上限（比特每秒）。
+     * 网络恢复后放开到的目标上限（比特每秒）：实测的 [RELEASE_TARGET_PERCENT]%。
      *
-     * 放开必须**单步有界**：上限从压扁状态一口气放回实测的 90%，一次网络抖动
-     * 又会把它打回重缓冲 —— 用户看到的是「松一下、卡一下」的循环。
-     * 这里每步最多放宽 [RELEASE_STEP_PERCENT]%，多轮才回到 [RELEASE_TARGET_PERCENT]%。
+     * **这里原来是「每跳最多放宽 25%」的阶梯，那是画质鬼畜的直接来源**：阶梯绑在
+     * 500ms 的轮询上，等于每秒放宽两次 —— 压下去之后一两秒就冲回高位，ABR 又挑高档，
+     * 又占满出口，又卡。用户看到的是清楚与模糊来回跳。
      *
-     * 边界：
-     * - 估计没量出来（<= 0）→ 原样返回；
-     * - **只升不降**：往下压是 [clampBitrate] 在重缓冲时干的事，两条路径别混；
-     * - 目标是实测的 [RELEASE_TARGET_PERCENT]%（比压下去的 80% 留更多头余量），到了就停。
+     * 放开的两件事因此拆开：**幅度**在这里（一步到实测的 90%，比压下去时的 80%
+     * 多留余量），**时机**在 [readyToRelease]（要连续稳定播放够久，且每卡一次窗口翻倍）。
+     *
+     * 降档之后估计值为什么仍可信：DefaultBandwidthMeter 按「一次加载的字节 ÷ 那一次
+     * 耗时」取样，而分片是尽量快地下完的 —— 量到的是出口能跑多快，不是当前这一档有多高。
+     * 所以降档不会把估计一起拖低到放不开手。
+     *
+     * 边界：估计没量出来（<= 0）→ 返回 0，由调用方保持现状（此时放开等于抬到未知）。
      */
-    fun releaseBitrate(currentMax: Long, estimate: Long): Long {
-        if (estimate <= 0L) return currentMax
-        val target = estimate * RELEASE_TARGET_PERCENT / 100L
-        if (currentMax >= target) return currentMax
-        val step = currentMax * RELEASE_STEP_PERCENT / 100L
-        return (currentMax + step).coerceAtMost(target)
+    fun releaseTarget(estimate: Long): Long {
+        if (estimate <= 0L) return 0L
+        return (estimate * RELEASE_TARGET_PERCENT / 100L).coerceAtLeast(MIN_ABR_BITRATE)
     }
 
-    /** 放开路径的单步上限（%）：每步最多放宽 25%。 */
-    const val RELEASE_STEP_PERCENT = 25L
-
-    /** 放开路径的目标（实测的百分比）：90% —— 比 80% 那份多留一点，减少刚放开又卡的来回。 */
+    /** 放开路径的目标（实测的百分比）：90% —— 比压下去的 80% 多留一点，减少刚放开又卡的来回。 */
     const val RELEASE_TARGET_PERCENT = 90L
+
+    /**
+     * 压住上限之后要**连续稳定播放**多久才允许放开一次（毫秒）。
+     *
+     * [rebuffers] 是这一条流上第几次重缓冲（1 起）。每多一次窗口翻倍：出口带宽正好
+     * 卡在某一档上时第一次放开多半还会卡，退避让抖动越来越稀，而不是持续抽搐。
+     * 到 [MAX_STABLE_MS] 封顶 —— 再往后翻就是十几分钟才试一次，等于这一场不打算给高画质了。
+     *
+     * 0 次（没卡过）返回 0：那时候根本没有「放开」这回事。
+     */
+    fun stableWindowMs(rebuffers: Int): Long = when {
+        rebuffers <= 0 -> 0L
+        else -> (FIRST_STABLE_MS shl (rebuffers - 1).coerceAtMost(6)).coerceAtMost(MAX_STABLE_MS)
+    }
+
+    /** 第一次重缓冲之后要求的稳定时长。 */
+    const val FIRST_STABLE_MS = 20_000L
+
+    /** 稳定窗口翻倍的封顶值。 */
+    const val MAX_STABLE_MS = 300_000L
+
+    /**
+     * 现在能不能放开一次。
+     *
+     * [clamped] 是「上限正被压着、在等放开」这一位，**不能从 abrMaxBitrate 的数值推**：
+     * 放开之后上限仍是一个有限的数（实测的 90%），照数值判会一直以为还压着、
+     * 反复重建选档参数 —— 而每次重建都会让 ABR 重新选一次档，那本身就是一种抖动。
+     */
+    fun readyToRelease(clamped: Boolean, stableMs: Long, rebuffers: Int): Boolean {
+        if (!clamped || rebuffers <= 0) return false
+        return stableMs >= stableWindowMs(rebuffers)
+    }
 
     /**
      * ABR 上限的最低档（比特每秒）。

@@ -51,35 +51,29 @@ class ClampBitrateTest {
         assertTrue(high >= low)
     }
 
-    // ---------- releaseBitrate：网络恢复后逐步放开 ----------
+    // ---------- releaseTarget：稳定够久之后放开到哪一档 ----------
 
     @Test
-    fun releaseRaisesTowardNinetyPercentOfEstimate() {
-        // 实测 10 Mbps、上限 2 Mbps：目标 9 Mbps，但单步最多放宽 25% → 2.5 Mbps
-        assertEquals(2_500_000L, PlayerBuffering.releaseBitrate(currentMax = 2_000_000L, estimate = 10_000_000L))
+    fun `放开一步到实测的九成`() {
+        // 原来这里是一条「每跳最多 +25%」的阶梯，绑在 500ms 轮询上，
+        // 等于每秒放宽两次 —— 那就是画质鬼畜的来源。现在幅度一步到位，
+        // 节奏交给 stableWindowMs / readyToRelease 管。
+        assertEquals(9_000_000L, PlayerBuffering.releaseTarget(10_000_000L))
     }
 
     @Test
-    fun releaseStopsAtNinetyPercentOfEstimate() {
-        // 上限已经很接近实测：直接到 90% 为止，不越过去
+    fun `估计没量出来时放开值为零表示别动`() {
+        // 这时候放开等于把上限抬到一个未知的位置
+        assertEquals(0L, PlayerBuffering.releaseTarget(0L))
+        assertEquals(0L, PlayerBuffering.releaseTarget(-1L))
+    }
+
+    @Test
+    fun `估计极低也守住最低档`() {
+        // 弱网估计可能抖到几十 kbps，跟着放开会让音轨都选不出来
         assertEquals(
-            9_000_000L,
-            PlayerBuffering.releaseBitrate(currentMax = 8_500_000L, estimate = 10_000_000L),
+            PlayerBuffering.MIN_ABR_BITRATE,
+            PlayerBuffering.releaseTarget(100_000L),
         )
-    }
-
-    @Test
-    fun releaseNeverLowersTheCap() {
-        // 实测忽然抖低：放宽路径不往下走（往下压是 clampBitrate 在重缓冲时干的事）
-        assertEquals(
-            8_000_000L,
-            PlayerBuffering.releaseBitrate(currentMax = 8_000_000L, estimate = 1_000_000L),
-        )
-    }
-
-    @Test
-    fun releaseWithoutEstimateLeavesCapUnchanged() {
-        assertEquals(4_000_000L, PlayerBuffering.releaseBitrate(currentMax = 4_000_000L, estimate = 0L))
-        assertEquals(4_000_000L, PlayerBuffering.releaseBitrate(currentMax = 4_000_000L, estimate = -1L))
     }
 }

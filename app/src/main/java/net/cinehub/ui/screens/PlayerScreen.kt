@@ -277,12 +277,27 @@ fun PlayerScreen(
     /**
      * ABR 码率上限（比特每秒）的**当前值**。
      *
-     * 正常时是 Int.MAX（不封顶，ABR 自由选档）；一次重缓冲把它压到实测 × 80%，
-     * 网络恢复后由轮询循环按 [PlayerBuffering.releaseBitrate] 逐步放开。
+     * 正常时是 Long.MAX_VALUE（不封顶，ABR 自由选档）；一次重缓冲把它压到实测 × 80%，
+     * 稳定够久之后由轮询循环按 [PlayerBuffering.releaseTarget] 放开一次。
      * 放在状态里而不是直接写 trackSelectionParameters：真正的参数应用只有
      * `LaunchedEffect(abrMaxBitrate)` 那一处，和画质上限同一个入口。
      */
     var abrMaxBitrate by remember { mutableLongStateOf(Long.MAX_VALUE) }
+
+    /**
+     * 上限是不是**正被压着、在等放开**。
+     *
+     * 这一位不能从 [abrMaxBitrate] 的数值推：放开之后它仍然是一个有限的数
+     * （实测的 90%），照数值判就永远以为「还压着」，于是每一跳都重建一次选档参数 ——
+     * 而每次重建都会让 ABR 重新选一次档，那本身就是一种抖动。
+     */
+    var abrClamped by remember { mutableStateOf(false) }
+
+    /** 这一条流上第几次重缓冲。窗口按它翻倍（见 [PlayerBuffering.stableWindowMs]）。 */
+    var rebufferCount by remember { mutableIntStateOf(0) }
+
+    /** 距离上一次状态变化稳定播放了多久（毫秒）。进 BUFFERING 就归零。 */
+    var stableMs by remember { mutableLongStateOf(0L) }
 
     val player = remember {
         // 缓冲的几档阈值集中在 PlayerBuffering，不在这里散着写
@@ -312,7 +327,16 @@ fun PlayerScreen(
                                 bandwidth.bitrateEstimate,
                                 abrMaxBitrate,
                             )
+                            // 压过就要等放开；第几次决定等多久（见 stableWindowMs）。
+                            // 这一句只在状态**变化**时进来（onPlaybackStateChanged 的语义），
+                            // 所以一次重缓冲计一次，不会重复累加。
+                            abrClamped = true
+                            rebufferCount += 1
                         }
+                        // 稳定计时以播放器状态为准，不以轮询为准：退到后台、被音频焦点
+                        // 打断时它既不是 READY 也不是 BUFFERING，那种时间不该算进「稳定播放」。
+                        // 进 BUFFERING 则当场归零 —— 窗口数的是「上一次卡住之后」的稳定时长。
+                        if (state == Player.STATE_BUFFERING) stableMs = 0L
                     }
 
                     override fun onPlayWhenReadyChanged(
@@ -475,9 +499,18 @@ fun PlayerScreen(
         playingHeight = 0
         // 换流之后 ABR 上限从头来：上一条流的「出口慢」不代表这一条也慢
         abrMaxBitrate = Long.MAX_VALUE
+        abrClamped = false
+        rebufferCount = 0
+        stableMs = 0L
         var lastPos = -1L
         var lastDur = -1L
+        // 上一跳实际睡了多久。稳定时长加的是这个数，而不是当跳要睡的数：
+        // 醒来时能确定「刚才那段时间播放器一直是 READY」，而当跳的时长还没过去。
+        var sleptMs = 500L
         while (true) {
+            // 这一轮只读一次播放状态：下面「算不算稳定」与「这一跳睡多久」
+            // 必须看着同一个状态，分两次读就有中间变了的可能
+            val state = player.playbackState
             pos = msToSec(player.currentPosition)
             dur = msToSec(player.duration)
             wantsPlay = player.playWhenReady
@@ -487,12 +520,25 @@ fun PlayerScreen(
             // 毫秒原值另算一份给缓冲提示：它的分母是 1.2~2.5 秒的起播阈值，
             // 用上面那个取整到秒的数只剩四五档，进度会跳
             bufAheadMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)
-            // 网络恢复后逐步放开 ABR 上限：READY 且上限已被压过时按
-            // releaseBitrate 抬一点。放在 READY 条件里，BUFFERING 期间不动它。
-            if (player.playbackState == Player.STATE_READY &&
-                abrMaxBitrate != Long.MAX_VALUE
-            ) {
-                abrMaxBitrate = PlayerBuffering.releaseBitrate(abrMaxBitrate, bandwidth.bitrateEstimate)
+            // 稳定计时与放开。READY 就攒时长，够久才放开一次。
+            //
+            // **这里原来是每跳（500ms）放宽 25% 的阶梯**，那是画质鬼畜的直接来源：
+            // 压下去 → ABR 降档（糊）→ 出口不再被占满 → 带宽估计上涨 → 阶梯一两秒就把
+            // 上限抬回高位 → ABR 挑高档（清楚）→ 又占满 → 又卡。每秒抖两轮，
+            // 用户看到的是清楚与模糊来回跳。
+            // 现在幅度一步到实测的 90%，节奏交给稳定窗口，且每卡一次窗口翻倍。
+            val ready = state == Player.STATE_READY
+            stableMs = if (ready) stableMs + sleptMs else 0L
+            if (PlayerBuffering.readyToRelease(abrClamped, stableMs, rebufferCount)) {
+                val target = PlayerBuffering.releaseTarget(bandwidth.bitrateEstimate)
+                if (target > 0L) {
+                    // 只往上抬：往下压是重缓冲时 clampBitrate 干的事，两条路径别混
+                    if (target > abrMaxBitrate) abrMaxBitrate = target
+                    // 放开过就收工，等下一次重缓冲重新武装。
+                    // 不这么做的话这一位会一直「压着」，每够一个窗口就白重建一次选档参数。
+                    abrClamped = false
+                    stableMs = 0L
+                }
             }
             // 只有真的进了 READY 才把位置交给仓库落盘。
             // prepare 之前那一句 seekTo 就已经让 currentPosition 报出续播起点了 —— 
@@ -502,7 +548,7 @@ fun PlayerScreen(
             // 而且**只在数字真的变了时**落盘：暂停着、退到后台放着（影枢没有前台服务，
             // ON_STOP 只 pause）都还是 STATE_READY，原来这一句会一路把同一个位置每 500ms
             // 量一次、每 10 秒往 DataStore 写一笔，横穿整个后台期间磨盘。
-            if (player.playbackState == Player.STATE_READY && (pos != lastPos || dur != lastDur)) {
+            if (ready && (pos != lastPos || dur != lastDur)) {
                 vm.updatePosition(pos, dur)
                 lastPos = pos
                 lastDur = dur
@@ -535,7 +581,12 @@ fun PlayerScreen(
             // 按平时的 500ms 一采只能画出四五帧，进度看着是跳的而不是走的。
             // 只在 BUFFERING 期间加密，正常播放仍走 500ms —— 上面那些
             // currentTracks / 轨道查询都不便宜，不该为了进度条一直付这份钱。
-            delay(if (player.playbackState == Player.STATE_BUFFERING) 100 else 500)
+            //
+            // sleptMs 给下一跳的稳定时长用。睡的这一跳里状态若正好从 BUFFERING 翻成
+            // READY，下一跳会多算进最多 100ms —— 对一个 20 秒起的窗口无关紧要，
+            // 不值得为它换成监听器驱动。
+            sleptMs = if (state == Player.STATE_BUFFERING) 100L else 500L
+            delay(sleptMs)
         }
     }
 
