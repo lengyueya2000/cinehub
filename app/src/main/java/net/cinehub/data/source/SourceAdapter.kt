@@ -74,6 +74,7 @@ object SourceAdapters {
         net.cinehub.data.model.SourceKind.Html -> HtmlAdapter(cfg)
         net.cinehub.data.model.SourceKind.AiMovie -> AiMovieAdapter(cfg)
         net.cinehub.data.model.SourceKind.MinoApi -> MinoAdapter(cfg)
+        net.cinehub.data.model.SourceKind.PpnixApi -> PpnixAdapter(cfg)
     }
 
     private class Held(val key: String, val adapter: SourceAdapter)

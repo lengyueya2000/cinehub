@@ -763,6 +763,13 @@ fun PlayerScreen(
             // 小窗的发起权在 Activity，它只认这一份报来的比例；这一屏卸了就必须说「不进小窗」，
             // 否则在首页按 Home 也会缩出一颗放着上一部片的小窗。
             vm.publishPipRatio(null)
+            // 本机 key 代理是跟着播放器活的：播放器还在读它那份 m3u8 / 密钥，
+            // 端口就不能关。放在 release 后面 —— 先让播放器放手，再收端口。
+            // 引用计数见 LocalKeyProxy.acquire：换集、换线路都会重放一次媒体源，
+            // 那期间端口必须还在，所以只有退出这一屏才真的收到 0。
+            playing?.sourceId?.let { sid ->
+                vm.releaseKeyProxy(sid)
+            }
             player.release()
         }
     }

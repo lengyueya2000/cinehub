@@ -45,6 +45,7 @@ import net.cinehub.data.model.titleSearchVariants
 import net.cinehub.data.model.VideoPlatforms
 import net.cinehub.data.model.normalizeTitle
 import net.cinehub.data.model.userNote
+import net.cinehub.data.net.LocalKeyProxy
 import net.cinehub.data.source.SourceAdapters
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -1543,6 +1544,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         is StreamResolution.NeedsClientScript, is StreamResolution.NeedsSession -> true
         is StreamResolution.Failed -> res.reason.startsWith("这个源还没有配置直链解析规则")
         else -> false
+    }
+
+    /**
+     * 放掉一个源的本机 key 代理。
+     *
+     * 只有「站点给的密钥不是规范形态」那一型（PPnix）才有代理，其余源这一行是空转 ——
+     * [LocalKeyProxy.release] 按 id 找不到就直接返回，不发请求、不起线程。
+     *
+     * 在播放器那一屏卸掉时调（见 PlayerScreen 的 onDispose）：引用计数归零才真关端口，
+     * 所以换集、换线路那几次重放不会把它提前收掉。
+     */
+    fun releaseKeyProxy(sourceId: String) {
+        // sourceRepo.all() 是 suspend 的（要读一次 DataStore），所以整个方法在协程里跑完。
+        // onDispose 那一下不等着它 —— 关端口的早晚差几毫秒没有意义。
+        viewModelScope.launch {
+            val cfg = sourceRepo.all().firstOrNull { it.id == sourceId } ?: return@launch
+            LocalKeyProxy.release(cfg)
+        }
     }
 
     /** 停在「等站点自己的页面把地址算出来」这一格上时，屏幕上该写的那句话。 */

@@ -136,6 +136,23 @@ enum class SourceKind {
      * 再拿票据里下发的解析接口现算（见 [net.cinehub.data.source.MinoAdapter]）。
      */
     MinoApi,
+
+    /**
+     * WordPress 主题型站点（如 www.ppnix.com）。
+     *
+     * 浏览 / 搜索 / 详情是普通网页解析，和 [Html] 那一步没有区别；单独开一型是因为
+     * 另外两件事它推不翻：
+     *
+     * - **分集不在 HTML 里**：详情页的 `.playlists` 是个空 div，由页面末尾那段
+     *   `classid/infoid/m3u8=[…]` script 在浏览器里渲染。照 [HtmlRules] 的选择器
+     *   找分集锚点一条都找不到，界面会显示成「这一部没有分集」。
+     * - **密钥不是规范形态**：`#EXT-X-KEY` 指向的地址回的不是 16 字节密钥，而是
+     *   32 个 ASCII 字符（真密钥是前 16 个）。播放器照规范读它只会解出乱码，
+     *   所以要经一道本机代理（[net.cinehub.data.net.LocalKeyProxy]）把密钥收拾成规范长度。
+     *
+     * 见 [net.cinehub.data.source.PpnixAdapter]。
+     */
+    PpnixApi,
 }
 
 @Serializable

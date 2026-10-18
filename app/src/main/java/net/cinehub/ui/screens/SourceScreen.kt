@@ -741,6 +741,7 @@ private fun SourceRow(
                     SourceKind.M3u -> "M3U 列表"
                     SourceKind.AiMovie -> "签名接口"
                     SourceKind.MinoApi -> "签名接口"
+                    SourceKind.PpnixApi -> "网页解析"
                 },
                 ghost = true,
             )

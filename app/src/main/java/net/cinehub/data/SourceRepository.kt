@@ -373,6 +373,21 @@ object Seed {
             ),
             hiddenUrl = true,
         ),
+        SourceConfig(
+            // WordPress 主题型站点（www.ppnix.com）。单独开一型而不是并进 Html：
+            // 分集只存在于详情页末尾那段 script 里（DOM 里是空 div），
+            // 且它给的密钥不是规范形态，要经本机代理收拾（见 PpnixAdapter / LocalKeyProxy）。
+            id = "ppnix",
+            name = "PPnix",
+            baseUrl = "https://www.ppnix.com/cn",
+            kind = net.cinehub.data.model.SourceKind.PpnixApi,
+            priority = 6,
+            // 只写实测站得住的两条：电影与电视剧两个分类各自成馆，
+            // 电视剧给到 47 集这种量级。不写「全线路可播」—— 分片在公共 IPFS 网关上，
+            // 网关抽风时这一集就是放不出来，那是网络的事，不是片库的事。
+            tags = listOf("电影 / 电视剧", "IPFS 分片"),
+            hiddenUrl = true,
+        ),
     )
 
     /**

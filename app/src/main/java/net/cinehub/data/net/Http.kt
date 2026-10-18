@@ -62,6 +62,14 @@ object Http {
     const val MAX_BODY_BYTES = 4_000_000L
 
     /**
+     * 二进制读法的字节上限，只对 [getBytes] 生效。
+     *
+     * 密钥就该是 16/24/32 字节。给到几十 KB 说明这个地址指的已经不是密钥了 ——
+     * 那时候该报错，而不是照截：截一份不是密钥的东西，播放器只会解出一个更说不清的错。
+     */
+    const val MAX_KEY_BYTES = 64
+
+    /**
      * 读正文，超过 [MAX_BODY_BYTES] 就报错，不截断、也不继续读。
      *
      * 为什么不截断着解析：半份 HTML 解析出来是「零条结果」，界面就会把它写成
@@ -379,6 +387,33 @@ object Http {
     private fun setCookieOf(r: Response): String? = r.headers("Set-Cookie")
         .joinToString("; ") { it.substringBefore(';') }
         .takeIf { it.isNotBlank() }
+
+    /**
+     * 二进制读一次：密钥、证书这类不是文本的响应走这条。
+     *
+     * [get] 那条会把正文按 charset 解成 `String` —— 非 ASCII 字节会被换成 U+FFFD，
+     * 字节数对不上，拿回来没法用。HLS 的 `#EXT-X-KEY` 指向的就是原始密钥字节，
+     * 所以单开这一条。
+     *
+     * 大小有上限（[MAX_KEY_BYTES]）：给到几十 KB 说明这个地址指的已经不是密钥了。
+     */
+    suspend fun getBytes(
+        url: String,
+        referer: String? = null,
+        headers: Map<String, String> = emptyMap(),
+        timeoutSec: Long = 20,
+        maxBytes: Int = MAX_KEY_BYTES,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        val b = builder(url, referer, headers)
+        client.newBuilder().withBudget(timeoutSec).build()
+            .newCall(b.build()).await().use { r ->
+                if (!r.isSuccessful) error(failureReason(r.code, ""))
+                val src = r.body?.source() ?: error("响应是空的")
+                val buf = src.readByteArray(maxBytes.toLong() + 1)
+                if (buf.size > maxBytes) error("响应有 ${buf.size} 字节，超过 $maxBytes 上限")
+                buf
+            }
+    }
 
     /** 响应正文 + 状态码 + 服务端下发的会话 Cookie（没有则为 null）。 */
     data class ResponseBody(
