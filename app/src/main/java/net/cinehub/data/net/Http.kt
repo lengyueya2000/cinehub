@@ -66,6 +66,7 @@ object Http {
      *
      * 密钥就该是 16/24/32 字节。给到几十 KB 说明这个地址指的已经不是密钥了 ——
      * 那时候该报错，而不是照截：截一份不是密钥的东西，播放器只会解出一个更说不清的错。
+     * 读取本身是「到流结束为止」，这一个数只是读完后的闸门。
      */
     const val MAX_KEY_BYTES = 64
 
@@ -409,7 +410,11 @@ object Http {
             .newCall(b.build()).await().use { r ->
                 if (!r.isSuccessful) error(failureReason(r.code, ""))
                 val src = r.body?.source() ?: error("响应是空的")
-                val buf = src.readByteArray(maxBytes.toLong() + 1)
+                // 读到流结束为止（密钥本来就是几十字节），再用上限卡「指到别的文件」。
+                // 不能用 readByteArray(maxBytes+1)：那是「恰好读这么多」，
+                // 32 字节的密钥会在第 33 字节处等来 EOF —— 实测 PPnix 的密钥
+                // 就是这样一封 全军覆没 的（EOFException）。
+                val buf = src.readByteArray()
                 if (buf.size > maxBytes) error("响应有 ${buf.size} 字节，超过 $maxBytes 上限")
                 buf
             }

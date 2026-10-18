@@ -191,6 +191,7 @@ object LocalKeyProxy {
                         return
                     }
                     val trimmed = runBlockingKey(siteUrl, cfg)
+                    android.util.Log.e("PPNIXDBG", "keyfetch site=$siteUrl -> ${trimmed?.size ?: -1}B")
                     if (trimmed == null) {
                         write(out, 502, "text/plain; charset=utf-8", "取不到密钥".toByteArray())
                         return
@@ -209,10 +210,15 @@ object LocalKeyProxy {
                         write(out, 502, "text/plain; charset=utf-8", "取不到播放清单".toByteArray())
                         return
                     }
-                    val rewritten = KeyTrimmer.rewritePlaylist(
-                        body,
-                        KeyTrimmer.localKeyUriWithSite(baseUrl, siteUrl),
-                    )
+                    // 每把 key 的 URI 都按清单自己的地址解析成绝对地址再编进查询串。
+                    // 曾经直接把清单地址塞进去，取「密钥」时抓回来的就是整份 m3u8，
+                    // 截 16 字节当密钥解出一堆乱码 —— 播放器报错、自动换源，PPnix 永远播不了。
+                    val rewritten = KeyTrimmer.rewritePlaylist(body) { rawKeyUri ->
+                        KeyTrimmer.localKeyUriWithSite(
+                            baseUrl,
+                            KeyTrimmer.resolveKeyUrl(siteUrl, rawKeyUri),
+                        )
+                    }
                     write(out, 200, "application/vnd.apple.mpegurl", rewritten.toByteArray())
                 }
 
@@ -255,7 +261,14 @@ object LocalKeyProxy {
 
     const val LOOPBACK = "127.0.0.1"
     const val KEY_PATH = "/key"
-    const val M3U8_PATH = "/playlist"
+
+    /**
+     * 清单路径带 `.m3u8` 后缀不是装饰：播放器按 [StreamUrls.isHls]（后缀 / 末段含
+     * m3u8 / 路径含 /m3u8/）决定走 HLS 还是把地址当单个视频文件抽流。曾经叫
+     * `/playlist`，三条全不中 —— 整份 m3u8 文本被 ProgressiveMediaSource 当媒体
+     * 探测，所有 extractor 认不出，Source error 换源，密钥请求一次都没发出来。
+     */
+    const val M3U8_PATH = "/playlist.m3u8"
 }
 
 /**
@@ -294,7 +307,17 @@ internal object KeyTrimmer {
      * 缺省时用分片序号，而站点**显式写了全零**，那就是它真的用全零加密
      * （按分片序号解不开，实测过）。所以照原样转达，不替它「补规范」。
      */
-    fun rewritePlaylist(playlist: String, localKeyUri: String): String {
+    fun rewritePlaylist(playlist: String, localKeyUri: String): String =
+        rewritePlaylist(playlist) { localKeyUri }
+
+    /**
+     * 把 m3u8 里的 key `URI` 换成本代理的密钥地址。
+     *
+     * 回调拿到的是 `#EXT-X-KEY` 里写的**原文**（PPnix 是相对的 `../key`），
+     * 由调用方按清单地址解析、按这把 key 自己的地址拼本机地址 ——
+     * key rotation 时每一把各走各的，不会串。
+     */
+    fun rewritePlaylist(playlist: String, localKeyUriFor: (String) -> String): String {
         if (!playlist.contains("#EXT-X-KEY", ignoreCase = true)) return playlist
         // lineSequence() 对「以换行结尾」的正文会在末尾多产出一个空串，
         // 照原样 append 下去就多出一个空行。所以只处理非空行，
@@ -306,7 +329,7 @@ internal object KeyTrimmer {
         lines.forEachIndexed { i, line ->
             out.append(
                 if (line.trimStart().startsWith("#EXT-X-KEY", ignoreCase = true)) {
-                    rewriteKeyLine(line, localKeyUri)
+                    rewriteKeyLine(line, localKeyUriFor)
                 } else {
                     line
                 },
@@ -318,10 +341,25 @@ internal object KeyTrimmer {
 
     private val KEY_URI = Regex("""URI\s*=\s*(?:"([^"]*)"|([^,\s]+))""", RegexOption.IGNORE_CASE)
 
-    private fun rewriteKeyLine(line: String, localKeyUri: String): String {
+    private fun rewriteKeyLine(line: String, localKeyUriFor: (String) -> String): String {
         val m = KEY_URI.find(line) ?: return line
-        return line.replaceRange(m.range, "URI=\"$localKeyUri\"")
+        // 带引号时地址在第一组；不带引号时第一组是空串，地址在第二组。
+        val raw = m.groupValues[2].ifEmpty { m.groupValues[1] }
+        return line.replaceRange(m.range, "URI=\"${localKeyUriFor(raw)}\"")
     }
+
+    /**
+     * 清单里的 key 地址是**相对清单地址**写的（实测 `../key`），要解析成绝对地址，
+     * 代理才知道去哪儿取。`URI("…/8509/1.m3u8").resolve("../key")`
+     * 正是 RFC 3986 的相对引用解析 → `…/info/m3u8/key`（实测站点的真密钥地址）。
+     *
+     * 解析不出时退回「同目录拼一下」，至少地址形状还对。
+     */
+    fun resolveKeyUrl(playlistUrl: String, keyUri: String): String =
+        runCatching { java.net.URI(playlistUrl).resolve(keyUri).toString() }
+            .getOrElse {
+                playlistUrl.substringBeforeLast('/') + "/" + keyUri.substringAfterLast('/')
+            }
 
     /** 拼出本代理的密钥地址。 */
     fun localKeyUri(baseUrl: String): String = baseUrl.trimEnd('/') + LocalKeyProxy.KEY_PATH

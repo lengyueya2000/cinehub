@@ -1,5 +1,6 @@
 package net.cinehub.data.source
 
+import kotlinx.coroutines.delay
 import net.cinehub.data.model.Episode
 import net.cinehub.data.model.Media
 import net.cinehub.data.model.MediaDetail
@@ -45,6 +46,9 @@ import org.jsoup.nodes.Element
 class PpnixAdapter(override val config: SourceConfig) : SourceAdapter {
 
     private val root: String get() = config.baseUrl.trimEnd('/')
+
+    /** 域名根（不含 /cn 语言前缀）：取链 /info/m3u8 挂在这一层。 */
+    private val origin: String get() = java.net.URI(root).let { "${it.scheme}://${it.host}" }
 
     private fun abs(path: String): String = when {
         path.startsWith("http") -> path
@@ -217,21 +221,46 @@ class PpnixAdapter(override val config: SourceConfig) : SourceAdapter {
         val infoId = PpnixScript.lastInfoId
             ?: return StreamResolution.Failed("取不到这部片的 infoid，重新打开一次详情页再试")
 
-        val site = "$root/info/m3u8/$infoId/$param.m3u8"
+        // 取链接口挂在域名根上（`/info/m3u8/...`），不在 /cn 语言前缀下 ——
+        // 拼上 /cn 的地址会被站点前端路由接住，回 200 + 一份首页 HTML：
+        // 状态码看着一切正常，内容根本不是清单。曾在这里用 root 拼，
+        // 模拟器实测 PPnix 一次都取不到链（宿主机 curl 用对路径一直好着，才把病灶藏住）。
+        val site = "$origin/info/m3u8/$infoId/$param.m3u8"
         // 先确认那一集真的有清单：站点对没上的集会回 301 到首页，
         // 那时候照给一个代理地址，播放器会拿到一份 HTML 然后报「解析失败」——
         // 而真相是「这一集还没上」，那句话比解析失败有用得多。
-        val head = runCatching { Http.getKeepStatus(site, referer = root) }.getOrNull()
-        if (head == null || head.status !in 200..299 || !head.body.contains("#EXTM3U")) {
+        val head = playlistOrRetry(site)
+        if (head == null || !head.body.contains("#EXTM3U")) {
             return StreamResolution.Failed(
                 if (head == null) "取不到这一集的播放清单（站点没答上话）" else "这一集还没有片源",
             )
         }
-
         val proxyBase = LocalKeyProxy.acquire(config)
         return StreamResolution.Ready(
             KeyTrimmer.proxiedPlaylistUrl(proxyBase, site),
         )
+    }
+
+    /**
+     * 取一份**真的是 m3u8** 的清单，最多试 [tries] 次。
+     *
+     * 站点对这一接口有三种回答：标准 m3u8；301 到首页（这一集没上）；以及 200 +
+     * 一份 37KB 的首页 HTML —— 地址拼进 /cn 语言前缀时必是它（前端路由接住了），
+     * 地址对了就是清单（见 [resolveStream] 的 origin 说明）。内容说了算：
+     * 不是清单就再要一次，仍不是就把最后一轮带回，让调用方如实说话。
+     *
+     * @return 最后一轮的响应：是清单自然用它；不是清单时也带回（区分「站点没答上话」
+     * 和「这一集还没上」两种说法）；网络一路失败则是 null。
+     */
+    private suspend fun playlistOrRetry(site: String, tries: Int = 3): Http.ResponseBody? {
+        var last: Http.ResponseBody? = null
+        repeat(tries) { i ->
+            val r = runCatching { Http.getKeepStatus(site, referer = root) }.getOrNull()
+            if (r != null && r.status in 200..299 && r.body.contains("#EXTM3U")) return r
+            if (r != null) last = r
+            if (i < tries - 1) delay(300L * (i + 1))
+        }
+        return last
     }
 
     private fun pathEncode(s: String): String =

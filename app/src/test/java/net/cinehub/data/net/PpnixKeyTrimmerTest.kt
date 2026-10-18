@@ -118,6 +118,56 @@ class PpnixKeyTrimmerTest {
         assertEquals(2, Regex("""URI="http://127\.0\.0\.1:9/key\"""").findAll(out).count())
     }
 
+    // ------------------------------------------------------------ 密钥地址解析
+
+    /**
+     * 病灶回归：清单里的 key 地址是相对清单地址写的（`../key`）。
+     *
+     * 曾经把**清单自己的地址**编进本机 key 地址的查询串，取「密钥」时抓回来的
+     * 是整份 m3u8，截 16 字节当密钥 —— 播放器必然解不开，PPnix 一次都没播出来过。
+     * 真密钥地址是按清单地址解析出来的 `…/info/m3u8/key`（宿主机实测回 32 字节，
+     * 截前 16 个字符能解出 TS 包头 0x47）。
+     */
+    @Test
+    fun `相对 key 地址按清单地址解析`() {
+        val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
+        assertEquals(
+            "https://www.ppnix.com/info/m3u8/key",
+            KeyTrimmer.resolveKeyUrl(site, "../key"),
+        )
+    }
+
+    @Test
+    fun `已经是绝对地址的 key 原样保留`() {
+        val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
+        val abs = "https://www.ppnix.com/key/today.bin"
+        assertEquals(abs, KeyTrimmer.resolveKeyUrl(site, abs))
+    }
+
+    @Test
+    fun `改写时每把 key 按各自地址解析`() {
+        val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
+        val out = KeyTrimmer.rewritePlaylist(playlist) { raw ->
+            KeyTrimmer.localKeyUriWithSite("http://127.0.0.1:51234", KeyTrimmer.resolveKeyUrl(site, raw))
+        }
+        val q = Regex("""URI="http://127\.0\.0\.1:51234/key\?u=([^"]*)"""").find(out)?.groupValues?.get(1)
+            ?: error("改写后没有本机 key 地址")
+        assertEquals(
+            "https://www.ppnix.com/info/m3u8/key",
+            java.net.URLDecoder.decode(q, "UTF-8"),
+        )
+    }
+
+    @Test
+    fun `不带引号的相对 key 地址也解析`() {
+        val src = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=../key,IV=0x00\n#EXT-X-ENDLIST\n"
+        val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
+        val out = KeyTrimmer.rewritePlaylist(src) { raw ->
+            KeyTrimmer.localKeyUriWithSite("http://127.0.0.1:9", KeyTrimmer.resolveKeyUrl(site, raw))
+        }
+        assertTrue(out.contains(java.net.URLEncoder.encode("https://www.ppnix.com/info/m3u8/key", "UTF-8")))
+    }
+
     /** 结尾换行别多加一个空行。 */
     @Test
     fun `结尾不多出空行`() {
@@ -132,16 +182,34 @@ class PpnixKeyTrimmerTest {
     fun `代理地址带上站点那份 m3u8 的地址`() {
         val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
         val proxied = KeyTrimmer.proxiedPlaylistUrl("http://127.0.0.1:51234", site)
-        assertTrue(proxied.startsWith("http://127.0.0.1:51234/playlist?u="))
+        assertTrue(proxied.startsWith("http://127.0.0.1:51234/playlist.m3u8?u="))
         // 查询串里的地址要能解回原样，否则代理拿不到站点那份
         val q = proxied.substringAfter("?u=")
         assertEquals(site, java.net.URLDecoder.decode(q, "UTF-8"))
     }
 
+    /**
+     * 病灶回归：代理清单地址必须被 [net.cinehub.data.model.StreamUrls.isHls] 认成 HLS。
+     *
+     * 播放器按这一条判定走 HLS 还是把地址当单个视频抽流。曾经代理路径叫
+     * `/playlist`，后缀 / 末段 / 路径三条判据全不中 —— 整份 m3u8 文本被当作
+     * 媒体探测，`UnrecognizedInputFormatException`，密钥请求一次都没发出来。
+     * 路径上那枚 `.m3u8` 不是装饰，是让播放器认对道的路标。
+     */
+    @Test
+    fun `代理清单地址被 isHls 认成 HLS`() {
+        val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
+        val proxied = KeyTrimmer.proxiedPlaylistUrl("http://127.0.0.1:51234", site)
+        assertTrue(
+            "代理清单地址必须被 isHls 认成 HLS：$proxied",
+            net.cinehub.data.model.StreamUrls.isHls(proxied),
+        )
+    }
+
     @Test
     fun `从请求目标里解回站点地址`() {
         val site = "https://www.ppnix.com/info/m3u8/8509/1.m3u8"
-        val target = "/playlist?u=" + java.net.URLEncoder.encode(site, "UTF-8")
+        val target = "/playlist.m3u8?u=" + java.net.URLEncoder.encode(site, "UTF-8")
         assertEquals(site, KeyTrimmer.siteUrlFrom(target))
     }
 
