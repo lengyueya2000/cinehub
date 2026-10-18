@@ -99,12 +99,14 @@ fun SiteBrowserScreen(
     var web by remember { mutableStateOf<WebView?>(null) }
     /** 这台 WebView 当前加载的是哪个目标；[startUrl] 或 [referer] 变了才重新加载。 */
     var loadedFrom by remember { mutableStateOf("") }
-    // 从「站点」入口进来只是为了登录，此时没有正在放的片子，接住的地址无处可交
+    // 这一页只在真的有一集正在播时才有处可交：接住的地址要交给「正在播的这一集」。
+    // （以前「播放源管理 → 站点」那条纯登录的入口也会落到这里，那一趟接住的地址无处可交。
+    //  现在源管理不再有开站点页的动作，这一页只剩取链这一个来路。）
     val playing by vm.playing.collectAsState()
 
     // 浏览器自己的历史优先：页面里点进了一层解析页，返回键该先退那一层。
     // 原来这里无条件 onClose —— 用户按返回是想回到刚才那页，结果整扇门被关上、
-    // 会话页也没了，得从「播放源管理」重新进。
+    // 会话页也没了，得从播放器那边重新进（源管理里已经不再有开站点页的动作）。
     BackHandler(enabled = true) {
         val wv = web
         if (wv != null && wv.canGoBack()) wv.goBack() else onClose()
@@ -171,8 +173,9 @@ fun SiteBrowserScreen(
                     runCatching { wv.postDelayed({ detachAndDestroy() }, 500L) }
                 }
             }
-            // 会话要落盘，不能清。这一页有两个用处：接住直链，以及从「播放源管理 → 站点」
-            // 进来登用户自己的账号 —— README 写的边界就是「凭证只留在本机 WebView 的 cookie 里」。
+            // 会话要落盘，不能清。这一页有两个来路：播放失败后从播放器进来接直链，
+            // 以及从「播放源管理 → 某条内置源的『凭证』」进来先登好自己的账号 ——
+            // README 写的边界就是「凭证只留在本机 WebView 的 cookie 里」。
             // 清掉等于每次进来都得重登一遍；而 removeAllCookies 清的还是整个 App 的 cookie 域，
             // 会把用户在别的源刚登好的会话一起抹了。
             runCatching { CookieManager.getInstance().flush() }

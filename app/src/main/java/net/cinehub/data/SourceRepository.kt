@@ -1,6 +1,7 @@
 package net.cinehub.data
 
 import android.content.Context
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -19,20 +20,18 @@ private val Context.dataStore by preferencesDataStore(name = "cinehub")
 /**
  * 播放源持久化。
  *
- * 内置的初始源见 [Seed]，用户可以改、可以删、也可以自己加。
+ * 内置源见 [Seed]：**跟着版本走**，每次启动按 [SourceRepository.syncSeeds] 同步一次。
+ * 用户自己添加的源是另一回事，任何一条同步路径都不碰它。
  */
 class SourceRepository(private val context: Context) {
 
     private val KEY = stringPreferencesKey("sources_v1")
     private val BACKUP_KEY = stringPreferencesKey("sources_v1_unreadable")
 
-    /**
-     * 这些内置源的 id **这个安装见过**。
-     *
-     * 「见过」和「在列表里」是两件事，而补新源必须认前者：认后者的话，用户自己删掉的那几条
-     * 会在每次升级时被偷偷加回来一次。
-     */
-    private val SEEN_KEY = stringPreferencesKey("seen_seed_ids")
+    // 上一版在这里还有一份 `seen_seed_ids`：老规矩「只补这个安装没见过的内置源」要靠它分辨
+    // 缺的那几条是用户删的还是版本没带。这一版内置源直接跟版本走，那份账不再参与判断。
+    // 键就此作废、不去 remove 它：对每个老安装删一格等于多一次无谓的写，而留着不影响读取。
+
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
 
     /** 上一次真读通了的列表。读不通时用它兜，见 [sources]。 */
@@ -75,49 +74,53 @@ class SourceRepository(private val context: Context) {
      * 读—改—写整套放进 DataStore 的事务里。
      *
      * 以前是「先 `sources.first()` 读一份 → 在内存里改 → 整份覆盖写回去」，
-     * 三步之间没有任何东西挡着：连着拨两个开关、删除撞上拖拽排序、补回内置源撞上存新源，
+     * 三步之间没有任何东西挡着：连着拨两个开关、删除撞上拖拽排序、同步内置源撞上存新源，
      * 后落地的那一笔都会带着它自己那份**旧**快照，把前一笔刚写进去的结果整个盖掉。
      * 界面上就是「我明明删了它还在」「排好的顺序过一会儿自己变回去」，
      * 而盘上确实被旧数据覆盖了 —— 不是显示没刷新。
      *
      * `edit { }` 里的变换由 DataStore 串行执行，读和写看到的是同一份，
      * 所以改的起点是事务里那份，不是调用方手里那份。
-     *
-     * 变换同时拿到「事务里那份列表」和「这批内置源见过没有」，因为 [syncNewSeeds] 要拿后者
-     * 判；「见过」也在这同一笔事务里刷新 —— 分开写就有个窗口：上一笔还没落、这一笔按旧的
-     * 那份见过判，新源会被补第二次。
      */
-    private suspend fun mutate(f: (List<SourceConfig>, Set<String>) -> List<SourceConfig>) {
+    private suspend fun mutate(f: (List<SourceConfig>) -> List<SourceConfig>) {
         context.dataStore.edit { p ->
             val raw = p[KEY]
             val (stored, unreadable) = decode(raw)
             val prev = stored ?: lastGood ?: Seed.sources
-            val seen = p[SEEN_KEY]?.split(SEEN_SEP)?.filter { it.isNotBlank() }?.toSet().orEmpty()
-            // 排完之后统一重编成 1..n。
-            //
-            // 属性名是 JSON 键、值是用户看到的顺序，重复的 priority 会让「谁排前面」
-            // 取决于排序算法的稳定性， restoreDefaults 补回来的内置源尤其容易和现有条目撞号。
-            // 顺手把整列压成连续整数，读写两边就都只有一种解释。
-            val next = f(prev.filterNot { it.id in Seed.retiredIds }, seen)
-                .sortedBy { it.priority }
-                .mapIndexed { i, s -> s.copy(priority = i + 1) }
-            // 覆盖前先把读不通的那份存档：这一版解析不了它，就得保证它还在盘上，
-            // 而不是被「看起来正常」的新列表就地替换掉。
-            if (unreadable && !raw.isNullOrBlank()) p[BACKUP_KEY] = raw
-            p[KEY] = json.encodeToString(next)
-            p[SEEN_KEY] = Seed.sources.joinToString(SEEN_SEP.toString()) { it.id }
-            lastGood = next
+            commit(p, raw, unreadable, f(prev.filterNot { it.id in Seed.retiredIds }))
         }
     }
 
-    suspend fun upsert(cfg: SourceConfig) = mutate { cur, _ ->
+    /**
+     * 把算好的列表写回去：重编号 → 备份读不通的那份 → 落盘 → 刷新内存副本。
+     *
+     * 重编号的理由：属性名是 JSON 键、值是用户看到的顺序，重复的 priority 会让「谁排前面」
+     * 取决于排序算法的稳定性，同步进来的内置源尤其容易和现有条目撞号。
+     * 顺手把整列压成连续整数，读写两边就都只有一种解释。
+     *
+     * 备份的理由：这一版解析不了盘上那份，就得保证它还在盘上，
+     * 而不是被「看起来正常」的新列表就地替换掉。
+     */
+    private fun commit(
+        p: MutablePreferences,
+        raw: String?,
+        unreadable: Boolean,
+        next: List<SourceConfig>,
+    ) {
+        val numbered = next.sortedBy { it.priority }.mapIndexed { i, s -> s.copy(priority = i + 1) }
+        if (unreadable && !raw.isNullOrBlank()) p[BACKUP_KEY] = raw
+        p[KEY] = json.encodeToString(numbered)
+        lastGood = numbered
+    }
+
+    suspend fun upsert(cfg: SourceConfig) = mutate { cur ->
         val i = cur.indexOfFirst { it.id == cfg.id }
         if (i >= 0) cur.toMutableList().also { it[i] = cfg } else cur + cfg
     }
 
-    suspend fun delete(id: String) = mutate { cur, _ -> cur.filterNot { s -> s.id == id } }
+    suspend fun delete(id: String) = mutate { cur -> cur.filterNot { s -> s.id == id } }
 
-    suspend fun setEnabled(id: String, enabled: Boolean) = mutate { l, _ ->
+    suspend fun setEnabled(id: String, enabled: Boolean) = mutate { l ->
         l.map { if (it.id == id) it.copy(enabled = enabled) else it }
     }
 
@@ -125,10 +128,10 @@ class SourceRepository(private val context: Context) {
      * 按界面上的新顺序重排。
      *
      * 没出现在 [ids] 里的源要留在末尾，不能顺手删掉：拖拽那一刻正好有另一笔写落了新源
-     * （补回内置源、存好一个新源），UI 手里那份顺序就已经少了它 —— 照原样「只保留传进来的」
+     * （同步内置源、存好一个新源），UI 手里那份顺序就已经少了它 —— 照原样「只保留传进来的」
      * 写回去，用户加的那个源就凭空消失了，而界面上他刚刚只是在挪位置。
      */
-    suspend fun reorder(ids: List<String>) = mutate { cur, _ ->
+    suspend fun reorder(ids: List<String>) = mutate { cur ->
         val byId = cur.associateBy { it.id }
         val moved = ids.toSet()
         // 新位置要写成新号：mutate 之后按 priority 排，只换列表顺序不换号等于什么都没改。
@@ -137,101 +140,175 @@ class SourceRepository(private val context: Context) {
     }
 
     /**
-     * 恢复内置源，但保留用户自己加的源。
+     * 内置源跟版本走：升级之后按这一版 [Seed] 同步，**用户自己添加的源一条都不动**。
      *
-     * 用户手滑删掉内置源后不该只能重装 —— 这里按 id 补回缺失的内置源，
-     * 已经是同一个 id 的条目保持原样（含用户的启停与排序）。
-     * 返回补回了几个，交给 UI 说清楚发生了什么。
-     */
-    suspend fun restoreDefaults(): Int {
-        var added = 0
-        mutate { cur, _ ->
-            val have = cur.map { it.id }.toSet()
-            val missing = Seed.sources.filter { it.id !in have }
-            added = missing.size
-            // 缺的补到队尾，不打乱用户已有的排序。
-            val tail = cur.maxOfOrNull { it.priority } ?: 0
-            cur + missing.mapIndexed { i, s -> s.copy(priority = tail + i + 1) }
-        }
-        return added
-    }
-
-    /**
-     * 老安装一次性迁移：已存的 `minoself` 挪到第一位，其余位次保持相对顺序。
+     * 这一句同时管着过去分开做的三件事，它们在这版并成一条路：
+     * - 补进新版本带来的内置源（原 `syncNewSeeds`）；
+     * - 用户删掉的内置源按 id 补回（原 `restoreDefaults`，还要他自己去点按钮）；
+     * - 给老安装的内置源补上后加的新字段（原 `markBuiltinHidden`）。
+     * 理由是内置源不是「用户的一份可改配置」，而是产品自带的线路：版本改了地址、
+     * 换了规则、撤了某一条，都该当场生效；靠用户点按钮才回来，或者靠一次专门的迁移，
+     * 都是把版本该负责的事推给他。
      *
-     * 背景：这一版之前 minoself 是后补进来的，`syncNewSeeds` 按约定只补到队尾，
-     * 老用户（包括 aaa 模拟器上那份）手里它是最后一位；但它现在是默认线路。
-     * 只有在新种子顺序已经把它写成第一（`Seed` 里 priority == 1）时才做，
-     * 以后种子顺序再变也不会重复挪。
-     */
-    suspend fun promoteSeedToFront(seedId: String): Boolean {
-        var moved = false
-        mutate { cur, _ ->
-            val idx = cur.indexOfFirst { it.id == seedId }
-            if (idx <= 0) return@mutate cur
-            val keepOrder = (cur.take(idx) + cur.drop(idx + 1)).sortedBy { it.priority }
-            moved = true
-            listOf(cur[idx].copy(priority = 0)) + keepOrder
-        }
-        return moved
-    }
-
-    /**
-     * 老安装一次性补标：盘里已存的那几个内置源盖上 `hiddenUrl`。
+     * **覆盖只覆盖内容**：地址、接入方式、类型、标签、探点、解析规则、要不要藏地址。
+     * **保留的是用户在这一条上做的决定**：启停开关、他拖出来的位次、他自己填的站点凭证、
+     * 这条源是哪天加的。
+     * 把启停一起覆盖，等于每次升级把用户关掉的线路悄悄打开；把位次一起覆盖，等于
+     * 新版本写的第一名自动成为默认线路（priority == 1 就是界面上那颗「默认」芯片，
+     * 也是进播放器时挑的那一条），那是替他做决定。
      *
-     * 新字段是后加的，老用户 DataStore 里反序列化出来的那四份全是 false ——
-     * 而它们正是要藏地址的那几份。只按 id 认种子源，用户自己加的（id 形如 src_xxx）碰不到。
-     * 已经标过的再走一遍是空操作，顺手幂等。
+     * 新补进来的内置源排到队尾（按 [Seed.sources] 里的相对顺序），不带着种子里写死的
+     * 名次挤进第一格。要在应用启动时调；顺序上排在任何一次用户改动之前。
+     *
+     * 原来还有一句 `promoteSeedToFront("minoself")`，专给老安装把默认线路挪回第一位。
+     * 这一版**不再挪**：位次是用户拖出来的，同步一次都不重排；默认线路只在全新安装时
+     * 由种子里的 priority 决定（minoself 本来就是 1）。
      */
-    suspend fun markBuiltinHidden(): Boolean {
-        var touched = false
-        mutate { cur, _ ->
-            val hiddenIds = Seed.sources.filter { it.hiddenUrl }.map { it.id }.toSet()
-            cur.map {
-                if (it.id in hiddenIds && !it.hiddenUrl) {
-                    touched = true
-                    it.copy(hiddenUrl = true)
-                } else it
+    suspend fun syncSeeds(): SeedSync {
+        var out = SeedSync(sources = emptyList(), added = 0, updated = 0, removed = 0, fresh = emptyList())
+        // 这一笔不走 [mutate]：那个入口会先把撤下的内置源过滤掉，
+        // 于是「这次撤下了 N 个」永远数出 0，界面上那句话就成了死代码。
+        // 这里要看到**过滤之前**那份，才能如实报出「少了哪几条」。
+        context.dataStore.edit { p ->
+            val raw = p[KEY]
+            val (stored, unreadable) = decode(raw)
+            val prev = stored ?: lastGood ?: Seed.sources
+            val merged = mergeSeeds(prev, Seed.sources, Seed.retiredIds)
+            out = merged
+            if (shouldWriteSync(merged, hadStored = stored != null, unreadable = unreadable)) {
+                commit(p, raw, unreadable, merged.sources)
             }
         }
-        return touched
-    }
-
-    /**
-     * 升级带进来的新内置源，自己长进列表里 —— 不用用户去「播放源管理」点补回。
-     *
-     * 判据是「这个 id 这个安装见过没有」，不是「它在不在列表里」。这个区别就是全部：
-     * 认后者的话，用户自己删掉的每一条都会在下次升级时被偷偷加回来一次。
-     *
-     * **第一次走到这条的老安装一个都不补**，只把当前这批记成见过。因为那时候还没有
-     * 「见过」这份账，列表里缺哪几条无从分辨是他删的还是版本没带 —— 宁可少补一次
-     * （他还能点补回），也不能多补一次（那是替他做决定）。
-     *
-     * 要在应用启动时就调，别排在任何一次用户改动之后：[mutate] 每一笔都会刷新那份「见过」，
-     * 先落了别的写，这一版的新源就被记成见过了、反而补不进来。
-     */
-    suspend fun syncNewSeeds(): List<SourceConfig> {
-        var added: List<SourceConfig> = emptyList()
-        mutate { cur, seen ->
-            val have = cur.map { it.id }.toSet()
-            val fresh = if (seen.isEmpty()) emptyList() else
-                Seed.sources.filter { it.id !in seen && it.id !in have }
-            // 一律补到队尾。原来直接带着 Seed 里写死的那个 priority 进来：mutate 之后是按
-            // priority 排序的，于是一条 priority=1 的新源会把用户拖出来的第一名挤下去 ——
-            // 而第一名就是进播放器时默认那个源，那是替他做决定。
-            val tail = cur.maxOfOrNull { it.priority } ?: 0
-            added = fresh.mapIndexed { i, s -> s.copy(priority = tail + i + 1) }
-            cur + added
-        }
-        return added
-    }
-
-    private companion object {
-        const val SEEN_SEP = '\u0001'
+        return out
     }
 }
 
-/** 初始源。 */
+/**
+ * 这一趟同步要不要写盘。抽成纯函数是为了能测 —— 写多写少都不出声：
+ * 写多了会让 `sources` 这条流重新发一遍（列表整屏重组），而带来的信息是零；
+ * 写少了更糟，见下面「读不通」那一支。
+ *
+ * - **读不通时一个字都不写。** 原来这里把「盘上读不通」也算成「要写」，理由是
+ *   `commit` 会顺手把原文存进 `BACKUP_KEY`。存档那一步确实对，但 `commit` 还会
+ *   把主键换成种子 —— 于是下一次 `sources` 解码成功，`unreadable` 归零，
+ *   界面上那段「本机存的源列表这一版读不通，原来那份已另存了一份」的警示**自己消失了**，
+ *   而用户自己加的源已经从列表里消失。备份键全仓没有一处读，等于用户拿不回来。
+ *   所以读不通就整笔不碰：主键保持原样（警示横幅继续挂着），
+ *   备份留到用户下一次真的改动时由 `commit` 照常写入 —— 那条路上 `unreadable` 还在。
+ *   `DownloadRepository` 那边同一条规矩：`if (!unreadable && merged != stored) p[KEY] = ...`。
+ * - 其余情况只有「真动了」才写；从没存过则一定要落一次，那是初始列表。
+ */
+internal fun shouldWriteSync(merged: SeedSync, hadStored: Boolean, unreadable: Boolean): Boolean =
+    !unreadable && (
+        merged.added > 0 || merged.updated > 0 || merged.removed > 0 || !hadStored
+        )
+
+/**
+ * 一次内置源同步的结果，也是 [mergeSeeds] 的返回值 —— 两处用同一个类型。
+ *
+ * 界面上那句话只读四个计数；[sources] 是并好的整份列表，[SourceRepository.syncSeeds]
+ * 要把它落盘。合成一个类型而不是「规则返回一份、仓储再抄成另一份」：
+ * 两套字段名一样的类型摆在一起，早晚会有一边加了字段另一边忘了抄。
+ *
+ * [added] 这次新补进来的条数（包括被删掉又回来的）；[updated] 内容按新版重写过的条数；
+ * [removed] 按 [Seed.retiredIds] 撤掉的条数，[dropped] 就是撤掉的那几条（报名字用）；
+ * [fresh] 新补进来的那几条。
+ */
+data class SeedSync(
+    val sources: List<SourceConfig>,
+    val added: Int,
+    val updated: Int,
+    val removed: Int,
+    val fresh: List<SourceConfig>,
+    val dropped: List<SourceConfig> = emptyList(),
+)
+
+/**
+ * [SourceRepository.syncSeeds] 的那套并表规则，抽成纯函数是为了能直接测：
+ * 「用户自己加的不能被动」和「内置的要跟着版本变」这两件事必须同时成立，
+ * 而它们原来只有真机跑一次升级才看得见。
+ *
+ * id 落在 [seeds] 里的就是内置源，内容整份换成种子那一份（身份那几样除外）；
+ * 落在 [retired] 里的整条剔掉；其余条目原样留着，一个字段都不改。
+ */
+internal fun mergeSeeds(
+    stored: List<SourceConfig>,
+    seeds: List<SourceConfig>,
+    retired: Set<String>,
+): SeedSync {
+    val seedById = seeds.associateBy { it.id }
+    val dropped = stored.filter { it.id in retired }
+    val kept = stored.filterNot { it.id in retired }
+    val removed = dropped.size
+
+    var updated = 0
+    val rewritten = kept.map { s ->
+        val seed = seedById[s.id] ?: return@map s
+        val next = seed.copy(
+            // 用户在这一条上做的决定，一律按盘上那份留着
+            enabled = s.enabled,
+            priority = s.priority,
+            createdAt = s.createdAt,
+            // 凭证是他自己的账号，同步**一个字都不碰**：既不该抹掉，也不该由种子塞一份进来。
+            // 原来这里写的是 `s.authToken ?: seed.authToken`（他没填过就用种子里那份），
+            // 那会让一次升级悄悄把这条从匿名请求变成带凭证请求，而 updated 照样数出 0
+            // —— 行为变了、界面上一个字没说。何况 SourceConfig.authToken 的定义就是
+            // 「用户自己提供的站点会话凭证」，种子那一份本来就不该存在。
+            authToken = s.authToken,
+            authMode = s.authMode,
+        )
+        // 只比内容：上面那四样是从盘上抄来的，本来就该相等；真相等就是这一条没变过。
+        if (differentContent(next, s)) updated++
+        next
+    }
+
+    val have = kept.mapTo(HashSet()) { it.id }
+    // 一律补到队尾。原来直接带着 Seed 里写死的那个 priority 进来：mutate 之后是按
+    // priority 排序的，于是一条 priority=1 的新源会把用户拖出来的第一名挤下去 ——
+    // 而第一名就是进播放器时默认那个源，那是替他做决定。
+    val tail = rewritten.maxOfOrNull { it.priority } ?: 0
+    val fresh = seeds.filter { it.id !in have && it.id !in retired }
+        .mapIndexed { i, s -> s.copy(priority = tail + i + 1) }
+
+    return SeedSync(
+        sources = rewritten + fresh,
+        added = fresh.size,
+        updated = updated,
+        removed = removed,
+        fresh = fresh,
+        dropped = dropped,
+    )
+}
+
+/**
+ * 两条配置的内容是否不同 —— 只看会被版本覆盖的那几样。
+ *
+ * 不能直接 `next != s`：两边共享的启停 / 位次 / createdAt / 凭证是从盘上抄过去的，
+ * 照整份比本来也相等，但「哪些字段算内容」必须写死在这里，因为它和 [mergeSeeds] 里
+ * 那份 `copy` 是一对：那边多抄一格、这边少比一格，就会出现「内容被静默覆盖、
+ * 界面上却说没动过」。加新的内容字段时，这里和 `MergeSeedsTest` 的清单要一起改。
+ */
+private fun differentContent(a: SourceConfig, b: SourceConfig): Boolean =
+    a.baseUrl != b.baseUrl ||
+        a.name != b.name ||
+        a.kind != b.kind ||
+        a.tags != b.tags ||
+        a.html != b.html ||
+        a.api != b.api ||
+        a.probePath != b.probePath ||
+        a.hiddenUrl != b.hiddenUrl ||
+        a.needsBrowser != b.needsBrowser ||
+        a.playPath != b.playPath
+
+/**
+ * 内置源（产品自带的那几条线路）。
+ *
+ * 这份列表**就是**当前版本的内置源集合：应用每次启动按 [mergeSeeds] 把它同步进用户的列表
+ * —— 缺的补回来、内容覆盖成这一份、[retiredIds] 里的清掉。所以改这里等于改「下一版装上去
+ * 长什么样」，而不是改某个默认值。
+ *
+ * 用户自己添加的源不走这条路：它们的 id 形如 `src_xxx`，永远不在 [sources] / [retiredIds] 里。
+ */
 object Seed {
     val sources: List<SourceConfig> = listOf(
         SourceConfig(

@@ -172,8 +172,8 @@ class DownloadRepository(
      */
     private val lastSpaceAt = java.util.concurrent.atomic.AtomicLong(0L)
 
-    /** 任务 id → 最近的速度样本 (时刻, 累计字节)。 */
-    private val speedWin = ConcurrentHashMap<String, ArrayDeque<Pair<Long, Long>>>()
+    /** 任务 id → 这一任务的速度窗口（规则见 [SpeedWindow]）。 */
+    private val speedWin = ConcurrentHashMap<String, SpeedWindow>()
 
     private val _segParallel = MutableStateFlow(DEFAULT_SEG_PARALLEL)
 
@@ -1065,30 +1065,27 @@ class DownloadRepository(
     /**
      * 报一次累计字节，顺带算速度。
      *
-     * 取最近 [SPEED_WINDOW_MS] 的样本，但**至少留两个**：原来剪到「只剩窗口内的样本」，
-     * 于是两次报告一旦隔得比窗口还长，队里就只剩刚进来那一个，span 恒为 0，
-     * `span >= 500` 永远不成立 —— 速度这一栏整个不会出现。慢线上这是常态：分片下载
-     * 每凑满 4 片才报一次，而 4 片在慢线上要十几秒（实测 4kku 一条 0.4 MB/s 的线，
-     * 进度从 163 MB 走到 263 MB，界面上一个速度字都没有）。
+     * 窗口规则在 [SpeedWindow] 里，和播放器的「缓冲速度」共用同一份实现 ——
+     * 两边量的都是「刚才这一小段真的下来了多快」，规则里每一条都是踩过坑才定下来的，
+     * 各写一套的话改一处忘另一处，同一个网络在两个页面上就会给出两套结论。
+     * 这一边只是窗口取 3 秒、不设「停住」判据（按片报告本来就是稀疏的）、
+     * 时钟仍用墙上时钟（每几秒整体重算一次，一次跳变会在下一个报告点自己纠正）。
      *
-     * 留一个窗口外的基准点后，跨度可能比 3 秒长，报出来的是这段平均 —— 慢线上本来
-     * 就只能给平均值，比「没有数字」诚实。
+     * 至少留两个样本那条规矩也在里面：原来剪到「只剩窗口内的样本」，两次报告一旦隔得比
+     * 窗口还长，队里就只剩刚进来那一个，跨度恒为 0，速度这一栏整个不出现 ——
+     * 慢线上这是常态（实测 4kku 一条 0.4 MB/s 的线，进度从 163 MB 走到 263 MB，
+     * 界面上一个速度字都没有）。
      */
     private fun reportBytes(id: String, totalBytes: Long) {
         val now = System.currentTimeMillis()
         // compute 而不是 getOrPut：后者在 ConcurrentHashMap 上也不原子，而同一集的
-        // 8 路 worker 会几乎同时进这里 —— 两边各建一个 deque、后 put 的覆盖前一个，
-        // 于是有一半样本进了那个已经脱离 map 的 deque，算出来的速度是残的。
-        val dq = speedWin.compute(id) { _, existing -> existing ?: ArrayDeque() }!!
-        synchronized(dq) {
-            dq.addLast(now to totalBytes)
-            while (dq.size > 2 && now - dq[1].first > SPEED_WINDOW_MS) dq.removeFirst()
-            val span = now - dq.first().first
-            if (span >= 500L) {
-                val perSec = ((totalBytes - dq.first().second) * 1000 / span).coerceAtLeast(0L)
-                _speed.update { it + (id to perSec) }
-            }
-        }
+        // 8 路 worker 会几乎同时进这里 —— 两边各建一个窗口、后 put 的覆盖前一个，
+        // 于是有一半样本进了那个已经脱离 map 的窗口，算出来的速度是残的。
+        val win = speedWin.compute(id) { _, existing -> existing ?: SpeedWindow(SPEED_WINDOW_MS) }!!
+        win.recordTotal(totalBytes, now)
+        // perSec 返回 null = 这一趟量不出来（样本不够 / 跨度太短），那就一个字都不更新：
+        // 报 0 是「量到了零」的结论，不能拿来顶替「还没量到」。
+        win.perSec(now)?.let { perSec -> _speed.update { it + (id to perSec) } }
     }
 
     private fun forgetSpeed(id: String) {

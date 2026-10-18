@@ -11,12 +11,14 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.PlaybackRepository
+import net.cinehub.data.SeedSync
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
 import net.cinehub.data.quietly
@@ -367,7 +369,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 要在站点自己的页面里打开的地址，以及它是给哪个源用的。
      *
-     * 只有一处能产生它：播放器上的「在站点页面里解析」和源管理里的「在站点里登录」。
+     * 只有播放这一条链路会打开它：播放器上的「在站点页面里解析」，以及取链走到
+     * 「地址要站点自己的页面现算」那一格时的自动打开（见 [play]）。「播放源管理」里
+     * 那个「站点」入口已经去掉 —— 这一页只管源本身，开对方的页面是取链的手段，
+     * 不该在用户只是在列表里翻一个源时冒出来。
      * [referer] 是源站根地址 —— 源站的解析端按来源域名放行，
      * WebView 不带它就会被当成陌生域名拒掉（实测西瓜影院的解析页就这么回过话）。
      */
@@ -412,17 +417,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /**
+     * 「这一次对内置源做了什么」那一句，只在真的动过的这一次启动里有话。
+     *
+     * 不藏：悄悄多一个源、悄悄换一条地址，和悄悄少一个源是同一种毛病，都得让用户看得见。
+     * 一句话把三种动作报齐（补回 / 重写 / 撤下），因为「内置源已按新版更新」这句笼统话
+     * 不足以让人知道他自己加的那几条有没有被动过。
+     *
+     * **不说「这次更新」**：内置源每次启动都跟版本对一次，而「上次删掉的那条又回来了」
+     * 发生在普通重启里，跟更新无关。写「这次更新」就是替一次普通启动安了个不存在的由头。
+     */
+    private val _seedNotice = MutableStateFlow<String?>(null)
+    val seedNotice: StateFlow<String?> = _seedNotice.asStateFlow()
+    fun dismissSeedNotice() { _seedNotice.value = null }
+
+    /**
+     * 内置源同步这一趟跑完了没有。
+     *
+     * 「有 N 个内置源不在列表里 · 补回」那条横幅不能只看当前列表：同步是一笔异步写，
+     * 而 `sources` 这条流会在它落地**之前**先把盘上那份发出来 —— 上一次会话里删掉的内置源
+     * 于是先以「缺失」的样子闪一下，几十毫秒后才被补回来。那等于替一次正常启动报了假警，
+     * 而这一版恰恰规定「缺的会自动补回来」。所以横幅要等这一位翻成 true 再判。
+     *
+     * 同步失败时也翻 true（在 finally 里翻）：否则横幅会永远不出现，
+     * 用户连「手动补回」这条路都没有了。
+     */
+    private val _seedsReady = MutableStateFlow(false)
+    val seedsReady: StateFlow<Boolean> = _seedsReady.asStateFlow()
+
+    // 上面这两位必须声明在 init 之前。`viewModelScope` 跑在 Main.immediate 上：
+    // 属性初始化还没轮到它们时，init 里那个协程的第一段就已经在主线程上同步执行了 ——
+    // 只要 syncSeeds() 还没挂起就抛（runCatching 接住，finally 照跑），
+    // 读到的就是两个还没赋值的 val。顺序摆对，这个地雷不用存在。
+
     init {
         viewModelScope.launch {
-            // 先补这一版新加的内置源、盖内置隐藏标记，再挪默认位，最后量健康度。
-            // 顺序不能反：mutate 每一笔都会刷新「见过」那份账，先落了别的写，
-            // 新源就被记成见过了、反而补不进来。
-            runCatching { sourceRepo.markBuiltinHidden() }
-            val fresh = runCatching { sourceRepo.syncNewSeeds() }.getOrDefault(emptyList())
-            runCatching { sourceRepo.promoteSeedToFront("minoself") }
-            if (fresh.isNotEmpty()) {
-                _seedNotice.value = "这次更新补进来 ${fresh.size} 个新源：" +
-                    fresh.joinToString("、") { it.name } + "。不想要就在下面删掉，删了不会再自动加回来。"
+            // 内置源跟版本走：升级后缺的补回来、内容按新版重写（用户自己加的源不动），
+            // 然后才量健康度 —— 健康表是照着同步完的那份列表探的。
+            try {
+                val sync = runCatching { sourceRepo.syncSeeds() }.getOrNull()
+                if (sync != null) seedNoticeOf(sync)?.let { _seedNotice.value = it }
+            } finally {
+                // 失败也要翻：这一位管着「缺失横幅能不能出现」，
+                // 卡在 false 上等于把用户手动补回的那条路也一起关掉。
+                //
+                // 翻之前先把列表重读一遍再放行：`sources` 那条订阅可能还停在同步前那一帧，
+                // 于是「缺不缺内置源」会拿旧列表判一次，横幅闪一下又消失。
+                // 同步失败时这次重读什么也改不了（盘上那份本来就没动），照旧放行。
+                runCatching { sourceRepo.sources.first() }.getOrNull()?.let { _sources.value = it }
+                _seedsReady.value = true
             }
             // 这一句不能排在 sources.collect 后面：那是一个永不返回的订阅
             // （DataStore 的流不会结束），排在它后面的代码一行都跑不到。
@@ -436,10 +479,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 由 HomeScreen 那边驱动，省得用户直接进「我的」也白取一趟榜单。
     }
 
-    /** 「这次更新补进来了新源」那一句，只在真的补过的这一次启动里有话。 */
-    private val _seedNotice = MutableStateFlow<String?>(null)
-    val seedNotice: StateFlow<String?> = _seedNotice.asStateFlow()
-    fun dismissSeedNotice() { _seedNotice.value = null }
+    /**
+     * 把 [SeedSync] 说成一句话。文案规则见 [_seedNotice] 那段注释。
+     */
+    private fun seedNoticeOf(sync: SeedSync): String? {
+        val parts = buildList {
+            if (sync.added > 0) {
+                add("补进来 ${sync.added} 个内置源：" + sync.fresh.joinToString("、") { it.name })
+            }
+            if (sync.updated > 0) add("按这一版重写了 ${sync.updated} 个内置源的内容")
+            if (sync.removed > 0) {
+                // 报名字：只写「撤下 1 个」的话，用户没法判断少的是哪条 ——
+                // 而他手上那条线路突然不见了，第一反应就是「是不是我删错了」。
+                add("撤下 ${sync.removed} 个内置源：" + sync.dropped.joinToString("、") { it.name })
+            }
+        }
+        if (parts.isEmpty()) return null
+        // 最后一句得说对「不想要怎么办」：内置源删掉会在下次启动补回来（缺的照补），
+        // 所以真正管用的动作是**停用** —— 停用是用户自己的决定，同步一律保留。
+        // 上一版这里写的是「删了不会再自动加回来」，这一版规则反过来了，话也必须跟着反。
+        return "内置源已按这一版对齐：" + parts.joinToString("，") + "。" +
+            "你自己添加的源一条都没动，启停和排序也照旧。" +
+            "不想用某一条就把它停用 —— 内置源被删掉的话，下次启动会补回来。"
+    }
 
     // ---------- 源管理 ----------
 
@@ -545,14 +607,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 补回被删掉的内置源。
+     * 内置源不在列表里时手动补回。
      *
-     * 用户误删后不需要重装 —— 只补缺失的那几个，自己加的源和已有的启停状态都不动。
+     * 这一版起内置源在每次启动按 [SourceRepository.syncSeeds] 跟版本走，缺的自己就回来了，
+     * 所以这里只剩一个用处：让用户**当场**看见效果，不必重开应用。
+     * 走的是同一条并表规则，因此不会出现「手动补的那份和自动同步的那份长得不一样」。
      */
-    fun restoreDefaultSources(onDone: (Int) -> Unit) = viewModelScope.launch {
-        val n = sourceRepo.restoreDefaults()
+    /**
+     * 内置源不在列表里时手动补回。
+     *
+     * 回传整份 [SeedSync] 而不是只回传「补了几个」：这条路走的是同一条并表规则，
+     * 除了补回还可能顺带按新版重写内容，只报一个数就会把另一半动作瞒下来 ——
+     * 而界面上那句话是用户唯一能看到的交代。
+     */
+    fun restoreDefaultSources(onDone: (SeedSync) -> Unit) = viewModelScope.launch {
+        val sync = sourceRepo.syncSeeds()
         refreshHealth(true)
-        onDone(n)
+        onDone(sync)
     }
 
     fun reorder(ids: List<String>) = viewModelScope.launch { sourceRepo.reorder(ids) }

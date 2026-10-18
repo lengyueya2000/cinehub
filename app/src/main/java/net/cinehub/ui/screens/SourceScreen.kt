@@ -60,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import net.cinehub.data.SeedSync
 import net.cinehub.data.model.Health
 import net.cinehub.data.model.HealthReport
 import net.cinehub.data.model.AuthMode
@@ -93,6 +94,7 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
     val checking by vm.checking.collectAsState()
     val unreadable by vm.sourcesUnreadable.collectAsState()
     val seedNotice by vm.seedNotice.collectAsState()
+    val seedsReady by vm.seedsReady.collectAsState()
 
     var showAdd by remember { mutableStateOf(false) }
     // 同一张表单也用来改：接进来的源地址写错了、要换个凭证，以前只能删了重加 ——
@@ -122,7 +124,10 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
 
     // 「补回了几个」记在这一屏，不记在那个 item 里：那块横幅挂在未键控的 item 上，
     // 滚出屏幕就被回收，回来时那句交代没了 —— 用户刚做完的事，界面不认账。
-    var restored by remember { mutableStateOf<Int?>(null) }
+    //
+    // 记整份结果而不是一个数：这条路除了补回还可能顺带按新版重写内容，
+    // 只留一个数就会把另一半动作瞒下来。
+    var restored by remember { mutableStateOf<SeedSync?>(null) }
 
     // 数字口径要和别处一致。首页、搜索、我的三处都按**启用的**源说话，而这一页原来把
     // 停用的一起数进去 —— 同一时刻屏幕上能同时出现「已接入 8 个 · 正常 6」和
@@ -296,9 +301,16 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                 }
             }
 
-            // 内置源被删掉后可以从这里补回，不必重装
-            val missing = net.cinehub.data.Seed.sources.count { s ->
-                sources.none { it.id == s.id }
+            // 内置源跟版本走：启动时按新版直接同步（见 SourceRepository.syncSeeds）。
+            // 这一格留着是因为用户**当场**删掉的内置源不会自己追回来 —— 它到下次启动才补，
+            // 这里给他一个立刻补回的办法，而不是让他重开一次应用。
+            //
+            // 要等 [vm.seedsReady]：同步是异步的，`sources` 会在它落地前先发一次盘上那份，
+            // 于是「上次删掉的内置源」会先以缺失的样子闪一下。那等于替一次正常启动报假警。
+            val missing = if (seedsReady) {
+                net.cinehub.data.Seed.sources.count { s -> sources.none { it.id == s.id } }
+            } else {
+                0
             }
             if (missing > 0) {
                 item {
@@ -322,9 +334,13 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                                     // 这句话是挂在「有 N 个不在列表里」下面说的，
                                     // 原来补回 0 个时会写出「内置源都在，无需补回」—— 上下两句自相矛盾。
                                     // 走到这一支只可能是点下去的那一瞬间列表已经被别的改动补上了。
-                                    if (it == 0) "这几个刚刚已经回到列表里了，这一趟没补新的。"
-                                    else "已补回 $it 个内置源"
-                                } ?: "删掉的内置源可以补回来，你自己添加的源不受影响。",
+                                    if (it.added == 0 && it.updated == 0) {
+                                        "这几个刚刚已经回到列表里了，这一趟没补新的。"
+                                    } else {
+                                        restoreDoneText(it)
+                                    }
+                                } ?: "内置源跟着版本走：删掉的会在下次启动补回来（内容按新版），" +
+                                    "也可以现在点补回。你自己添加的源不受影响。",
                                 color = T.TextFaint,
                                 fontSize = Fs.xxs,
                                 lineHeight = Fs.xxs * 1.6f,
@@ -340,8 +356,44 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                                 .border(1.dp, T.Warn.copy(alpha = .5f), R.full)
                                 .heightIn(min = 44.dp)
                                 .clickable {
-                                    vm.restoreDefaultSources { n -> restored = n }
+                                    vm.restoreDefaultSources { r -> restored = r }
                                 }
+                                .padding(horizontal = 14.dp, vertical = 7.dp),
+                        )
+                    }
+                    Spacer12()
+                }
+            } else if (restored?.let { it.added > 0 || it.updated > 0 } == true) {
+                // 补回成功的交代。
+                //
+                // 单开一支是因为**补回来的那几条排在列表最下面**：补完 missing 就归零，
+                // 原来整块横幅跟着消失，「已补回 N 个」那句话一次都看不见 ——
+                // 源多的用户根本不知道刚才那一下做了什么（他要滑到底才看得见新行）。
+                // 这一行只说结果，不再放「补回」按钮：此刻没有缺的了。
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().clip(R.md)
+                            .background(T.Ok.copy(alpha = .07f))
+                            .border(1.dp, T.Ok.copy(alpha = .28f), R.md)
+                            .padding(Sp.s3),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            restoreDoneText(restored!!) + "，排在最下面",
+                            color = T.Text,
+                            fontSize = Fs.sm,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer12()
+                        Text(
+                            "知道了",
+                            color = T.Ok,
+                            fontSize = Fs.sm,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clip(R.full)
+                                .border(1.dp, T.Ok.copy(alpha = .5f), R.full)
+                                .heightIn(min = 44.dp)
+                                .clickable { restored = null }
                                 .padding(horizontal = 14.dp, vertical = 7.dp),
                         )
                     }
@@ -414,7 +466,6 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
                             },
                             onToggle = { vm.toggleSource(cfg.id, it) },
                             onDelete = { pendingDelete = cfg },
-                            onOpenSite = { vm.openSiteBrowser(cfg.baseUrl, cfg.name) },
                             onEdit = { editTarget = cfg; showAdd = true },
                             onUp = if (i == 0) null else {
                                 {
@@ -447,8 +498,15 @@ fun SourceScreen(vm: AppViewModel, onBack: () -> Unit) {
         pendingDelete?.let { victim ->
             ConfirmDialog(
                 title = "删除「${victim.name}」？",
-                body = "这个源的地址、接入方式和你自己填的凭证都会从本机抹掉，"
-                    + "用它的观看记录还在，但要再播得重新添加回来。",
+                // 内置源删掉会在下次启动补回来（缺的照补），这句话必须说在前面：
+                // 不然用户删完看到它又回来了，只会以为删除坏了。真要长期不要它是**停用**。
+                body = if (victim.hiddenUrl) {
+                    "这个源是内置的：删掉之后下次启动会补回来（内容跟版本走）。" +
+                        "想长期不用它，关掉它的开关就行 —— 停用会一直保留。"
+                } else {
+                    "这个源的地址、接入方式和你自己填的凭证都会从本机抹掉，" +
+                        "用它的观看记录还在，但要再播得重新添加回来。"
+                },
                 confirm = "删除",
                 onConfirm = { vm.deleteSource(victim.id); pendingDelete = null },
                 onDismiss = { pendingDelete = null },
@@ -516,6 +574,21 @@ private fun targetIndexFor(
     return if (abs > f) abs - 1 else abs
 }
 
+/**
+ * 「补回」那一下到底做了什么，一句话说清。
+ *
+ * 不写成固定的「已补回 N 个」：这条路走的是同一条并表规则，补回的同时还可能按新版重写了
+ * 几条的内容 —— 只报一半，用户就会以为那几条没被同步过。两件事都发生时两句都说。
+ */
+private fun restoreDoneText(s: SeedSync): String = buildString {
+    if (s.added > 0) append("已补回 ${s.added} 个内置源")
+    if (s.updated > 0) {
+        if (isNotEmpty()) append("，")
+        append("顺带按新版更新了 ${s.updated} 个内置源的内容")
+    }
+    if (isEmpty()) append("这一趟什么都没变")
+}
+
 @Composable
 private fun Stat(value: String, label: String, color: Color, modifier: Modifier = Modifier) {
     Column(modifier) {
@@ -532,7 +605,6 @@ private fun SourceRow(
     grip: Modifier,
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
-    onOpenSite: () -> Unit,
     onUp: (() -> Unit)?,
     onEdit: () -> Unit,
 ) {
@@ -657,7 +729,7 @@ private fun SourceRow(
             )
         }
         // ---------- 第二行：接入方式 + 这一行的动作 ----------
-        // 动作不做 14dp 的小图标：删源和「站点页取链」都是要点准的，撑到 44dp 才算可点
+        // 动作不做 14dp 的小图标：删源是要点准的，撑到 44dp 才算可点
         Row(
             Modifier.padding(start = Sp.s1, top = Sp.s1, bottom = Sp.s1),
             verticalAlignment = Alignment.CenterVertically,
@@ -677,16 +749,23 @@ private fun SourceRow(
                 Pill(it, cyan = true)
             }
             Box(Modifier.weight(1f))
-            // 「站点」= 在影枢里打开对方自己的页面。用户在这里登自己的账号，
-            // 凭证只留在本机 WebView 的 cookie 里 —— 影枢不代收账号密码。
-            TextAction("站点", color = T.Src400, onClick = onOpenSite)
+            // 这一行不再摆「站点」：这一页只做一件事 —— 管源本身。在影枢里打开对方自己的页面
+            // 是取链那一步的手段，只在播放器真需要它时才出现（见 PlayerScreen 的「在站点页面里解析」）。
             // 上一档是「上移」而不是刷新图标 —— 同一个符号在一行里表示两件事，
             // 用户按下去之前猜不出来。第一行没有可上的位置，就不摆一个按了没反应的按钮。
             if (onUp != null) {
                 TextAction("上移", onClick = onUp)
             }
-            // 改一处地址不必删了重加：删一次就丢掉它的位次和启停，重加只能排到末尾
-            TextAction("编辑", onClick = onEdit)
+            // 改一处地址不必删了重加：删一次就丢掉它的位次和启停，重加只能排到末尾。
+            //
+            // **内置源那一行不写「编辑」，写「凭证」**：它的名称、地址、接入方式、解析路径
+            // 都是版本的内容（见 SourceRepository.syncSeeds），在这里改完下次启动就被新版覆盖
+            // 回去 —— 那按钮按下去只是在骗用户。而凭证是同步**明确保留**的一格
+            // （`mergeSeeds` 里 authToken 原样留着），所以它是内置源上唯一改得动的东西，
+            // 弹层也只露那一格（见 AddSourceSheet 的 credentialOnly）。
+            // 想要一份自己的变体（换个域名、换条线路）就自己添加一条源：
+            // 用户添加的源任何同步路径都不碰，改一次就一直是他那份。
+            TextAction(if (cfg.hiddenUrl) "凭证" else "编辑", onClick = onEdit)
             TextAction("删除", color = T.Err, onClick = onDelete)
         }
         // 不可用的原因整句留在这里，不再截成 18 个字：
@@ -726,6 +805,21 @@ private fun AddSourceSheet(
     var result by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     var tested by remember { mutableStateOf<SourceConfig?>(null) }
     var busy by remember { mutableStateOf(false) }
+
+    /**
+     * 内置源（地址隐藏的那几条）在这张表单里**只露「站点凭证」**。
+     *
+     * 理由是这两类字段的归属不同：
+     * - 名称、地址、接入方式、播放页路径、浏览路径都是**版本的内容**，同步时一律按新版覆盖
+     *   （见 [net.cinehub.data.SourceRepository.syncSeeds]）。在这里改等于改完下次启动就没了，
+     *   那不是「编辑」，那是一次会被撤销的输入。
+     * - 凭证是**用户自己的**，同步明确保留（`mergeSeeds` 里 `authToken` 一格原样留着），
+     *   所以它是内置源上唯一改得动、也该让用户改的一格。
+     *
+     * 这几格虽然不显示，state 仍然按 [initial] 初始化好了，落库时 `keepIdentity` 会照原样
+     * 带上 —— 不显示不等于丢掉。
+     */
+    val credentialOnly = initial?.hiddenUrl == true
 
     // 探测结论只对「探测当时那套输入」成立。改过名字、地址、类型、凭证或播放页路径里的
     // 任何一项，上一次那份结果就作废 —— 不作废的话第二次点下去会把旧配置直接落库，
@@ -792,90 +886,102 @@ private fun AddSourceSheet(
             )
             Spacer16()
             Text(
-                if (initial == null) "添加播放源" else "编辑「${initial.name}」",
+                when {
+                    initial == null -> "添加播放源"
+                    credentialOnly -> "「${initial.name}」的站点凭证"
+                    else -> "编辑「${initial.name}」"
+                },
                 color = T.Text, fontSize = Fs.navTitle, fontWeight = FontWeight.Bold,
             )
             Spacer4()
             Text(
-                "填入站点地址，影枢会自动识别站点类型、抓取资源并生成统一播放列表。",
+                if (credentialOnly) {
+                    "这个源是内置的：地址和解析规则跟着版本走，这里只改你自己的站点凭证。" +
+                        "凭证留在本机，每次启动的内置源同步不会动它。"
+                } else {
+                    "填入站点地址，影枢会自动识别站点类型、抓取资源并生成统一播放列表。"
+                },
                 color = T.TextFaint,
                 fontSize = Fs.xs,
                 lineHeight = Fs.xs * 1.6f,
             )
             Spacer16()
 
-            Field("名称", "用于界面展示") {
-                Box(
-                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
-                        .background(T.Surface2).border(1.dp, T.Border, R.md)
-                        .padding(horizontal = 13.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    if (name.isEmpty()) Text("例如：我的源", color = T.TextFaint, fontSize = Fs.body2)
-                    BasicTextField(
-                        name, { name = it; invalidate() },
-                        singleLine = true,
-                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
-                        cursorBrush = SolidColor(T.Src500),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-
-            Field(
-                "站点地址",
-                if (initial?.hiddenUrl == true) "内置地址已隐藏 · 不填则保留原地址" else "支持 http / https",
-            ) {
-                Box(
-                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
-                        .background(T.Surface2)
-                        .border(1.dp, T.Src500.copy(alpha = .50f), R.md)
-                        .padding(horizontal = 13.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    if (url.isEmpty()) Text(
-                        if (initial?.hiddenUrl == true) "••••••（已隐藏，留空不改）" else "https://",
-                        color = T.TextFaint,
-                        fontSize = Fs.body2,
-                    )
-                    BasicTextField(
-                        url, { url = it; invalidate() },
-                        singleLine = true,
-                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
-                        cursorBrush = SolidColor(T.Src500),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                // 地址是用户自己加的源的必填项，留空时下面那颗按钮就是关着的。
-                // 按钮只是「不能按」，说不出为什么 —— 这句把原因补上，
-                // 不然用户只能靠反复按那颗灰按钮来猜（原来按下去还没反应）。
-                if (initial?.hiddenUrl != true && url.isBlank()) {
-                    Text(
-                        "填入站点地址后才能保存",
-                        color = T.TextDim,
-                        fontSize = Fs.xxs,
-                        modifier = Modifier.padding(top = Sp.s2),
-                    )
-                }
-            }
-
-            Field("接入方式", "不确定就选网页解析") {
-                Column(verticalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                        KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                        KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
-                        KindTile("自建签名接口", "自有后端", SourceKind.MinoApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
-                        Spacer(Modifier.weight(1f))
+            if (!credentialOnly) {
+                Field("名称", "用于界面展示") {
+                    Box(
+                        Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                            .background(T.Surface2).border(1.dp, T.Border, R.md)
+                            .padding(horizontal = 13.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (name.isEmpty()) Text("例如：我的源", color = T.TextFaint, fontSize = Fs.body2)
+                        BasicTextField(
+                            name, { name = it; invalidate() },
+                            singleLine = true,
+                            textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                            cursorBrush = SolidColor(T.Src500),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                     }
                 }
-            }
 
+                // 这一段只有「用户自己添加的源」走得到：内置源（地址隐藏的那几条）
+                // 在 credentialOnly 那一段就结束了，它们的地址连显都不显。
+                // 所以这里不必再判 hiddenUrl —— 原来那几处三元判断在这个分支里恒为假。
+                Field("站点地址", "支持 http / https") {
+                    Box(
+                        Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                            .background(T.Surface2)
+                            .border(1.dp, T.Src500.copy(alpha = .50f), R.md)
+                            .padding(horizontal = 13.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (url.isEmpty()) Text(
+                            "https://",
+                            color = T.TextFaint,
+                            fontSize = Fs.body2,
+                        )
+                        BasicTextField(
+                            url, { url = it; invalidate() },
+                            singleLine = true,
+                            textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                            cursorBrush = SolidColor(T.Src500),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    // 地址是必填项，留空时下面那颗按钮就是关着的。
+                    // 按钮只是「不能按」，说不出为什么 —— 这句把原因补上，
+                    // 不然用户只能靠反复按那颗灰按钮来猜（原来按下去还没反应）。
+                    if (url.isBlank()) {
+                        Text(
+                            "填入站点地址后才能保存",
+                            color = T.TextDim,
+                            fontSize = Fs.xxs,
+                            modifier = Modifier.padding(top = Sp.s2),
+                        )
+                    }
+                }
+
+                Field("接入方式", "不确定就选网页解析") {
+                    Column(verticalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                            KindTile("网页解析", "抓取页面", SourceKind.Html, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                            KindTile("JSON 接口", "标准 API", SourceKind.JsonApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                            KindTile("M3U 列表", "直链列表", SourceKind.M3u, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                            KindTile("签名接口", "需签名的站", SourceKind.AiMovie, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
+                            KindTile("自建签名接口", "自有后端", SourceKind.MinoApi, kind, Modifier.weight(1f)) { kind = it; invalidate() }
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            } // 内置源到此为止：名称 / 地址 / 接入方式都是版本的内容，不给改
+
+            // 凭证这一格两种模式都露：用户自己加的源要填，内置源更是只剩这一格能填。
             Field("站点凭证", "选填 · 需要登录的源填你自己的凭证") {
                 Box(
                     Modifier.fillMaxWidth().height(44.dp).clip(R.md)
@@ -910,45 +1016,47 @@ private fun AddSourceSheet(
                 }
             }
 
-            Field("播放页路径", "选填 · 接口只给爱奇艺/腾讯播放页时才需要") {
-                Box(
-                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
-                        .background(T.Surface2).border(1.dp, T.Border, R.md)
-                        .padding(horizontal = 13.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    if (playPath.isEmpty()) Text(
-                        "如 /index.php/vod/play/id/{id}/sid/{sid}/nid/{nid}.html",
-                        color = T.TextFaint, fontSize = Fs.body2,
-                    )
-                    BasicTextField(
-                        playPath, { playPath = it; invalidate() },
-                        singleLine = true,
-                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
-                        cursorBrush = SolidColor(T.Src500),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+            if (!credentialOnly) {
+                Field("播放页路径", "选填 · 接口只给爱奇艺/腾讯播放页时才需要") {
+                    Box(
+                        Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                            .background(T.Surface2).border(1.dp, T.Border, R.md)
+                            .padding(horizontal = 13.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (playPath.isEmpty()) Text(
+                            "如 /index.php/vod/play/id/{id}/sid/{sid}/nid/{nid}.html",
+                            color = T.TextFaint, fontSize = Fs.body2,
+                        )
+                        BasicTextField(
+                            playPath, { playPath = it; invalidate() },
+                            singleLine = true,
+                            textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                            cursorBrush = SolidColor(T.Src500),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
-            }
 
-            Field("浏览路径", "选填 · 只对「网页解析」生效，缺它时浏览会退化成拿搜索页凑数") {
-                Box(
-                    Modifier.fillMaxWidth().height(44.dp).clip(R.md)
-                        .background(T.Surface2).border(1.dp, T.Border, R.md)
-                        .padding(horizontal = 13.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    if (browsePath.isEmpty()) Text(
-                        "如 /vodshow/1--------{page}---.html",
-                        color = T.TextFaint, fontSize = Fs.body2,
-                    )
-                    BasicTextField(
-                        browsePath, { browsePath = it; invalidate() },
-                        singleLine = true,
-                        textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
-                        cursorBrush = SolidColor(T.Src500),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                Field("浏览路径", "选填 · 只对「网页解析」生效，缺它时浏览会退化成拿搜索页凑数") {
+                    Box(
+                        Modifier.fillMaxWidth().height(44.dp).clip(R.md)
+                            .background(T.Surface2).border(1.dp, T.Border, R.md)
+                            .padding(horizontal = 13.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (browsePath.isEmpty()) Text(
+                            "如 /vodshow/1--------{page}---.html",
+                            color = T.TextFaint, fontSize = Fs.body2,
+                        )
+                        BasicTextField(
+                            browsePath, { browsePath = it; invalidate() },
+                            singleLine = true,
+                            textStyle = TextStyle(color = T.Text, fontSize = Fs.body2),
+                            cursorBrush = SolidColor(T.Src500),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
 
@@ -990,7 +1098,9 @@ private fun AddSourceSheet(
             // 原来只有 clickable 读这个条件、渐变只读 busy，于是地址留空的用户看到的是一颗
             // 满色、随时能按的按钮，按下去什么也不发生 —— 一个按了没反应却看着能按的格子，
             // 比一个明写着「现在不行」的格子更让人反复试。语义与原来完全一致，只是样子跟上。
-            val canSave = !busy && (url.isNotBlank() || initial?.hiddenUrl == true)
+            // 内置源（credentialOnly）的地址栏根本没显示，所以这里不能拿「地址非空」当门槛 ——
+            // 它的地址由 keepIdentity 从原配置带过去。
+            val canSave = !busy && (url.isNotBlank() || credentialOnly)
             Row(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                 Box(
                     Modifier.weight(1f).height(46.dp).clip(R.md).background(T.Surface2)

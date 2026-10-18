@@ -183,12 +183,29 @@ fun PlayerScreen(
     /** 已缓冲到的位置（秒），进度条第二根条与缓冲提示用。0 = 还没量到。 */
     var buf by remember { mutableLongStateOf(0L) }
     /**
-     * 缓冲领先播放点的毫秒数，**只喂缓冲提示那一个百分比**。
+     * 缓冲领先播放点的毫秒数，喂给缓冲提示里「已缓冲 N 秒」那一项。
      *
-     * 不能拿 [buf] 减 [pos] 来算：那两个都是取整到秒的，而分母只有 1.2~2.5 秒，
-     * 相减只剩四五个档位，进度是跳的。这里直接用播放器的毫秒原值，档位足够细。
+     * 不能拿 [buf] 减 [pos] 来算：那两个都是取整到秒的，相减只剩几个粗档位。
+     * 这里直接用播放器的毫秒原值，档位足够细。
      */
     var bufAheadMs by remember { mutableLongStateOf(0L) }
+    /**
+     * 缓冲速度（字节每秒），只喂缓冲提示那一句「· 1.2 MB/s」。
+     *
+     * 取的是 [PlayerBuffering.SpeedMeter] 那份自己数的字节，**不是** Media3 的带宽估计：
+     * 估计只在真的发生加载时更新，连接一挂就冻结在最后一次成功的值上 ——
+     * 那正是缓冲提示最需要说真话的时刻，照它写就成了「1.2 MB/s」而其实一个字都没来。
+     */
+    var bufSpeed by remember { mutableLongStateOf(0L) }
+    /**
+     * 已经多久没有新字节了（毫秒），0 表示没停住。
+     *
+     * 和 [bufSpeed] 分开存，是因为「速度为零」有两种完全不同的意思：
+     * 一种是还没量到（刚起播、样本不够），一种是**量到了零**（这三秒确实一个字节都没进来）。
+     * 前者只能闭嘴，后者必须说出来 —— 追播中卡住时，屏幕上那句「已缓冲 3 秒」不会自己动，
+     * 没有这一项的话整行字是静止的，用户分不清是在走还是死了。
+     */
+    var bufStalledMs by remember { mutableLongStateOf(0L) }
     /** 用户意图，不是 player.isPlaying —— 后者在 HLS seek/buffer 期间会短暂为 false，按钮会闪成「已暂停」。 */
     var wantsPlay by remember { mutableStateOf(true) }
     var buffering by remember { mutableStateOf(true) }
@@ -273,6 +290,15 @@ fun PlayerScreen(
     // 带宽估计器：起始那一档保守一点（见 PlayerBuffering）。
     // 它必须同时挂在播放器和数据源上 —— 只挂一边等于 ABR 永远停在初始值。
     val bandwidth = remember { PlayerBuffering.bandwidthMeter(ctx) }
+
+    /**
+     * 缓冲速度那一份测量，挂在数据源的 transfer listener 上。
+     *
+     * 它是**包着** [bandwidth] 的一层，不是替掉它：一个数据源只接一个监听器，
+     * 直接把这颗塞进 `setTransferListener` 就等于把测量从带宽估计器上摘下来，ABR 当场失效。
+     * 转发的事由 [PlayerBuffering.SpeedMeter] 自己做，这里只负责把它接上去。
+     */
+    val speedMeter = remember { PlayerBuffering.SpeedMeter(bandwidth) }
 
     /**
      * ABR 码率上限（比特每秒）的**当前值**。
@@ -422,8 +448,10 @@ fun PlayerScreen(
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
             // 另一半 wiring：测量是从这里流进带宽估计器的，漏掉这一行
-            // 播放器看到的就永远是那个初始值，码率再也不会跟着网络动
-            .setTransferListener(bandwidth)
+            // 播放器看到的就永远是那个初始值，码率再也不会跟着网络动。
+            // 现在这里挂的是 speedMeter —— 它把每一趟回调原样转发给 bandwidth，
+            // 顺带自己数一份字节给缓冲提示那句速度用（见它的类注释：为什么不能用估计值）。
+            .setTransferListener(speedMeter)
 
         // 缓存好的片子是 file:// 地址，只挂 HTTP 数据源会读不到 —— 按 scheme 分派一层
         val data = androidx.media3.datasource.DefaultDataSource.Factory(
@@ -455,6 +483,16 @@ fun PlayerScreen(
         // 就会算到新那一笔头上，把一条从没试过的线路跳掉。放在换源这一刻，
         // 「播放器在放哪一条」与「账上记着哪一条」才是同一件事。
         attemptUrl = playing?.episodeUrl
+        // 上一条流攒下的速度不作数：换集 / 换源 / 换线路都是另一条流，
+        // 不重置的话新流起播那一瞬会先闪一个旧速度 —— 和上面那句百分比是同一类谎。
+        //
+        // 位置就在换源这一行前面，不能提前到 effect 开头：换集时 url 非空、不走上面那个
+        // stop() 分支，旧数据源在「effect 开头 → setMediaSource」这段时间里还在报字节，
+        // 提前清掉的窗口会立刻被上一集的字节填回来 —— 新流起播头两秒的速度就掺了旧量，
+        // 而那两秒正是用户盯着这个数看的时候。
+        speedMeter.reset()
+        bufSpeed = 0L
+        bufStalledMs = 0L
         player.setMediaSource(source)
         player.prepare()
         // 用这一次请求冻结下来的起点，不用 vm.resumePosition —— 轮询会把那个活值写成 0，
@@ -520,6 +558,11 @@ fun PlayerScreen(
             // 毫秒原值另算一份给缓冲提示：它的分母是 1.2~2.5 秒的起播阈值，
             // 用上面那个取整到秒的数只剩四五档，进度会跳
             bufAheadMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)
+            // 缓冲速度：这一跳顺手读一次测量。放在这个循环里而不是单独一条 effect，
+            // 是因为缓冲中本来就是 100ms 一采（见下面那句 sleptMs 的调法），
+            // 数字跟着同一节拍走，不会和「已缓冲几秒」那句错开一拍。
+            bufSpeed = speedMeter.speedPerSec()
+            bufStalledMs = speedMeter.stalledMs()
             // 稳定计时与放开。READY 就攒时长，够久才放开一次。
             //
             // **这里原来是每跳（500ms）放宽 25% 的阶梯**，那是画质鬼畜的直接来源：
@@ -1295,11 +1338,14 @@ fun PlayerScreen(
                     Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(27.dp))
                 }
             } else if (buffering && playing?.streamUrl != null) {
-                // 缓冲提示报两件分开的事实，不报百分比 ——
+                // 缓冲提示报几件分开的事实，不报百分比 ——
                 // 为什么百分比在这条链路上没有意义，见 PlayerBuffering.bufferingLabel 的注释
                 // （一句话：ExoPlayer 拿数据是成批灌满几十秒的，百分比成了阶跃函数）。
+                // 速度那一项只在真的量到时才写（没量到就整项不出现，不编数字）；
+                // 而「三秒没有新数据」是量到的结论，要写出来 —— 追播中卡住时，
+                // 那句「已缓冲 N 秒」自己不会动，没这一项整行字就是静止的。
                 Text(
-                    PlayerBuffering.bufferingLabel(bufAheadMs, bufferingSec),
+                    PlayerBuffering.bufferingLabel(bufAheadMs, bufferingSec, bufSpeed, bufStalledMs),
                     color = Color.White,
                     fontSize = Fs.xs,
                     modifier = Modifier.align(Alignment.Center),

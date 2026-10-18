@@ -538,16 +538,13 @@ private fun downloadStatsLine(task: DownloadTask, speed: Long): String {
     return parts.joinToString(" · ")
 }
 
-private fun fmtBytes(b: Long): String {
-    val tenthsGb = b * 10 / (1L shl 30)
-    val tenthsMb = b * 10 / (1L shl 20)
-    return when {
-        b >= 1L shl 30 -> "${tenthsGb / 10}.${tenthsGb % 10} GB"
-        b >= 1L shl 20 -> "${tenthsMb / 10}.${tenthsMb % 10} MB"
-        b >= 1024 -> "${b / 1024} KB"
-        else -> "$b B"
-    }
-}
+/**
+ * 字节数 → 人话。实现只有一份：[net.cinehub.data.ByteFormat]。
+ *
+ * 留这个薄壳是为了不动这一屏里那几十处调用点；口径统一在 ByteFormat 里，
+ * 播放器的「缓冲速度」也走同一份（同一个量在两屏上必须是同一个数）。
+ */
+private fun fmtBytes(b: Long): String = net.cinehub.data.ByteFormat.bytes(b)
 
 /**
  * 下载设置。
