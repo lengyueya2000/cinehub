@@ -83,7 +83,42 @@ internal object QilinResolver {
                 timeoutSec = 90,
             )
         }.getOrElse { return StreamResolution.Failed("解析器没有答话：${it.message ?: "请求失败"}") }
-        return streamFromResolve(reply)
+        return gateOnHostResolvable(streamFromResolve(reply))
+    }
+
+    /**
+     * 交给播放器之前先验一次「这台设备解不解得开那个域名」。
+     *
+     * 解析器回吐的地址挂在几个不同的 CDN 域下，而其中有的**在公网 DNS 上已经是
+     * NXDOMAIN**（实测 `png.ruyijx.com`，运营方弃用了）。播放器拿到这种地址必然
+     * UnknownHostException，但它要等满读超时才报错 —— 用户看到的是「点了黑屏、
+     * 卡半分钟才换到别的源」。这里提前一次 DNS 查询把这种地址当场判掉，换源的决策
+     * 交回上层，那半分钟就省下来了。
+     *
+     * 用的是系统解析器（和播放器同一个），所以判据跟播放器实际会不会失败是一致的。
+     * 主机上验的时候会被本地代理的 fake-ip 骗过去（任何域名都回个假 IP），
+     * 这一句在设备上才是它本来的意思。
+     *
+     * 认不出主机名（地址本身不成形）时**不拦**：让播放器去报它自己的错，
+     * 这里编一句「域名解不开」是假话，真实成因是地址不成形。
+     *
+     * [resolvable] 做成注入的，是为了单测里不真发 DNS 查询。
+     */
+    fun gateOnHostResolvable(
+        res: StreamResolution,
+        resolvable: (String) -> Boolean = defaultResolvable,
+    ): StreamResolution {
+        val url = (res as? StreamResolution.Ready)?.url ?: return res
+        val host = runCatching { java.net.URI(url).host }.getOrNull() ?: return res
+        if (resolvable(host)) return res
+        return StreamResolution.Failed(
+            "解析器给的地址解不开那个域名（$host）—— 它自己挂的 CDN 已经失效了，换一条线路或换一个源",
+        )
+    }
+
+    private val defaultResolvable: (String) -> Boolean = { host ->
+        // 解不开时 getAllByName 是抛 UnknownHostException，不是回空数组：两种都算「解不开」
+        runCatching { java.net.InetAddress.getAllByName(host).isNotEmpty() }.getOrDefault(false)
     }
 
     /**
