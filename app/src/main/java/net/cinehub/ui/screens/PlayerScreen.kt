@@ -30,11 +30,17 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -71,7 +77,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.viewinterop.AndroidView
@@ -253,6 +264,17 @@ fun PlayerScreen(
     var lastUi by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var panel by remember { mutableStateOf<Panel?>(null) }
     /**
+     * 触屏锁住了没有。
+     *
+     * 锁住之后这一屏只剩一件事能办：点画面左中那一颗图标解锁。手势整块摘下、控件不弹、
+     * 返回键也不退出播放器 —— 设这个开关的场景就是「揣兜里接着放、接着听」：
+     * 那种场合下误触一次比少一个功能疼得多。
+     *
+     * 只在这一次播放会话里有效（[remember]，不落盘）：退出播放器再进来一定是没锁的 ——
+     * 「进了播放器先得找锁在哪」比「忘了 unlock 出来费点劲」更让人烦。
+     */
+    var screenLocked by remember { mutableStateOf(false) }
+    /**
      * 倍速读的是全局那一份（见 `PlaybackRepository`），不是这一屏的本地态。
      *
      * 以前它是 `remember { mutableFloatStateOf(1f) }`：同一部剧连看八集，每一集都得
@@ -330,6 +352,19 @@ fun PlayerScreen(
         ExoPlayer.Builder(ctx)
             .setLoadControl(PlayerBuffering.loadControl())
             .setBandwidthMeter(bandwidth)
+            // 音频焦点两件套 + 拔耳机暂停。曾经一样都没配：
+            // 来电话、别的 App 放歌，影枢照响不误；拔掉耳机外放继续，
+            // 尴尬是用户自己的。setAudioAttributes(audioFocus=true) 让播放器
+            // 自己去申请/监听焦点（丢失即暂停、拿回不自动恢复 —— 恢不恢复交给用户），
+            // setHandleAudioBecomingNoisy 认「耳机被拔」那个系统广播并暂停。
+            .setAudioAttributes(
+                androidx.media3.common.AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                /* handleAudioFocus = */ true,
+            )
+            .setHandleAudioBecomingNoisy(true)
             .build().apply {
                 playWhenReady = true
                 addListener(object : Player.Listener {
@@ -677,10 +712,17 @@ fun PlayerScreen(
 
     // 控件在播放 3.5 秒后自己收起来；浮层开着时不收，否则选到一半界面就没了。
     // 出错 / 拿不到直链时更不能收 —— 收了就没有返回按钮，用户只能强杀应用。
+    // 锁屏时也不收 —— 弹出来了这一屏就没有「锁」可言了。
     val stuck = errText != null || playing?.streamUrl == null
-    LaunchedEffect(controls, lastUi, wantsPlay, panel, stuck) {
+    LaunchedEffect(controls, lastUi, wantsPlay, panel, stuck, screenLocked) {
+        // 出错时**锁要让位**：那一屏上挂着「重试 / 换源」这些唯一出口，
+        // 锁着它们等于把用户关在一个放不出东西的播放器里。锁不住他还会回来锁。
         if (stuck) {
             controls = true
+            return@LaunchedEffect
+        }
+        if (screenLocked) {
+            controls = false
             return@LaunchedEffect
         }
         if (controls && wantsPlay && panel == null) {
@@ -828,7 +870,10 @@ fun PlayerScreen(
             hint = null
         } else {
             fullscreenBeforePip?.let { fullscreen = it; fullscreenBeforePip = null }
-            controls = true
+            // 锁着的时候出小窗**不把控件拉回来**：那颗小窗里只有画面，
+            // 用户啥也点不了就回了应用 —— 他走之前锁屏，回来第一眼看到的
+            // 应该还是锁着的那块画面，而不是一整排按钮糊上来。
+            if (!screenLocked) controls = true
             lastUi = System.currentTimeMillis()
         }
     }
@@ -902,6 +947,46 @@ fun PlayerScreen(
         if (player.playbackState == Player.STATE_ENDED) stepEpisode(1)
     }
 
+    /**
+     * 双击中间那一竖条 = 暂停/播放，和底部那颗暂停键、非全屏那一行同一个动作。
+     *
+     * 判据用 [wantsPlay]（用户意图）而不是 `player.playWhenReady`（播放器当下）：
+     * ExoPlayer 在缓冲、加载失败时也会把 playWhenReady 翻成 false，认它就会「暂停「暂停」。
+     * 同一份 `if (playWhenReady) pause() else play()` 在别处出现三次了（全屏暂停键、
+     * 非全屏那一行、播放失败重试），这里是第四次 —— 该收进一处了。
+     */
+    fun togglePlay() {
+        // 先取这一刻的意图再动手： wantsPlay 是监听器回写的，pause() 之后
+        // 那一笔还没到（它在主线程下一次回调里），晚一拍读就会把文案说反。
+        val wasPlaying = wantsPlay
+        if (wasPlaying) player.pause() else player.play()
+        // 双击之后画面本身没有变化（除非正好停在尾帧），给一句反馈 ——
+        // 用户不知道这一下是暂停了还是没吃上。
+        hint = if (wasPlaying) "已暂停" else "播放中"
+    }
+
+    /**
+     * 锁屏 / 解锁：同一颗按钮的两面（见画面左中那颗 [LockScreenToggle]）。
+     *
+     * 锁定时顺手把 [panel] 也收掉：浮层开着时控件倒数是停着的（见上面那条 effect 的
+     * `panel == null` 条件），不关就变成「锁屏了但选集面板还开着」的半锁状态。
+     */
+    fun lockScreen() {
+        screenLocked = true
+        panel = null
+        controls = false
+        hint = "已锁定 · 点左侧图标解锁"
+    }
+
+    fun unlockScreen() {
+        screenLocked = false
+        // 解锁后让控件出来一下：这一屏刚才是全冻结的，不摆出控件，
+        // 用户第一眼看到的还是一块「点哪都没反应」的画面。
+        controls = true
+        lastUi = System.currentTimeMillis()
+        hint = null
+    }
+
     fun seekBy(deltaMs: Long) {
         // 时长还没解出来时 `duration` 是 C.TIME_UNSET（负的哨兵）。原来那句
         // `coerceAtLeast(0)` 把钳位变成 `coerceIn(0, 0)` —— 于是准备阶段双击、
@@ -919,6 +1004,9 @@ fun PlayerScreen(
     // 系统返回键与左上角那颗箭头走同一个判断，见 goBack()
     fun goBack() {
         when {
+            // 锁着的时候返回键什么都不做：口袋里蹭一下就把人甩出播放器 / 退出全屏，
+            // 而这一屏的锁本来就是为那个场合设的。说一句话告诉他怎么解。
+            screenLocked -> hint = "已锁定 · 点左侧图标解锁"
             panel != null -> panel = null
             fullscreen -> fullscreen = false
             else -> onBack()
@@ -977,45 +1065,79 @@ fun PlayerScreen(
             }
 
             // ---------- 手势层：在控件之下，吃掉画面区的拖动与点击 ----------
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .playerGestures(
-                        currentPosition = { player.currentPosition.coerceAtLeast(0) },
-                        durationMs = { player.duration.coerceAtLeast(0) },
-                        currentVolume = {
-                            val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                            audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
-                        },
-                        currentBrightness = { if (brightness.isNaN()) 0.5f else brightness },
-                        onScrubPreview = { ms ->
-                            previewSec = ms / 1000
-                            hint = "${fmt(ms / 1000)} / ${fmt(dur)}"
-                        },
-                        onScrubCommit = { ms ->
-                            player.seekTo(ms)
-                            previewSec = null
-                            controls = true
-                            lastUi = System.currentTimeMillis()
-                        },
-                        onVolume = { frac ->
-                            setVolume(audio, frac)
-                            hint = "音量 ${(frac * 100).roundToInt()}%"
-                        },
-                        onBrightness = { frac ->
-                            brightness = frac
-                            hint = "亮度 ${(frac * 100).roundToInt()}%"
-                        },
-                        onDoubleTapSeek = { seekBy(if (it > 0) 10_000 else -10_000) },
-                        onToggleControls = {
-                            controls = !controls
-                            lastUi = System.currentTimeMillis()
-                        },
-                    ),
-            )
+            //
+            // 锁屏时整块**不挂**而不是「挂着、里面判一个 locked 开关」：
+            // awaitEachGesture 一旦启动就跑完整个指头生命周期，判开关只是白跑一遍，
+            // 还得为「锁着时第一下要不要记 lastTap」这种小事操心。不挂就是真的没有手势 ——
+            // 单击/双击/拖进度/音量/亮度一起消失，只剩画面左中那一颗解锁图标
+            // （它在更上面一层，自己 clickable 吃掉自己的那一下）。
+            if (!screenLocked) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .playerGestures(
+                            currentPosition = { player.currentPosition.coerceAtLeast(0) },
+                            durationMs = { player.duration.coerceAtLeast(0) },
+                            currentVolume = {
+                                val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
+                            },
+                            currentBrightness = { if (brightness.isNaN()) 0.5f else brightness },
+                            onScrubPreview = { ms ->
+                                previewSec = ms / 1000
+                                hint = "${fmt(ms / 1000)} / ${fmt(dur)}"
+                            },
+                            onScrubCommit = { ms ->
+                                player.seekTo(ms)
+                                previewSec = null
+                                controls = true
+                                lastUi = System.currentTimeMillis()
+                            },
+                            onVolume = { frac ->
+                                setVolume(audio, frac)
+                                hint = "音量 ${(frac * 100).roundToInt()}%"
+                            },
+                            onBrightness = { frac ->
+                                brightness = frac
+                                hint = "亮度 ${(frac * 100).roundToInt()}%"
+                            },
+                            onDoubleTapSeek = { seekBy(if (it > 0) 10_000 else -10_000) },
+                            onTogglePlay = { togglePlay() },
+                            onToggleControls = {
+                                controls = !controls
+                                lastUi = System.currentTimeMillis()
+                            },
+                        ),
+                )
+            }
 
             LaunchedEffect(brightness) {
                 if (!brightness.isNaN()) activity?.let { applyBrightness(it, brightness) }
+            }
+
+            // ---------- 触屏锁：锁屏/解锁同一颗按钮 ----------
+            //
+            // 位置固定在画面左中：锁着的时候它是唯一还能点的东西（用户伸手就能摸到，
+            // 不必等控件弹出 —— 控件在锁定态根本不弹）；没锁的时候它是颗低调的图标，
+            // 点一下即锁。锁屏期间它不自动隐藏 —— 一隐藏就再没有人能打开这一屏。
+            //
+            // 小窗里不摆：那颗窗只有巴掌大，图标比画面还占地方；而小窗本来就是为了
+            // 「盯着它」才开的，那种场合下锁不锁无差别。
+            //
+            // 非全屏也不摆，锁只在横屏全屏里成立：竖屏预览那一屏，右侧竖排切源栏和
+            // 底部控件不走 [controls] 那道闸（它们本来就该常驻），锁了也拦不住它们 ——
+            // 半锁比不锁更骗人。而锁的场景（揣兜里、横着放）本来就只发生在全屏，
+            // 竖屏预览是「正在用这台手机看详情」，不是口袋。
+            if (fullscreen && !inPip) {
+                LockScreenToggle(
+                    locked = screenLocked,
+                    onClick = {
+                        if (screenLocked) unlockScreen() else lockScreen()
+                    },
+                    // align 必须由调用方给：这颗要贴在画面左中，而 composable 自己
+                    // 不知道会被放进哪种父布局里（这里是 BoxScope，能 align）。
+                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 6.dp),
+                )
             }
 
             // ---------- 顶栏 ----------
@@ -1030,7 +1152,7 @@ fun PlayerScreen(
                             .clickable { goBack() },
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(Icons.Filled.ArrowBack, null, tint = Color.White, modifier = Modifier.size(17.dp))
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White, modifier = Modifier.size(17.dp))
                     }
                     Spacer8()
                     Column(Modifier.weight(1f)) {
@@ -1288,7 +1410,7 @@ fun PlayerScreen(
                         )
                     }
                 }
-            } else if (playerEnded && !inPip && (nextEp != null || curInList)) {
+            } else if (playerEnded && !inPip && !screenLocked && (nextEp != null || curInList)) {
                 // 这一集播到结尾：有下一集就摆连播倒计时（和上面那条 effect 同一个闸门：
                 // 开关关着、或本集已取消，这里也不谎称「3 秒后」，只说播放完成）；
                 // 没下一集就老实说播完了。这里**不看 wantsPlay**：ExoPlayer 到结尾会
@@ -1334,7 +1456,12 @@ fun PlayerScreen(
                         )
                     }
                 }
-            } else if (!wantsPlay && !buffering) {
+            } else if (!wantsPlay && !buffering && !screenLocked) {
+                // 锁着的时候这颗**不出现**：暂停不是事故，画面停着 + 中央一颗能点的播放键，
+                // 等于告诉用户「这屏没锁」—— 而它恰恰是锁定态下除解锁图标外唯一的可点物。
+                // 想让他继续播，先解锁，这是锁的应有之义。
+                // （错误卡和换源告知那两枝**不**加这一道：那是逃生口，锁住等于把人
+                // 关在放不出东西的播放器里 —— 见上面控件倒数处同样的取舍。）
                 Box(
                     Modifier.align(Alignment.Center).size(64.dp).clip(CircleShape)
                         .background(Color.Black.copy(alpha = .42f))
@@ -1607,9 +1734,35 @@ fun PlayerScreen(
                             if (episodes.isEmpty()) {
                                 Text("这一条没有分集列表", color = T.TextFaint, fontSize = Fs.xxs)
                             } else {
+                                // 跳到指定集：4 列网格在 200 集的剧上得滚很久，手找第 157 集
+                                // 纯属折磨。输入集号回车 = 直接播那一集（和点那一格同一个动作）。
+                                if (episodes.size > JUMP_MIN_EPISODES) {
+                                    JumpToEpisodeRow(
+                                        hint = "集号 1-${episodes.maxOf { it.index }}",
+                                        onJump = { n ->
+                                            val e = episodes.firstOrNull { it.index == n }
+                                            if (e == null) {
+                                                // 走不通要说一句话：输错集号却「按了没反应」最难查
+                                                vm.showNotice("这一条线路没有第 $n 集")
+                                            } else {
+                                                playEpisode(e)
+                                                panel = null
+                                            }
+                                        },
+                                    )
+                                    Spacer8()
+                                }
+                                // 线路面板（Panel.Line）是 verticalScroll 套滚动列，照做一遍：
+                                // 固定 4 列 × 高度只到浮层底，一屏 5 行，200 集滚不到底。
                                 LazyVerticalGrid(
                                     columns = GridCells.Fixed(4),
-                                    modifier = Modifier.fillMaxSize(),
+                                    // 每格 34dp + 格间距 7dp：n 行 = 41n − 7。写**死值**是关键：
+                                    // heightIn(min=…) 在 verticalScroll 里拿到的是「无上限」约束，
+                                    // LazyVerticalGrid 在无上限高度下会直接抛异常；
+                                    // 写死之后它是一个有界块，懒加载照常，外层容器负责滚。
+                                    modifier = Modifier.fillMaxWidth().height(
+                                        ((episodes.size + 3) / 4 * 41 - 7).dp,
+                                    ),
                                     horizontalArrangement = Arrangement.spacedBy(7.dp),
                                     verticalArrangement = Arrangement.spacedBy(7.dp),
                                 ) {
@@ -1965,7 +2118,11 @@ fun PlayerScreen(
 /**
  * 画面区手势：
  * 横向拖 = 按整条时间轴跳转；右半竖拖 = 系统音量；左半竖拖 = 窗口亮度；
- * 单击 = 显隐控件；双击左/右半屏 = 快退/快进 10 秒。
+ * 单击 = 显隐控件；双击**中间那一竖条** = 暂停/播放，双击左/右半屏 = 快退/快进 10 秒。
+ *
+ * 三分而不是两分：暂停和快进退是两只手都会用的动作，划成左右各一半之后，
+ * 「双击一下暂停」和「双击一下快进」落在同一片区域上 —— 想暂停的人一不留神就跳走了 10 秒。
+ * 中间留 1/3 给暂停，两边各 1/3 给快进退，食指落在哪半边都是明确的意图。
  *
  * 自己写 awaitEachGesture 而不是叠 detectTapGestures + detectDragGestures ——
  * 两个探测器叠在同一层时，拖动结束会被 tap 再判一次，点一下控件就乱跳。
@@ -1980,6 +2137,7 @@ private fun Modifier.playerGestures(
     onVolume: (Float) -> Unit,
     onBrightness: (Float) -> Unit,
     onDoubleTapSeek: (side: Int) -> Unit,
+    onTogglePlay: () -> Unit,
     onToggleControls: () -> Unit,
 ): Modifier = pointerInput(Unit) {
     val lastTap = longArrayOf(0L)
@@ -1991,6 +2149,9 @@ private fun Modifier.playerGestures(
         val height = size.height.toFloat().coerceAtLeast(1f)
         val slop = viewConfiguration.touchSlop
         val leftSide = down.position.x < width / 2f
+        // 中间那一竖条（画面宽的 1/3）双击是暂停/播放。取 **down 落点**而不是抬手位置：
+        // 手指划过中线时他想点的是按下那一下，和 leftSide 同一个口径，两处不能一个认 down 一个认 up。
+        val centerZone = abs(down.position.x - width / 2f) <= width / 6f
         val baseMs = currentPosition()
         val totalMs = durationMs()
         var axis = 0 // 0 未定 1 横向 2 右竖(音量) 3 左竖(亮度)
@@ -2042,7 +2203,10 @@ private fun Modifier.playerGestures(
                 val now = System.currentTimeMillis()
                 if (now - lastTap[0] < 320L) {
                     lastTap[0] = 0L
-                    onDoubleTapSeek(if (leftSide) -1 else 1)
+                    // 双击落点在中间 → 暂停/播放；左右两半 → ±10 秒。
+                    // 第一下那一下已经把控件显隐过一次（见下面的 else 分支），
+                    // 所以这一下只管播不播，不再去动控件 —— 否则双击一次屏幕闪两下。
+                    if (centerZone) onTogglePlay() else onDoubleTapSeek(if (leftSide) -1 else 1)
                 } else {
                     lastTap[0] = now
                     onToggleControls()
@@ -2134,6 +2298,95 @@ private fun SeekBar(
                     .background(Color.White),
             )
         }
+    }
+}
+
+/**
+ * 「跳到指定集」那一行。
+ *
+ * 200 集的剧在 4 列网格里找第 157 集要滚很久 —— 输入集号回车就播那一集。
+ * 只给超过 [JUMP_MIN_EPISODES] 集的条目挂（短剧一屏就摆得下，挂一行纯属占地方）。
+ */
+@Composable
+private fun JumpToEpisodeRow(hint: String, onJump: (Int) -> Unit) {
+    // 数字键盘 + 「前往」：数字键直接给数字行，ImeAction.Go 让回车就是「去」
+    var text by remember { mutableStateOf("") }
+    val focus = LocalFocusManager.current
+    fun submit() {
+        val n = text.trim().toIntOrNull()
+        if (n != null && n > 0) {
+            onJump(n)
+            text = ""
+            focus.clearFocus()
+        }
+    }
+    Row(
+        Modifier.fillMaxWidth().clip(R.sm)
+            .background(T.Surface2)
+            .border(1.dp, T.Border, R.sm)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.weight(1f)) {
+            if (text.isEmpty()) {
+                Text(hint, color = T.TextFaint, fontSize = Fs.xs)
+            }
+            BasicTextField(
+                value = text,
+                onValueChange = { s -> if (s.length <= 4) text = s.filter(Char::isDigit) },
+                singleLine = true,
+                textStyle = TextStyle(color = T.Text, fontSize = Fs.sm),
+                cursorBrush = SolidColor(T.Play400),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Go,
+                ),
+                keyboardActions = KeyboardActions(onGo = { submit() }),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+            )
+        }
+        // 键盘弹着时回车可能被 IME 吃掉（个别输入法不发 onGo），这颗就是那条兜底
+        Text(
+            "跳转",
+            color = if (text.isEmpty()) T.TextFaint else T.Play400,
+            fontSize = Fs.xs,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.clip(R.full)
+                .background(T.Play500.copy(alpha = if (text.isEmpty()) .06f else .16f))
+                .clickable(enabled = text.isNotEmpty()) { submit() }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        )
+    }
+}
+
+/** 集数超过这个数才显示「跳到指定集」：短剧一屏摆得下，那一行就是占地方。 */
+private const val JUMP_MIN_EPISODES = 41
+
+@Composable
+private fun LockScreenToggle(
+    locked: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // 锁与开锁共用一颗按钮，只是换个图标、换个底色。
+    // 锁定态底色更实、图标用警示色 —— 那一态下画面上只剩它能点，
+    // 得让人一眼看到「锁着」这件事本身，别以为是画面卡了。
+    Box(
+        modifier
+            .size(36.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = if (locked) .45f else .22f))
+            // 和无锁态其他画面图标一个待遇：锁着时的 36dp 是刻意留出来的命中区，
+            // 不想让人在口袋里乱摸时还要瞄着一个小点戳。
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            if (locked) Icons.Filled.Lock else Icons.Filled.LockOpen,
+            contentDescription = if (locked) "解锁" else "锁屏",
+            tint = if (locked) T.Err else Color.White.copy(alpha = .78f),
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 

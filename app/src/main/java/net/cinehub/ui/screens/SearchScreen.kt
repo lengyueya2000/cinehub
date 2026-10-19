@@ -122,7 +122,8 @@ fun SearchScreen(
                 Spacer8()
                 Box(Modifier.weight(1f)) {
                     if (query.isEmpty()) {
-                        Text("搜索影片、演员", color = T.TextFaint, fontSize = Fs.sm)
+                        // 不写「演员」：源站按片名匹配，搜演员只会得到空结果
+                        Text("搜索影片", color = T.TextFaint, fontSize = Fs.sm)
                     }
                     BasicTextField(
                         value = query,

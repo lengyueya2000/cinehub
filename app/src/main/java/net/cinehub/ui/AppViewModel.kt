@@ -173,6 +173,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 盘上那份收藏/观看记录这一版读不通了（[net.cinehub.data.WatchRepository.unreadable]）。 */
     val watchUnreadable: StateFlow<Boolean> = watchRepo.unreadable
 
+    /** 收藏页的排序选择（0 最近加入 / 1 名称 / 2 年份），存盘 —— 退出再进来还是那一档。 */
+    val favoriteSort: StateFlow<Int> = watchRepo.favoriteSort
+    fun setFavoriteSort(value: Int) = watchRepo.setFavoriteSort(value)
+
     // ---------- 豆瓣榜单 ----------
 
     /**

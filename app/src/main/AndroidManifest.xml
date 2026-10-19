@@ -4,6 +4,20 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
+      离线缓存的前台服务（DownloadService）。
+
+      FOREGROUND_SERVICE 是 9.0 起「能当前台服务」的资格；DATA_SYNC 那一条是 34 起
+      分类的规矩 —— 两样都是运行期权限，缺哪一条，startForeground 就在 34+ 上当场
+      SecurityException，缓存直接失败。dataSync 正是「替用户把文件取下来」这一类。
+
+      没有 POST_NOTIFICATIONS：那条权限管的是**这一条通知显不显示**（13+ 默认不给），
+      不管服务能不能当前台。没授权时通知自己待在抽屉里，进程照常被钉住 —— 这正是
+      要的那半件事；为一块牌子去追一个运行期弹窗，反而多一条要解释的路径。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!--
       allowBackup 留着：收藏、进度、播放源列表是用户自己攒的东西，换机时正该跟着走。
       但用户填的站点凭证（SourceConfig.authToken）不能跟着走 —— 它明文躺在
       `cinehub` 那份 DataStore 里，而默认的自动备份会把内部存储整个搬去云端。
@@ -33,5 +47,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          缓存期间把进程钉住的那个服务。类型与代码里 startForeground 传的 dataSync
+          必须对得上（34+ 上对不上就抛），删权限或删类型任何一半都会让缓存起不来。
+          34+ 的短时任务豁免（fastDependant）不适用：一集能下十几分钟。
+        -->
+        <service
+            android:name=".data.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

@@ -143,7 +143,9 @@ fun HomeScreen(
                     ) {
                         Icon(Icons.Filled.Search, null, tint = T.TextFaint, modifier = Modifier.size(14.dp))
                         Spacer8()
-                        Text("搜索影片、演员、播放源", color = T.TextDim, fontSize = Fs.sm)
+                        // 「演员」两个字曾经写在这里，但源站 LIKE 匹配的是片名，
+                        // 搜演员搜不出东西 —— 占位符不能许愿自己兑现不了的。
+                        Text("搜索影片、播放源", color = T.TextDim, fontSize = Fs.sm)
                     }
                 }
             }

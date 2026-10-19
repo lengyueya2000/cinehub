@@ -2,6 +2,7 @@ package net.cinehub.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
@@ -37,6 +38,8 @@ class WatchRepository(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY_FAV = stringPreferencesKey("favorites_v1")
     private val KEY_HIS = stringPreferencesKey("history_v1")
+    /** 收藏页那一排 SortChip 当前选中哪一档（0 最近加入 / 1 名称 / 2 年份）。 */
+    private val KEY_FAV_SORT = intPreferencesKey("favorite_sort_v1")
     /** 解不通时那份原文的去处，见 [snapshot]。和 [SourceRepository] 的备份键同一套路。 */
     private val KEY_FAV_BAK = stringPreferencesKey("favorites_v1_unreadable")
     private val KEY_HIS_BAK = stringPreferencesKey("history_v1_unreadable")
@@ -55,6 +58,38 @@ class WatchRepository(private val context: Context) {
      */
     private val _unreadable = MutableStateFlow(false)
     val unreadable: StateFlow<Boolean> = _unreadable.asStateFlow()
+
+    private val _favoriteSort = MutableStateFlow(DEFAULT_FAV_SORT)
+
+    /**
+     * 收藏页的排序选择。存下来 —— 上一版是 Compose 里的 `remember`，退出那一屏就回 0，
+     * 每次进来都要重挑一次。倍速、连播、画面比例（`PlaybackRepository`）早就是持久的，
+     * 同一种「用户挑好的偏好」不该有两种待遇。档位含义见 [setFavoriteSort]。
+     */
+    val favoriteSort: StateFlow<Int> = _favoriteSort.asStateFlow()
+
+    /**
+     * 排序这一档读盘回来了没有。
+     *
+     * 和 [loaded] 同一道闸的单独一份：`setFavoriteSort` 是直接往这一个键里写的
+     * （不整份覆盖，不需要等 [loaded]），但 [load] 回来时仍可能拿盘上那份旧的
+     * 把用户刚点的盖掉 —— 所以先点过就别再读。和 `PlaybackRepository.loaded` 同一个套路。
+     */
+    @Volatile
+    private var sortLoaded = false
+
+    /**
+     * 记下收藏页选的那一档：0 最近加入 / 1 名称 / 2 年份。
+     *
+     * 认不出的值一律回 0（最近加入）：盘上那份是手改过的、或将来档位重排后残留的序号，
+     * 拿去 `when` 只会落进 else 分支显示最近加入 —— 那正好是默认，写回一个干净的 0 更诚实。
+     */
+    fun setFavoriteSort(value: Int) {
+        val v = if (value in 0..2) value else DEFAULT_FAV_SORT
+        sortLoaded = true
+        _favoriteSort.value = v
+        scope.launch { runCatching { context.watchStore.edit { it[KEY_FAV_SORT] = v } } }
+    }
 
     private var lastSaveAt = 0L
     private var pendingSave: Job? = null
@@ -197,6 +232,14 @@ class WatchRepository(private val context: Context) {
         context.watchStore.edit { p ->
             val favRaw = p[KEY_FAV]
             val hisRaw = p[KEY_HIS]
+            // 排序选择是个独立的偏好，和上面那份「读不通就整份作废」的清单无关：
+            // 收藏 blob 坏了也不该把用户挑好的排序丢掉。读盘期间用户已点过一档时，
+            // 新的那一档说了算（见 [sortLoaded]）。
+            if (!sortLoaded) {
+                _favoriteSort.value = p[KEY_FAV_SORT]?.takeIf { it in 0..2 } ?: DEFAULT_FAV_SORT
+            }
+            p[KEY_FAV_SORT] = _favoriteSort.value
+            sortLoaded = true
             val favs = favRaw?.takeIf { it.isNotBlank() }?.let { decodeIt<Favorite>(it) }
             val his = hisRaw?.takeIf { it.isNotBlank() }?.let { decodeIt<HistoryEntry>(it) }
             val favBad = !favRaw.isNullOrBlank() && favs == null
@@ -229,5 +272,8 @@ class WatchRepository(private val context: Context) {
 
     private companion object {
         const val MAX_HISTORY = 100
+
+        /** 排序默认档：最近加入。和收藏页第一颗 SortChip 同一个顺序。 */
+        const val DEFAULT_FAV_SORT = 0
     }
 }

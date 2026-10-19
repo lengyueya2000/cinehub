@@ -31,7 +31,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -82,7 +81,9 @@ fun FavoritesScreen(
     val favorites by vm.favorites.collectAsState()
     val history by vm.watchHistory.collectAsState()
     val watchUnreadable by vm.watchUnreadable.collectAsState()
-    var sort by remember { mutableIntStateOf(0) }
+    // 排序存盘（WatchRepository）：上一版是 remember，退出再进来就回「最近加入」——
+    // 倍速、连播、画面比例全是持久的，唯独这一档每次进来都要重挑一次。
+    val sort by vm.favoriteSort.collectAsState()
     // 取消收藏要过一道确认：收藏的片常常是找了好久才定位到某一源的，点错一下就得重来
     var pendingDrop by remember { mutableStateOf<Fav?>(null) }
 
@@ -119,9 +120,9 @@ fun FavoritesScreen(
             Modifier.fillMaxWidth().padding(horizontal = Sp.s4, vertical = Sp.s1),
             horizontalArrangement = Arrangement.spacedBy(Sp.s2),
         ) {
-            SortChip("最近加入", sort == 0) { sort = 0 }
-            SortChip("名称", sort == 1) { sort = 1 }
-            SortChip("年份", sort == 2) { sort = 2 }
+            SortChip("最近加入", sort == 0) { vm.setFavoriteSort(0) }
+            SortChip("名称", sort == 1) { vm.setFavoriteSort(1) }
+            SortChip("年份", sort == 2) { vm.setFavoriteSort(2) }
         }
 
         LazyVerticalGrid(

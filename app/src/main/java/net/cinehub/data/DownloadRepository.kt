@@ -18,6 +18,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -84,6 +86,9 @@ class DownloadRepository(
         }
         jobs.clear()
         scope.cancel()
+        // 引擎关了，牌子也得摘 —— 留着一块「正在缓存」的前台通知配一颗空转的协程，
+        // 进程反而被前台服务钉住，下次进来还会看到一条没人认领的通知。
+        runCatching { DownloadService.stop(context) }
     }
 
     /**
@@ -203,6 +208,22 @@ class DownloadRepository(
             val loaded = load()
             if (loaded.isSuccess && !_unreadable.value) pruneOrphans()
             refreshSpace()
+        }
+        // 前台通知那一行字跟着任务与速度走。
+        //
+        // 顺带兼一件正事：这条每秒都在发射，于是它也是**兜底重举**的那条路 ——
+        // 服务被系统单独收掉（Android 15 上 dataSync 有 6 小时额度，到点会被收）之后，
+        // 只要还有任务在跑，下一次发射就把它举回来；一个不剩时走 update（它尊重 wanted），
+        // 不会把刚摘掉的牌子又凭空举起来。举不回来（12+ 不许从后台举牌）时
+        // ForegroundServiceStartNotAllowedException 由 start() 自己吞 —— 平台规矩，
+        // 不该把用户正在下的那集一起砸了。
+        scope.launch {
+            combine(_tasks, _speed) { t, s -> statusLine(t, s) }
+                .distinctUntilChanged()
+                .collect { text ->
+                    if (jobs.isNotEmpty()) DownloadService.start(context, text)
+                    else DownloadService.update(context, text)
+                }
         }
     }
 
@@ -395,22 +416,71 @@ class DownloadRepository(
     // ---------- 执行 ----------
 
     /**
-     * 有空位就把排队的发出去。
+     * 有空位就把排队的发出去，发完顺手把前台服务的牌子对齐一次。
      *
      * 占位（写进 [jobs]）和发射必须在同一把锁里：pump 会从主线程和 IO 线程两侧进来，
      * 慢一步就会把同一集发出去两遍，两笔写同一个文件。
+     *
+     * 举牌/收牌放在**锁外**（见 [syncService]）：pump 的调用方遍布主线程与 IO 线程，
+     * 让「持着 queueLock 等服务那边的往返」白多一层能别开就别开的锁序。
      */
-    private fun pump() = synchronized(queueLock) {
-        val free = MAX_PARALLEL - jobs.size
-        if (free <= 0) return
-        _tasks.value.filter { it.status == DownloadStatus.Queued }.take(free).forEach { t ->
-            val run = Run()
-            if (jobs.putIfAbsent(t.id, run) == null) {
-                run.job = scope.launch { runTask(t.id, run) }
-                // 占位期间被 pause/delete 摘走了就掐掉自己这一笔：map 里已经换了人
-                if (jobs[t.id] !== run) run.job?.cancel()
+    private fun pump() {
+        synchronized(queueLock) {
+            val free = MAX_PARALLEL - jobs.size
+            // 没空位就什么都不发，但**照样**要走到下面的对齐（不能从这块里 return：
+            // 非局部返回会把 syncService 一起跳过，而牌子该不该留由 jobs 说了算）。
+            if (free > 0) {
+                _tasks.value.filter { it.status == DownloadStatus.Queued }.take(free).forEach { t ->
+                    val run = Run()
+                    if (jobs.putIfAbsent(t.id, run) == null) {
+                        run.job = scope.launch { runTask(t.id, run) }
+                        // 占位期间被 pause/delete 摘走了就掐掉自己这一笔：map 里已经换了人
+                        if (jobs[t.id] !== run) run.job?.cancel()
+                    }
+                }
             }
         }
+        syncService()
+    }
+
+    /**
+     * 前台服务的牌子跟着 [jobs] 对齐：还有任务在跑就举着（并刷那一行字），一个不剩就摘。
+     *
+     * 这就是 [DownloadService] 整条生命周期的唯一入口 —— 服务自己不问任务状态，
+     * 仓库不说它就不动，两边永远同一步调。pump() 的末尾是那条总汇合线：
+     * 排队、暂停、续传、单笔跑完，每一条路都经过它。
+     */
+    private fun syncService() {
+        val running = jobs.isNotEmpty()
+        if (running) DownloadService.start(context, statusLine())
+        else DownloadService.stop(context)
+    }
+
+    /**
+     * 通知栏那一行字。任务与速度各变各的（[combine] 取两者），所以这一行每秒都会重算：
+     * 「几集在下 + 现在多快」—— 速度不落盘（见 [speed]），通知也只报当下这一刻的值。
+     *
+     * 排队中的也要数进去：刚点完「缓存全部」那一瞬，那几集全都还是 Queued，
+     * 只数 Running 会显示一句「缓存完成」—— 而那正是最该让人看见「在排队」的时刻。
+     */
+    private fun statusLine(
+        tasks: List<DownloadTask> = _tasks.value,
+        speed: Map<String, Long> = _speed.value,
+    ): String {
+        val running = tasks.filter { it.status == DownloadStatus.Running }
+        val queued = tasks.count { it.status == DownloadStatus.Queued }
+        val active = running.size + queued
+        if (active == 0) return "缓存完成"
+        val head = if (active == 1 && running.size == 1) {
+            // 只有一集在下时说出是哪一部哪一集 —— 用户切走之前常停在「到底在缓存哪一集」上
+            val t = running.first()
+            "「${t.mediaTitle}」${t.episodeName}"
+        } else {
+            "$active 集缓存中"
+        }
+        // 速度量不出来就只留前半句：写「0 B/s」是在说「现在没在动」，多数时候只是还没采到样
+        val perSec = ByteFormat.perSec(speed.values.sum()) ?: return head
+        return "$head · $perSec"
     }
 
     private suspend fun runTask(id: String, self: Run) {
@@ -504,21 +574,18 @@ class DownloadRepository(
      * 实测缓存 4kku 的一集，先稳稳存下 163 MB，然后中途断开 —— 界面照样写着
      * 「线路对你不开放，换一个源」。那是把方向指错：线路是开着的，它已经给了 163 MB，
      * 用户照这句话去换源，反而把已经存下的那半集丢了。
+     *
+     * 大小一律走 [ByteFormat.bytes]（原来这里有一份手抄的 fmtSize，1 KB 以下会写成
+     * 「512 KB」—— 和全应用那一份口径对不上）。
      */
     private fun reasonOf(e: Exception, t: DownloadTask): String {
         val got = t.bytesDone
         if (got > 0L && e is java.io.IOException) {
             val pct = if (t.bytesTotal > 0) "，约 ${(got * 100 / t.bytesTotal).coerceAtMost(99)}%" else ""
-            return "存下 ${fmtSize(got)}$pct 之后连接断了 —— 已经落盘的那些分片还在，" +
+            return "存下 ${ByteFormat.bytes(got)}$pct 之后连接断了 —— 已经落盘的那些分片还在，" +
                 "点继续会从没下完的分片接着来，不用整集重下。"
         }
         return reasonOf(e)
-    }
-
-    private fun fmtSize(b: Long): String = when {
-        b >= 1_073_741_824 -> "%.1f GB".format(b / 1_073_741_824.0)
-        b >= 1_048_576 -> "%.1f MB".format(b / 1_048_576.0)
-        else -> "%.0f KB".format(b / 1024.0)
     }
 
     private suspend fun download(id: String) {
@@ -662,7 +729,7 @@ class DownloadRepository(
                     // 半截断开和正常结束在客户端看来一模一样。所以要问一句：
                     // 从这一字节起还有没有内容。有就交给外层重试接着下，别急着 promote。
                     if (total == 0L && done > 0L && tailWaiting(id, url, cfg, done)) throw Transient(
-                        "对方没给文件总长度，按字节续到 ${fmtSize(done)} 时后面还有内容 —— 接着下。",
+                        "对方没给文件总长度，按字节续到 ${ByteFormat.bytes(done)} 时后面还有内容 —— 接着下。",
                     )
                     val d = done
                     reportBytes(id, d)

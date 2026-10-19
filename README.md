@@ -58,7 +58,7 @@ keytool -genkeypair -keystore .signing/cinehub-release.jks -alias cinehub \
 
 当前发布证书的 SHA-256 指纹：`10:61:03:3E:DF:BB:36:4B:69:B8:56:18:26:3B:B0:ED:67:8C:B5:9C:0A:C7:86:74:ED:90:32:4A:FD:9C:F9:E`
 
-Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。打包后 2.6 MB，debug 包 26 MB。
+Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。打包后 2.8 MB，debug 包 21 MB。
 
 如果依赖已经在本地 Gradle 缓存里，加 `--offline` 会明显更快。
 
@@ -376,6 +376,12 @@ HLS 规范（RFC 8216）说 `#EXT-X-KEY` 的 `URI` 指向的文件里存的就�
   改动只作用于**之后开始**的任务：正在下的那条已经按旧并发数起好了 worker 池，要暂停再点「继续」才会换（设置页也这么写，不假装即时生效）。
   HLS 的分片列表不给字节数，所以「总共多大」在第一个分片落地前只能估 —— 估出来的带「约」，
   下完那一格转成实际落盘字节，「约」字跟着消失（`DownloadTask.sizeEstimated`）。
+- **缓存跑着的时候有前台服务举牌**（`data/DownloadService`，`dataSync` 型）：有任务在跑就常驻一条低优先级通知
+  （「几集缓存中 · 多快」，每秒跟着速度刷），一个不剩就摘牌 —— 没有它，用户切去别的应用转一圈，系统就可能把进程收掉，
+  回来满屏「排队中」变「已暂停」。生命周期只有 `DownloadRepository.syncService()` 一个入口（挂在 `pump()` 末尾，
+  排队/暂停/续传/跑完每一条路都经过它）；通知那条链每秒的发射同时兼作兜底重举（服务被系统单独收掉后举回来）。
+  12+ 从后台举牌会被平台拦下 —— 拦了就当没牌子，下载照跑，不为一条通知砸用户的任务。
+  没要 `POST_NOTIFICATIONS`：决定进程优先级的是服务本身，通知可见与否不影响它。
 - **首页 = 豆瓣「剧集 · 热门」那一张榜**：一屏的画面全出自这一张榜（`DoubanRepository`，落盘键 `tv/热门/recommend`），
   进来这一屏取一次；盘上有旧的先上屏，旁边写着「取回于 今天 14:18」，最新一次没成则旧榜留着、
   上面加一句「最新一次没刷新成功：…」—— 一次网络抖动不该把首页冲成空白。
@@ -409,9 +415,9 @@ HLS 规范（RFC 8216）说 `#EXT-X-KEY` 的 `URI` 指向的文件里存的就�
   起播偏向最高档靠的是 `PlayerBuffering.START_AT_BITRATE`（1.5 → 6 Mbps）：那是 ABR 的**初始估计**，
   估低了开头要往上爬好几轮，看到的就是「先糊一会儿才清楚」。代价反过来也真 —— 出口本来就慢时，
   开头几秒会因为去追一条下不动的档而多缓冲一会儿。两边不兼得，这里选了「起手就清楚」。
-- **退到后台就停，唯一的例外是小窗**：播放器挂了 `LifecycleEventObserver`，`ON_STOP` 时 `pause()`。影枢没有前台服务也不发播放通知，
+- **退到后台就停，唯一的例外是小窗**：播放器挂了 `LifecycleEventObserver`，`ON_STOP` 时 `pause()`。影枢不给**播放**做前台服务、也不发播放通知，
   放任它在后台放着，用户既找不到入口也关不掉；回来时不自动续播。小窗里不许停 —— 那三条抱怨的「看不见、关不掉」，
-  那颗悬浮窗本身就是入口和关得掉。
+  那颗悬浮窗本身就是入口和关得掉。（前台服务只用在一处：`data/DownloadService` 给**离线缓存**举牌，见「离线缓存」一节。）
 - **小窗播放：在播放器里按 Home 就把画面缩成系统那颗悬浮窗**（`MainActivity.onUserLeaveHint`）。
   发起权只能在 Activity（只有它收得到「用户按了 Home」），而「放不放得开、什么形状」只有播放器那一屏知道 ——
   所以那条 500ms 的轮询顺手报一次视频宽高比（`AppViewModel.pipRatio`，还没解出画面就是 `null`，

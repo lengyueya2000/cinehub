@@ -400,19 +400,55 @@ fun DetailScreen(
             }
 
             item {
-                Column(Modifier.padding(Sp.s4)) {
-                    Text("简介", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
-                    Spacer8()
-                    Text(
-                        // 简介的清洗要 remember：这一屏会随 downloads / health / watchHistory
-                        // 的每一次发射重组（下载中就是每秒好几次），而 cleanIntro 里
-                        // 走 24 个实体替换 + 四趟正则 —— 每帧重跑一遍纯属白烧。
-                        remember(d.intro, d.media.intro) { cleanIntro(d.intro ?: d.media.intro) } ?: "暂无简介",
-                        color = T.TextDim,
-                        fontSize = Fs.sm,
-                        lineHeight = Fs.sm * 1.78f,
-                    )
+                // 演职员：适配器解析了 actors/director（苹果 CMS、MINO、PPnix 都给），
+                // 界面却从来没显示过。有值才显示这一段 —— 大多数源只有其中一样，
+                // 空着一条「导演：」比不显示更难看。导演与演员同行不同段，各自整段省略。
+                val cast = d.media.actors?.takeIf { it.isNotBlank() }
+                val director = d.media.director?.takeIf { it.isNotBlank() }
+                if (cast != null || director != null) {
+                    Column(Modifier.padding(Sp.s4)) {
+                        Text("演职员", color = T.Text, fontSize = Fs.body, fontWeight = FontWeight.Bold)
+                        Spacer8()
+                        if (director != null) {
+                            Text(
+                                "导演：$director",
+                                color = T.TextDim,
+                                fontSize = Fs.sm,
+                                lineHeight = Fs.sm * 1.6f,
+                            )
+                        }
+                        if (cast != null) {
+                            Text(
+                                "主演：$cast",
+                                color = T.TextDim,
+                                fontSize = Fs.sm,
+                                lineHeight = Fs.sm * 1.6f,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                    }
                 }
+            }
+
+            item {
+                Text(
+                    "简介",
+                    color = T.Text,
+                    fontSize = Fs.body,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = Sp.s4),
+                )
+                Spacer8()
+                Text(
+                    // 简介的清洗要 remember：这一屏会随 downloads / health / watchHistory
+                    // 的每一次发射重组（下载中就是每秒好几次），而 cleanIntro 里
+                    // 走 24 个实体替换 + 四趟正则 —— 每帧重跑一遍纯属白烧。
+                    remember(d.intro, d.media.intro) { cleanIntro(d.intro ?: d.media.intro) } ?: "暂无简介",
+                    color = T.TextDim,
+                    fontSize = Fs.sm,
+                    lineHeight = Fs.sm * 1.78f,
+                    modifier = Modifier.padding(horizontal = Sp.s4),
+                )
             }
         }
 
