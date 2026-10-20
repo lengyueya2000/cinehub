@@ -14,8 +14,9 @@ import org.junit.Test
  *
  * 默认**跳过**（构建机上不该打真实站点，也不该让 CI 的绿取决于一个外部后端）。
  * 本地验证时带上环境变量 `MINO_LIVE=1` 才真的跑：
- * `gradlew :app:testReleaseUnitTest --tests net.cinehub.data.source.MinoLiveIT -Dorg.gradle.project.MINO_LIVE=1`
- * 或先 `$env:MINO_LIVE='1'` 再跑本模块测试。
+ * `$env:MINO_LIVE='1'; .\gradlew :app:testReleaseUnitTest --tests net.cinehub.data.source.MinoLiveIT`
+ * （Linux/macOS：`MINO_LIVE=1 ./gradlew …`。判据读的是 `System.getenv`，
+ *  Gradle 的 `-Dorg.gradle.project.MINO_LIVE=1` 传不进来 —— 照那样写只会静默跳过。）
  *
  * 这一条不是走过场：单测钉的是「我们的算法和参考实现一致」，这一条钉的是
  * 「后端今天还认我们这套签名」。两边都绿，才有资格说整合完成。

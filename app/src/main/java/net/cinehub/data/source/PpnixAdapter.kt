@@ -161,9 +161,9 @@ class PpnixAdapter(override val config: SourceConfig) : SourceAdapter {
         // 分集只在那段 script 里。取不到就说明这一部还没有片源
         // （站点有详情页但取链接口还没上片），照实说，别给一份空的选集。
         val vars = PpnixScript.read(doc) ?: return MediaDetail(media, emptyList(), intro = media.intro)
-        // 取链要用的 infoid 只有这里有：顺手记下来，resolveStream 读它。
-        // 换源、换集都会重新走一遍 detail()，所以这个值跟着当前看的这部片走。
-        PpnixScript.lastInfoId = vars.infoId
+        // 取链要用的 infoid 只有这里有：按这一部的 mediaId 记下来，resolveStream 读它。
+        // （换源、换集不一定重走 detail()，所以不能只记「最后一次」—— 见 rememberInfoId。）
+        vars.infoId?.let { infoId -> rememberInfoId(media.id, infoId) }
 
         val params = vars.params
         val isMovie = vars.paramKind == PpnixScript.Kind.Movie
@@ -211,15 +211,17 @@ class PpnixAdapter(override val config: SourceConfig) : SourceAdapter {
      * 站点给的密钥不是规范形态，而播放器只认规范的。代理在那里把 `#EXT-X-KEY`
      * 的 URI 换成本机、把密钥截成 16 字节，分片仍由播放器直连 IPFS。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution {
         // episodeUrl 在这一型里是「参数」（`1080P` 或集号字符串），不是地址。
         val param = episodeUrl.trim().takeIf { it.isNotBlank() }
             ?: return StreamResolution.Failed("这一集没有可取链的参数")
 
         // infoid 得从详情页那段 script 里拿，而 resolveStream 手上只有参数。
-        // 由 [detail] 顺手写进 [PpnixScript.lastInfoId]，这里读它。
-        val infoId = PpnixScript.lastInfoId
-            ?: return StreamResolution.Failed("取不到这部片的 infoid，重新打开一次详情页再试")
+        // 由 [detail] 按 mediaId 记下（见 [rememberInfoId]），这里照 mediaId 查 ——
+        // 查不到就不猜：猜错一次就是拿另一部片的地址去要清单，站点回 200 + 首页 HTML，
+        // 界面上还说着「这一集还没有片源」，比说「重新打开一次详情页」难查得多。
+        val infoId = mediaId?.let { infoIdFor(it) }
+            ?: return StreamResolution.Failed("取不到这部片的取链参数，重新打开一次详情页再试")
 
         // 取链接口挂在域名根上（`/info/m3u8/...`），不在 /cn 语言前缀下 ——
         // 拼上 /cn 的地址会被站点前端路由接住，回 200 + 一份首页 HTML：
@@ -266,8 +268,52 @@ class PpnixAdapter(override val config: SourceConfig) : SourceAdapter {
     private fun pathEncode(s: String): String =
         java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
+    /**
+     * 最近一次解析出来的 infoid，按 mediaId 各存一份。
+     *
+     * 这是这一型绕不开的一处妥协：`SourceAdapter.resolveStream(episodeUrl)` 的签名里
+     * 只有「这一集的地址」，而取链要的是 `infoid` —— 它在详情页，不在分集里。
+     *
+     * 三条路都走不通，所以留这一个：改接口签名会动到全部适配器和上层；
+     * 把 infoid 塞进 episodeUrl 会让上面每一层都把它当地址解析（它是个数字）；
+     * 每次 resolveStream 重新拉一遍详情页 = 每次起播多一次请求，而详情就在手上。
+     *
+     * **按 mediaId 记，不记一个全局单值**：infoid 是**一部片**的属性，不是这个源的属性。
+     * 曾经这里只有一个 `@Volatile` 槽，谁最后打开详情页谁说了算 —— 于是打开过 A 剧
+     * （47 集）再打开 B 电影，回去播 A 的第 30 集时，取链地址拼的是 B 的 infoid：
+     * 站点回 200 + 一份首页 HTML，界面上说的是「这一集还没有片源」，
+     * 而真相是拿错了片子的地址。AppViewModel 换线路、换集并不重走 detail()，
+     * 那条「换源时会刷新」的防线在换集这条路上根本不设防。
+     *
+     * 存在适配器实例上（不是 companion）：换源的地址、凭证一变，`SourceAdapters` 会换一个新实例，
+     * 这张表跟着一起换 —— 拿 companion 存就会在「用户改了源地址」之后还拿着旧站的 infoid。
+     */
+    private val lastInfoIds = LinkedHashMap<String, String>()
+
+    /** 记下这一部的 infoid（覆盖旧的）。 */
+    @Synchronized
+    fun rememberInfoId(mediaId: String, infoId: String) {
+        lastInfoIds.remove(mediaId)
+        lastInfoIds[mediaId] = infoId
+        // 超过就淘汰最早那个：LinkedHashMap 的迭代顺序就是写入顺序，头一个最旧
+        while (lastInfoIds.size > INFO_ID_CACHE_MAX) {
+            val oldest = lastInfoIds.keys.firstOrNull() ?: break
+            lastInfoIds.remove(oldest)
+        }
+    }
+
+    /** 这一部的 infoid；没打开过它的详情页就没有。 */
+    @Synchronized
+    fun infoIdFor(mediaId: String): String? = lastInfoIds[mediaId]
+
     private companion object {
         val YEAR = Regex("(19|20)\\d{2}")
+
+        /**
+         * infoid 缓存留几部片。够「在几部片之间来回点着播」就行，不是为了当数据库 ——
+         * 淘汰最早那个，用户回去看很久以前那部时重新打开一次详情页就有。
+         */
+        const val INFO_ID_CACHE_MAX = 8
     }
 }
 
@@ -291,22 +337,6 @@ internal object PpnixScript {
         /** 电影是 `['1080P']`，电视剧是 `['1'..'47']`。 */
         val paramKind: Kind,
     )
-
-    /**
-     * 最近一次解析出来的 infoid。
-     *
-     * 这是这一型绕不开的一处妥协：`SourceAdapter.resolveStream(episodeUrl)` 的签名里
-     * 只有「这一集的地址」，而取链要的是 `infoid` —— 它在详情页，不在分集里。
-     *
-     * 三条路都走不通，所以留这一个：改接口签名会动到全部五个适配器和上层；
-     * 把 infoid 塞进 episodeUrl 会让上面每一层都把它当地址解析（它是个数字）；
-     * 每次 resolveStream 重新拉一遍详情页 = 每次起播多一次请求，而详情就在手上。
-     *
-     * 它是 `@Volatile` 的单值缓存：详情页打开时写，取链时读。两个源同时放的情况
-     * 不会错到播错片 —— 换源时 AppViewModel 会重新走一遍 detail()，值跟着刷新。
-     */
-    @Volatile
-    var lastInfoId: String? = null
 
     /** 从详情页正文里读出那几个变量。没有那段 script 时返回 null。 */
     fun read(doc: Document): Vars? {

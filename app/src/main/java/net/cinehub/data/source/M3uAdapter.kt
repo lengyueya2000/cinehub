@@ -81,7 +81,7 @@ class M3uAdapter(override val config: SourceConfig) : SourceAdapter {
     }
 
     /** m3u 里存的本身就是直链。 */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution =
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution =
         if (episodeUrl.startsWith("http")) StreamResolution.Ready(episodeUrl)
         else StreamResolution.Failed("播放列表里这一项不是可直接播放的地址")
 

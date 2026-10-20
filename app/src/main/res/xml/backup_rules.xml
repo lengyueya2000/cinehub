@@ -4,9 +4,8 @@
   两份内容是同一件事：把用户填的站点凭证挡在备份之外）。
 
   只排 `cinehub` 那一份 DataStore —— 里面装着 SourceConfig.authToken。
-  收藏 / 进度 / 缓存清单照常备份。
+  收藏 / 进度 / 缓存清单照常备份（缓存清单里存的是集号，不是解析出来的直链）。
 -->
 <full-backup-content>
     <exclude domain="file" path="datastore/cinehub.preferences_pb" />
-    <exclude domain="file" path="datastore/cinehub_downloads.preferences_pb" />
 </full-backup-content>

@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import net.cinehub.ui.screens.DetailScreen
 import net.cinehub.ui.screens.DownloadSettingsScreen
+import net.cinehub.ui.screens.PlaybackSettingsScreen
 import net.cinehub.ui.screens.DownloadsScreen
 import net.cinehub.ui.screens.HomeScreen
 import net.cinehub.ui.screens.LibraryScreen
@@ -73,6 +74,7 @@ private sealed interface Route {
     data object SourceManage : Route
     data object Downloads : Route
     data object DownloadSettings : Route
+    data object PlaybackSettings : Route
     data object Favorites : Route
     data object History : Route
 }
@@ -244,10 +246,16 @@ fun CineHubApp(vm: AppViewModel = viewModel()) {
                         onOpenHistory = { go(Route.History) },
                         onOpenDownloads = { go(Route.Downloads) },
                         onOpenDownloadSettings = { go(Route.DownloadSettings) },
+                        onOpenPlaybackSettings = { go(Route.PlaybackSettings) },
                         onOpenDetail = { s, m -> openDetail(s, m) },
                     )
 
                     is Route.DownloadSettings -> DownloadSettingsScreen(
+                        vm = vm,
+                        onBack = { backOr(Route.Sources) },
+                    )
+
+                    is Route.PlaybackSettings -> PlaybackSettingsScreen(
                         vm = vm,
                         onBack = { backOr(Route.Sources) },
                     )

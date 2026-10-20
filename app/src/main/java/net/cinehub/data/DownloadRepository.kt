@@ -595,7 +595,8 @@ class DownloadRepository(
         val page = t.episodeUrl?.takeIf { it.isNotBlank() }
             ?: error("这一集没有给出播放页地址，解析不了直链")
 
-        val res = media.resolveStream(cfg, page)
+        // mediaId 一起给：PPnix 那一型的取链地址要按「哪一部片」查（见 resolveStream 的注释）
+        val res = media.resolveStream(cfg, page, t.mediaId)
         val direct = (res as? StreamResolution.Ready)?.url ?: error(res.userNote() ?: "解析不到可下载的地址")
 
         // 目录名是拿站点的 vid 拼出来的，长度没人保证 —— 文件系统对单个名字有上限，

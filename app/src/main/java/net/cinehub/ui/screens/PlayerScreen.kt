@@ -49,6 +49,8 @@ import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -117,7 +119,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** 播放器右侧浮层的内容。 */
-private enum class Panel { Episodes, Line, Quality, Speed, Source }
+private enum class Panel { Episodes, Line, Quality, Speed, Resize, Source }
 
 /** 横滑划满一屏对应的跳转量。 */
 private const val SCRUB_SPAN_MS = 120_000L
@@ -153,6 +155,60 @@ internal fun nextEpisodeOf(
     val i = episodes.indexOfFirst { it.index == currentIndex }
     if (i < 0) return null
     return episodes.getOrNull(i + delta)
+}
+
+/**
+ * 这一集该不该自动跳到片头结束的位置；该跳就给出落点（秒），否则 null。
+ *
+ * 抽成纯函数是为了能单测：它牵着一串边界（时长还没解出来、已经播过那一格、
+ * 整集比两头的和还短），埋在 500ms 的轮询里既没法验证、出错又全是静默的。
+ *
+ * 判据用**当前位置**而不是续播点：续播到第 18 分钟进来时位置本来就在 90 秒之后，
+ * 同一条判据就顺带管住了，不必再引第二个概念。而「位置已过那一格就不跳」是必须的 ——
+ * 时长晚一拍才解出来的时候，只看续播点会把用户从第 2 分钟**往回**拖到 90 秒，
+ * 那不叫跳过片头，叫倒带。
+ *
+ * 「整集不足三倍就不跳」那条最不显眼也最要紧：45 秒的短片设着 90 秒的跳过，
+ * 片头吃掉一份、片尾再吃掉一份，中间剩不了几秒 —— 那等于把这一集跳没了。
+ */
+internal fun introSkipTarget(
+    durationSec: Long,
+    skipSec: Int,
+    posSec: Long,
+): Long? {
+    if (skipSec <= 0) return null
+    if (durationSec <= 0L) return null
+    if (posSec >= skipSec) return null
+    if (durationSec <= skipSec * 3L) return null
+    return skipSec.toLong()
+}
+
+/**
+ * 这一集该不该自动跳到结尾（触发播完 → 连播那一套）；该跳就给出落点，否则 null。
+ *
+ * 只认「顺着播进那片区域」：上一拍还在区域外、这一拍进了区域、且两拍之间挪得不比
+ * 播放本身该挪的多。[maxAdvanceSec] 由调用方按「这一跳真的隔了多久 × 此刻倍速」算出来
+ * —— 写死一个 2 秒的话，轮询那 500ms 被 GC 拖长、或缓冲期 100ms 一跳切回 500ms 时，
+ * 正常的播放会被误判成「人是被拖过来的」，这一集的片尾就再也不跳了。
+ * 用户自己把进度条拖到片尾附近不算 —— 他想在那儿看，播放器不该替他按结束。
+ */
+internal fun outroSkipTarget(
+    posSec: Long,
+    prevPosSec: Long,
+    durationSec: Long,
+    skipSec: Int,
+    maxAdvanceSec: Long = 2L,
+): Long? {
+    if (skipSec <= 0) return null
+    if (durationSec <= 0L) return null
+    if (durationSec <= skipSec * 3L) return null
+    val edge = durationSec - skipSec
+    if (posSec < edge) return null
+    // 没有上一拍（第一次采样）不动手：分不清这是播进来的还是拖进来的
+    if (prevPosSec < 0L) return null
+    if (prevPosSec >= edge) return null
+    if (posSec - prevPosSec > maxAdvanceSec) return null
+    return durationSec
 }
 
 /**
@@ -266,7 +322,7 @@ fun PlayerScreen(
     /**
      * 触屏锁住了没有。
      *
-     * 锁住之后这一屏只剩一件事能办：点画面左中那一颗图标解锁。手势整块摘下、控件不弹、
+     * 锁住之后这一屏只剩一件事能办：点画面右中那一颗图标解锁。手势整块摘下、控件不弹、
      * 返回键也不退出播放器 —— 设这个开关的场景就是「揣兜里接着放、接着听」：
      * 那种场合下误触一次比少一个功能疼得多。
      *
@@ -281,10 +337,19 @@ fun PlayerScreen(
      * 重新点一遍 1.5x —— 用户的耳朵记着上一集那档，界面不记。
      */
     val speed by vm.playbackSpeed.collectAsState()
+    /**
+     * 倍速面板里滑杆的本地预览值。只活在面板开合之间：
+     * 拖动途中每一像素都去写全局那份，等于把「正在拖」这一半截状态也持久化了 ——
+     * 松手那一刻才落盘（见面板里的 onValueChangeFinished）。
+     * 打开面板时同步成当前档（芯片的 onClick 里做），下次进来滑杆停在他真正用的那一格。
+     */
+    var customSpeed by remember { mutableStateOf(speed) }
     /** 自动连播也是全局那一份偏好：和倍速同理由，不在这一屏抄本地态。 */
     val autoNext by vm.autoPlayNext.collectAsState()
     /** 画面比例模式（fit/fill/zoom），同样读全局那份。 */
     val resizeMode by vm.playbackResizeMode.collectAsState()
+    /** 跳过片头/片尾的秒数（0 = 关），全局一份；改动从下一集起算（见轮询里的判法）。 */
+    val skipSec by vm.skipIntroOutroSec.collectAsState()
     var lineIndex by remember { mutableIntStateOf(0) }
     /** 0 = 不封顶，交给 ExoPlayer 自适应；否则是用户选的视频高度上限。 */
     var maxVideoHeight by remember { mutableIntStateOf(0) }
@@ -577,9 +642,18 @@ fun PlayerScreen(
         stableMs = 0L
         var lastPos = -1L
         var lastDur = -1L
+        // 片头/片尾的跳过状态，一集一份（循环按集重建，不必手动归零）。
+        // 片头只判一次：用户手动拖回开头想再看片曲，播放器不该再把他甩到 90 秒。
+        var introDone = false
+        var outroDone = false
+        // 上一拍的位置：片尾那条要它才分得清「顺着播进片尾区」和「被拖进片尾区」
+        var prevPos = -1L
         // 上一跳实际睡了多久。稳定时长加的是这个数，而不是当跳要睡的数：
         // 醒来时能确定「刚才那段时间播放器一直是 READY」，而当跳的时长还没过去。
         var sleptMs = 500L
+        // 此刻倍速。轮询这一路顺手读，不另起一条 effect —— 它和位置同频变化，
+        // 分两条线早晚对不齐。
+        var speedNow = 1f
         while (true) {
             // 这一轮只读一次播放状态：下面「算不算稳定」与「这一跳睡多久」
             // 必须看着同一个状态，分两次读就有中间变了的可能
@@ -587,6 +661,9 @@ fun PlayerScreen(
             pos = msToSec(player.currentPosition)
             dur = msToSec(player.duration)
             wantsPlay = player.playWhenReady
+            // 此刻倍速（倍速是从仓库读的那一份，播放器跟不上手改的那一小会儿）。
+            // 片尾那条判据要它：两拍之间「该挪几秒」是隔了多久 × 几倍速。
+            speedNow = player.playbackParameters.speed
             // 缓冲进度（秒）交给进度条第二根条与缓冲提示；没在缓冲时也照读，
             // 进度条上的缓冲段要一直画
             buf = msToSec(player.bufferedPosition).coerceAtLeast(pos)
@@ -630,6 +707,43 @@ fun PlayerScreen(
                 vm.updatePosition(pos, dur)
                 lastPos = pos
                 lastDur = dur
+            }
+            // ---------- 跳过片头 / 片尾 ----------
+            //
+            // 判在 READY 的拍子里：时长没解出来之前没有任何可跳的依据（判据自己会挡，
+            // 但状态位要留到真能判的那一拍再消费 —— 见两个 target 函数的 null 分支）。
+            // 每集各判一次：这两个都是协程里的局部位，循环按「哪一集哪条流」重建，
+            // 换集换源天然归零，不需要额外的重置点。
+            if (ready) {
+                // 小窗里只跳不说：那句提示会盖在巴掌大的窗上（进小窗时清 hint 是同一条
+                // 「那颗窗只装画面」的规矩，见上面小窗那一节）。跳过本身照做 ——
+                // 用户在小窗里看的也是这一集，片头该跳。
+                if (!introDone && dur > 0L) {
+                    introDone = true
+                    introSkipTarget(dur, skipSec, pos)?.let { t ->
+                        player.seekTo(t * 1000)
+                        pos = t
+                        if (!inPip) hint = "已跳过片头"
+                    }
+                }
+                if (!outroDone) {
+                    // 「挪得不比播放本身该挪的多」：这一跳真的隔了多久 × 此刻倍速，
+                    // 再加半拍的余量。写死 2 秒的话，轮询被拖长一拍就被误判成拖进度，
+                    // 这一集的片尾再也不跳（见 outroSkipTarget 的注释）。
+                    val advance = (sleptMs * speedNow) / 1000f
+                    outroSkipTarget(pos, prevPos, dur, skipSec, maxAdvanceSec = (advance + 0.5f).toLong())?.let { t ->
+                        outroDone = true
+                        // 跳到结尾而不是「按暂停等用户」：seek 到末尾让播放器自己进
+                        // ENDED，下面那套「连播倒计时 / 已是最后一集」全按 ENDED 走 ——
+                        // 跳过片尾和看着它自己播完，后续行为就该一模一样。
+                        // 落点用播放器的毫秒原值：拿秒截断的 dur*1000 会差最多 999ms，
+                        // 那半秒还得等它自己播完才进 ENDED。
+                        player.seekTo(player.duration.coerceAtLeast(t * 1000))
+                        pos = t
+                        if (!inPip) hint = "已跳过片尾"
+                    }
+                }
+                prevPos = pos
             }
             val (hs, sel) = runCatching {
                 val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
@@ -948,7 +1062,7 @@ fun PlayerScreen(
     }
 
     /**
-     * 双击中间那一竖条 = 暂停/播放，和底部那颗暂停键、非全屏那一行同一个动作。
+     * 双击画面（任意处）= 暂停/播放，和底部那颗暂停键、非全屏那一行同一个动作。
      *
      * 判据用 [wantsPlay]（用户意图）而不是 `player.playWhenReady`（播放器当下）：
      * ExoPlayer 在缓冲、加载失败时也会把 playWhenReady 翻成 false，认它就会「暂停「暂停」。
@@ -966,7 +1080,7 @@ fun PlayerScreen(
     }
 
     /**
-     * 锁屏 / 解锁：同一颗按钮的两面（见画面左中那颗 [LockScreenToggle]）。
+     * 锁屏 / 解锁：同一颗按钮的两面（见画面右中那颗 [LockScreenToggle]）。
      *
      * 锁定时顺手把 [panel] 也收掉：浮层开着时控件倒数是停着的（见上面那条 effect 的
      * `panel == null` 条件），不关就变成「锁屏了但选集面板还开着」的半锁状态。
@@ -975,7 +1089,7 @@ fun PlayerScreen(
         screenLocked = true
         panel = null
         controls = false
-        hint = "已锁定 · 点左侧图标解锁"
+        hint = "已锁定 · 点右侧图标解锁"
     }
 
     fun unlockScreen() {
@@ -1006,7 +1120,7 @@ fun PlayerScreen(
         when {
             // 锁着的时候返回键什么都不做：口袋里蹭一下就把人甩出播放器 / 退出全屏，
             // 而这一屏的锁本来就是为那个场合设的。说一句话告诉他怎么解。
-            screenLocked -> hint = "已锁定 · 点左侧图标解锁"
+            screenLocked -> hint = "已锁定 · 点右侧图标解锁"
             panel != null -> panel = null
             fullscreen -> fullscreen = false
             else -> onBack()
@@ -1069,7 +1183,7 @@ fun PlayerScreen(
             // 锁屏时整块**不挂**而不是「挂着、里面判一个 locked 开关」：
             // awaitEachGesture 一旦启动就跑完整个指头生命周期，判开关只是白跑一遍，
             // 还得为「锁着时第一下要不要记 lastTap」这种小事操心。不挂就是真的没有手势 ——
-            // 单击/双击/拖进度/音量/亮度一起消失，只剩画面左中那一颗解锁图标
+            // 单击/双击/拖进度/音量/亮度一起消失，只剩画面右中那一颗解锁图标
             // （它在更上面一层，自己 clickable 吃掉自己的那一下）。
             if (!screenLocked) {
                 Box(
@@ -1101,7 +1215,6 @@ fun PlayerScreen(
                                 brightness = frac
                                 hint = "亮度 ${(frac * 100).roundToInt()}%"
                             },
-                            onDoubleTapSeek = { seekBy(if (it > 0) 10_000 else -10_000) },
                             onTogglePlay = { togglePlay() },
                             onToggleControls = {
                                 controls = !controls
@@ -1117,7 +1230,7 @@ fun PlayerScreen(
 
             // ---------- 触屏锁：锁屏/解锁同一颗按钮 ----------
             //
-            // 位置固定在画面左中：锁着的时候它是唯一还能点的东西（用户伸手就能摸到，
+            // 位置固定在画面右中：锁着的时候它是唯一还能点的东西（用户伸手就能摸到，
             // 不必等控件弹出 —— 控件在锁定态根本不弹）；没锁的时候它是颗低调的图标，
             // 点一下即锁。锁屏期间它不自动隐藏 —— 一隐藏就再没有人能打开这一屏。
             //
@@ -1134,9 +1247,9 @@ fun PlayerScreen(
                     onClick = {
                         if (screenLocked) unlockScreen() else lockScreen()
                     },
-                    // align 必须由调用方给：这颗要贴在画面左中，而 composable 自己
+                    // align 必须由调用方给：这颗要贴在画面右中，而 composable 自己
                     // 不知道会被放进哪种父布局里（这里是 BoxScope，能 align）。
-                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 6.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
                 )
             }
 
@@ -1611,13 +1724,22 @@ fun PlayerScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Chip("选集") { panel = Panel.Episodes }
                                 Spacer8()
-                                Chip("倍速 ${fmtSpeed(speed)}") { panel = Panel.Speed }
-                                Spacer8()
-                                // 画面比例三档轮换：一次点击在 自适应 → 铺满 → 裁切 之间走一圈。
-                                // 不开面板 —— 一个三档的小选择犯不着一层浮层，芯片上的字就是档位名。
-                                Chip("画面 ${resizeLabel(resizeMode)}") {
-                                    vm.setPlaybackResizeMode(vm.nextResizeMode(resizeMode))
+                                Chip("倍速 ${fmtSpeed(speed)}") {
+                                    customSpeed = speed
+                                    panel = Panel.Speed
                                 }
+                                Spacer8()
+                                // 自动连播单独一颗摆在底部：它是「这一屏之外的行为」开关
+                                // （播完接不接下一集），以前藏在倍速面板底下，找一个开关
+                                // 得先开面板 —— 而它只有两档，一颗芯片点一下就翻，犯不着浮层。
+                                // 芯片上的字就是当前档：点了立刻从「开」变「关」，反馈即状态。
+                                Chip(if (autoNext) "连播 开" else "连播 关") {
+                                    vm.setAutoPlayNext(!autoNext)
+                                }
+                                Spacer8()
+                                // 画面比例三档走面板：轮换式一点一圈，按快了会跳过想要的那档，
+                                // 也不知道下一点落到哪 —— 摆成三个选项，看一眼再选。
+                                Chip("画面 ${resizeLabel(resizeMode)}") { panel = Panel.Resize }
                                 Spacer8()
                                 if (siblings.size > 1 || sibQuery != SiblingsQuery.Done) {
                                     // 「源」和「线路」不是一回事：源是懂片帝AI、4kku 这种一整个站，
@@ -1815,29 +1937,87 @@ fun PlayerScreen(
                                     )
                                 }
                             }
-                            // 自动连播就设在倍速面板底下：这一屏的播放偏好全在这一份里
-                            // （见 PlaybackRepository），不再单开一个 Panel 多一个入口要学。
-                            // 点了不关面板：这是个开关，用户会盯着「开/关」那一格确认它真的翻了。
+                            // 自定义：那几档之间想要 1.1x、1.75x 的人，拖一下就有。
+                            // 上下限就是仓库 clamp 的那一段（见 speedRange）——
+                            // 这里不另抄字面量，两处各列各的早晚会有一处摆出对方存不下的值。
+                            // 0.05 一格：再细手抖一下就换值，读数跟不上眼睛。
+                            // 拖完松手才落盘（onValueChange 只动本地预览）：
+                            // 每像素一次 DataStore 写没有意义，偏好记的是「他最后停在哪」。
                             Spacer8()
-                            Row(
-                                Modifier.fillMaxWidth().clip(R.sm)
-                                    .clickable { vm.setAutoPlayNext(!autoNext) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    "自动连播",
-                                    color = T.Text,
-                                    fontSize = Fs.sm,
-                                    fontWeight = FontWeight.SemiBold,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                Text(
-                                    if (autoNext) "开" else "关",
-                                    color = if (autoNext) T.Play400 else T.TextDim,
-                                    fontSize = Fs.sm,
-                                    fontWeight = FontWeight.Bold,
-                                )
+                            val lo = vm.speedRange.start
+                            val hi = vm.speedRange.endInclusive
+                            Text(
+                                "自定义 ${fmtSpeed(customSpeed)}x",
+                                color = if (customSpeed != speed) T.Play400 else T.TextDim,
+                                fontSize = Fs.xs,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Slider(
+                                value = customSpeed.coerceIn(lo, hi),
+                                onValueChange = { customSpeed = ((it * 20f).roundToInt() / 20f).coerceIn(lo, hi) },
+                                onValueChangeFinished = { vm.setPlaybackSpeed(customSpeed) },
+                                valueRange = vm.speedRange,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = T.Play400,
+                                    activeTrackColor = T.Play500,
+                                    inactiveTrackColor = T.Border,
+                                ),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Text(
+                                "松手就生效 · 点上面任一格回整档",
+                                color = T.TextFaint,
+                                fontSize = Fs.xxs,
+                            )
+                            // 非整档也算「选中」：自定义到 1.50x 时那一档就该亮起来，
+                            // 别让人对着两行「都对」的界面猜现在到底几倍速。
+                        }
+
+                        Panel.Resize -> {
+                            Text("画面", color = T.Text, fontSize = Fs.sm, fontWeight = FontWeight.Bold)
+                            Spacer8()
+                            // 三档各配一句它是干什么的：轮换式按一圈人不知道刚才跳过了什么，
+                            // 选项摆开了每一档都解释得清 —— 尤其「铺满」那档，不说是给
+                            // 宽高比写错的源准备的，没人想得到它为什么存在。
+                            //
+                            // 档位清单取自仓库（vm.resizeModeChoices），这里只补一句说明：
+                            // 照旧在界面上抄一遍 "fit"/"fill"/"zoom" 的话，仓库将来加第四档
+                            // 存得下、界面上选不到。
+                            val resizeDesc = mapOf(
+                                "fit" to "等比显示，画面完整、四周留黑边",
+                                "fill" to "拉满整个窗口；宽高比写错的源拉平了反而正常",
+                                "zoom" to "等比放大裁到没有黑边，画面四边会超出窗口",
+                            )
+                            vm.resizeModeChoices.forEach { mode ->
+                                val desc = resizeDesc[mode]
+                                Row(
+                                    Modifier.fillMaxWidth().clip(R.sm)
+                                        .background(
+                                            if (mode == resizeMode) T.Play500.copy(alpha = .16f)
+                                            else Color.Transparent
+                                        )
+                                        .clickable { vm.setPlaybackResizeMode(mode); panel = null }
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                ) {
+                                    Column {
+                                        Text(
+                                            resizeLabel(mode),
+                                            color = if (mode == resizeMode) T.Play400 else T.Text,
+                                            fontSize = Fs.sm,
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                        // 新档没配说明就不摆那一行：空着比写一句「（暂无说明）」干净
+                                        if (desc != null) {
+                                            Spacer4()
+                                            Text(
+                                                desc,
+                                                color = T.TextFaint,
+                                                fontSize = Fs.xxs,
+                                                lineHeight = Fs.xs,
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -2118,11 +2298,11 @@ fun PlayerScreen(
 /**
  * 画面区手势：
  * 横向拖 = 按整条时间轴跳转；右半竖拖 = 系统音量；左半竖拖 = 窗口亮度；
- * 单击 = 显隐控件；双击**中间那一竖条** = 暂停/播放，双击左/右半屏 = 快退/快进 10 秒。
+ * 单击 = 显隐控件；双击（画面任意处）= 暂停/播放。
  *
- * 三分而不是两分：暂停和快进退是两只手都会用的动作，划成左右各一半之后，
- * 「双击一下暂停」和「双击一下快进」落在同一片区域上 —— 想暂停的人一不留神就跳走了 10 秒。
- * 中间留 1/3 给暂停，两边各 1/3 给快进退，食指落在哪半边都是明确的意图。
+ * 双击不再分左右：用户要的是「连点两下就暂停」，落在哪都是暂停才符合这句话。
+ * 以前两侧双击是 ±10 秒，那一档现在由底部那两颗 ⟲10 / ⏩10 按钮独家承担 ——
+ * 快进退是有准头的动作（看清了再按），暂停是本能动作（点就是了），本能不该为准头让路。
  *
  * 自己写 awaitEachGesture 而不是叠 detectTapGestures + detectDragGestures ——
  * 两个探测器叠在同一层时，拖动结束会被 tap 再判一次，点一下控件就乱跳。
@@ -2136,7 +2316,6 @@ private fun Modifier.playerGestures(
     onScrubCommit: (Long) -> Unit,
     onVolume: (Float) -> Unit,
     onBrightness: (Float) -> Unit,
-    onDoubleTapSeek: (side: Int) -> Unit,
     onTogglePlay: () -> Unit,
     onToggleControls: () -> Unit,
 ): Modifier = pointerInput(Unit) {
@@ -2149,9 +2328,6 @@ private fun Modifier.playerGestures(
         val height = size.height.toFloat().coerceAtLeast(1f)
         val slop = viewConfiguration.touchSlop
         val leftSide = down.position.x < width / 2f
-        // 中间那一竖条（画面宽的 1/3）双击是暂停/播放。取 **down 落点**而不是抬手位置：
-        // 手指划过中线时他想点的是按下那一下，和 leftSide 同一个口径，两处不能一个认 down 一个认 up。
-        val centerZone = abs(down.position.x - width / 2f) <= width / 6f
         val baseMs = currentPosition()
         val totalMs = durationMs()
         var axis = 0 // 0 未定 1 横向 2 右竖(音量) 3 左竖(亮度)
@@ -2203,10 +2379,9 @@ private fun Modifier.playerGestures(
                 val now = System.currentTimeMillis()
                 if (now - lastTap[0] < 320L) {
                     lastTap[0] = 0L
-                    // 双击落点在中间 → 暂停/播放；左右两半 → ±10 秒。
-                    // 第一下那一下已经把控件显隐过一次（见下面的 else 分支），
-                    // 所以这一下只管播不播，不再去动控件 —— 否则双击一次屏幕闪两下。
-                    if (centerZone) onTogglePlay() else onDoubleTapSeek(if (leftSide) -1 else 1)
+                    // 双击画面任意处 = 暂停/播放。第一下已经把控件显隐过一次（见下面的
+                    // else 分支），所以这一下只管播不播，不再去动控件 —— 否则双击一次屏幕闪两下。
+                    onTogglePlay()
                 } else {
                     lastTap[0] = now
                     onToggleControls()
@@ -2453,8 +2628,17 @@ private fun fmt(sec: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
 }
 
-private fun fmtSpeed(s: Float): String =
-    if (s % 1f == 0f) "%.1f".format(s) else "%.2f".format(s).trimEnd('0')
+/**
+ * 倍速读数。先按百分位归拢再判：1.05f 存成 float 是 1.04999…，直接 trimEnd('0') 会印成「1」，
+ * 而 0.05 一格正是自定义滑杆的步进 —— 拖到那一格读数必须说 1.05。
+ * 百分位是 0 就一位小数（1.0、1.3），不是 0 才两位（1.05、1.75）。
+ *
+ * `internal`：这一条被单测钉着（浮点边界太容易说错话），不给 `private`。
+ */
+internal fun fmtSpeed(s: Float): String {
+    val r = (s * 100f).roundToInt()
+    return if (r % 10 == 0) "%.1f".format(r / 100f) else "%.2f".format(r / 100f)
+}
 
 /** 「画面」芯片上的档位名。认不出的值按自适应说 —— 和仓库那一侧的兜底同一个口径。 */
 private fun resizeLabel(mode: String): String = when (mode) {

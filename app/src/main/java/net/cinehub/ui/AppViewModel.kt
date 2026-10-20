@@ -18,6 +18,7 @@ import net.cinehub.data.DoubanRepository
 import net.cinehub.data.DownloadRepository
 import net.cinehub.data.MediaRepository
 import net.cinehub.data.PlaybackRepository
+import net.cinehub.data.SearchHistoryRepository
 import net.cinehub.data.SeedSync
 import net.cinehub.data.SourceRepository
 import net.cinehub.data.WatchRepository
@@ -56,6 +57,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val doubanRepo = DoubanRepository(app)
     private val downloadRepo = DownloadRepository(app, sourceRepo, mediaRepo)
     private val playbackRepo = PlaybackRepository(app)
+    private val searchHistoryRepo = SearchHistoryRepository(app)
 
     /**
      * 一次性的一句话告知，界面那侧弹出来。
@@ -96,9 +98,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 不关的话，退出应用再进来会得到第二颗引擎：两份内存清单指向同一批目录和同一个
      * DataStore 键，而「同时最多 3 集」那个闸门变成每颗一份 —— 实际并发翻倍。
      * 盘上已缓存的东西一律不动，用户下次进来照旧能离线播。
+     *
+     * 顺手把「正在播」也放下。上一颗 VM 的播放器已经在 PlayerScreen 的 onDispose 里
+     * release 过了（见那边的注释），而这个 VM 也一起死了；可 [playing] 是个 StateFlow，
+     * 下一个 Activity 会拿到一个新 VM，一上来就看见「有片在播」—— CineHubApp 那道
+     * `LaunchedEffect(playing != null)` 只认「从没有到有了」，新 VM 里 wasPlaying 初值是
+     * false，于是它当场把人塞进播放器，而那一屏连播放器都没有：一块黑画面 + 一堆按不动的键。
+     * 人已经退出应用了，就不该再替他开门。
      */
     override fun onCleared() {
         downloadRepo.close()
+        _playing.value = null
+        _resolving.value = false
+        _resumePosition.value = 0L
         super.onCleared()
     }
 
@@ -107,6 +119,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 全局倍速：不分作品、不分源，起播/换线路/换集都读它，用户调一次就一直是那一档。 */
     val playbackSpeed: StateFlow<Float> = playbackRepo.speed
     val speedChoices: List<Float> get() = playbackRepo.speedChoices
+
+    /** 倍速自定义滑杆能拖到的头尾（也是仓库 clamp 的范围），和芯片那几档是两件事。 */
+    val speedRange: ClosedFloatingPointRange<Float> get() = playbackRepo.speedRange
     fun setPlaybackSpeed(value: Float) = playbackRepo.setSpeed(value)
 
     /** 自动连播：播完一集后要不要倒计时接下一集。全局一份，与倍速同一语义。 */
@@ -118,12 +133,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val resizeModeChoices: List<String> get() = playbackRepo.resizeModes
     fun setPlaybackResizeMode(value: String) = playbackRepo.setResizeMode(value)
 
-    /** 「画面」芯片一次点击轮换到的下一档：fit → fill → zoom → fit。 */
-    fun nextResizeMode(current: String): String {
-        val modes = resizeModeChoices
-        val i = modes.indexOf(current)
-        return if (i < 0) modes.first() else modes[(i + 1) % modes.size]
-    }
+    /**
+     * 跳过片头/片尾的秒数（0 = 关），全局一份。播放器起播后照它跳，
+     * 「播放设置」页那一排芯片改它。
+     */
+    val skipIntroOutroSec: StateFlow<Int> = playbackRepo.skipSec
+    val skipChoices: List<Int> get() = playbackRepo.skipChoices
+    fun setSkipIntroOutro(value: Int) = playbackRepo.setSkipSec(value)
 
     // ---------- 小窗播放 ----------
 
@@ -188,6 +204,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _doubanItems = MutableStateFlow<List<DoubanItem>>(emptyList())
     val doubanItems: StateFlow<List<DoubanItem>> = _doubanItems.asStateFlow()
+
+    /**
+     * [_doubanItems] 此刻装的是哪张榜。
+     *
+     * 光看「手上这份空不空」判断要不要放缓存是不够的：A → B → A 走一圈，切回 A 时
+     * selectDoubanChart 只在 id 不同时才放缓存，于是手上那份还是 B 的、非空 ——
+     * A 的缓存就永远上不了屏。记下这一位，见 [ensureDouban]。
+     */
+    private var doubanShownChartId: String? = null
 
     private val _doubanLoading = MutableStateFlow(false)
     val doubanLoading: StateFlow<Boolean> = _doubanLoading.asStateFlow()
@@ -255,8 +280,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _searching = MutableStateFlow(false)
     val searching: StateFlow<Boolean> = _searching.asStateFlow()
 
-    private val _history = MutableStateFlow<List<String>>(emptyList())
-    val history: StateFlow<List<String>> = _history.asStateFlow()
+    /**
+     * 搜索历史。住在 [SearchHistoryRepository]（落盘），这里只是转发给搜索页读 ——
+     * 曾经它是本类的一个内存 StateFlow，重启就没了，而界面上写着「只存在这台设备上」。
+     */
+    val history: StateFlow<List<String>> = searchHistoryRepo.terms
 
     /**
      * 上一次**真的发出去**搜过的那个词；`null` = 这一屏还没搜过。
@@ -300,7 +328,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 播放器起播时要决定能不能把这份带过去 —— 列表本身看不出来它是为谁查的，
      * 而条目自己的 key 又常常和查询用的那条差一年（各源年份写法不一致）。
      * 记下出处，比拿 key 去猜可靠。
+     *
+     * `@Volatile`：今天读写都挤在主线程，是安全的；可它一挪到 IO 上就是一条真竞态
+     * （读的一方看到半截写入的引用不算，看到旧值会让播放器把上一部的源列表带过去）。
+     * 一个字比将来查一夜便宜。
      */
+    @Volatile
     private var _siblingsOf: String? = null
 
     /** 查这一部片的其它源时，根本没答上话的那几个（界面要单独说一句）。 */
@@ -756,8 +789,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _home.value = it.items
             _homeAt.value = it.at
         }
-        // 正在取的时候不排队重取：手动那颗按钮自己会变灰，这里是挡住别处同时进来的第二笔
-        if (!force && homeJob?.isActive == true) return
+        // 正在取的时候一律不排队重取，**包括手动那一下**。
+        //
+        // 原来这里写的是 `if (!force && …) return`：于是手动刷新（force = true）永远
+        // 放进第二笔，还把正在飞的第一笔取消掉。新的一笔从连上服务器算起，几乎必然比
+        // 被取消的那一笔晚到首字节 —— 用户按下刷新，屏幕却可能先空一下再慢慢填，
+        // 而第一笔的结果已经被丢掉了。注释里说的「并发跑两份、互相覆盖」也是这个道理：
+        // 让旧的跑完比再起一笔更快，也更快出结果。
+        if (homeJob?.isActive == true) return
         val mine = ++homeGen
         homeJob?.cancel()
         _homeLoading.value = true
@@ -836,7 +875,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (mine != searchGen) return@launch
                 _results.value = out.items
                 _searchFailures.value = out.failures
-                _history.value = (listOf(q) + _history.value).distinct().take(8)
+                // 记在「这一次搜索真的发出去并回来了」之后（和上一版同一个时机）：
+                // 半途被新搜索作废的那一轮不留痕；而「所有源都没有」的词照记 ——
+                // 用户回头再试一次那颗芯片还得在。
+                searchHistoryRepo.add(q)
             } finally {
                 if (mine == searchGen) _searching.value = false
             }
@@ -861,7 +903,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _searchFailures.value = emptyList()
     }
 
-    /** 清搜索框：回到「历史 + 当前接入的源」那一屏，但人还留在搜索页。 */
+    /** 清搜索框：回到「搜索历史」那一屏，但人还留在搜索页。 */
     fun clearQuery() {
         searchGen++
         searchJob?.cancel()
@@ -873,11 +915,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 删一条搜索历史。不弹确认 —— 删错了重新搜一次就回来了。 */
-    fun removeSearchHistory(term: String) {
-        _history.value = _history.value.filterNot { it == term }
-    }
+    fun removeSearchHistory(term: String) = searchHistoryRepo.remove(term)
 
-    fun clearSearchHistory() { _history.value = emptyList() }
+    fun clearSearchHistory() = searchHistoryRepo.clear()
 
     // ---------- 详情 ----------
 
@@ -1066,7 +1106,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 用指纹而不是各源的 key：换源以后 key 就变了，而这份列表本来就是跨源的，
      * 拿 key 比会逼着用户每换一次源重查一遍。
+     *
+     * `@Volatile`：同 [_siblingsOf]，这一位由 queryPlayingSiblings 那条协程写。
      */
+    @Volatile
     private var playingSiblingsOf: String? = null
 
     /**
@@ -1227,10 +1270,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (r.findingSiblings) return
         r.findingSiblings = true
         viewModelScope.launch {
-            val self = r.candidates.firstOrNull()?.item ?: return@launch
-            val found = mediaRepo.siblingsOf(self)
-            // 这一趟是全源扇出，回来时用户早可能换集甚至退出了 —— 认一次代再说
+            val self = r.candidates.firstOrNull()?.item ?: run {
+                // 一个候选都没有：这一轮就此打住。findingSiblings 必须跟着放掉 ——
+                // 留着的话下一次 reportPlaybackFailure 会在上面那道闸门前一直返回，
+                // 横幅停在「正在试 · 第 N 次」而背后什么都没有（见 retryFallbackRound 的注释）。
+                r.findingSiblings = false
+                return@launch
+            }
+            // 这一趟是全源扇出，抛出来就是没兜住的异常：viewModelScope 没有 SupervisorJob，
+            // 它会一路捅到默认处理器上把进程带走。所以 quietly 包一层 ——
+            // 而 quietly 只吞普通异常，CancellationException 照旧往外走。
+            val found = quietly { mediaRepo.siblingsOf(self) }.getOrNull()
+            // 回来时用户早可能换集甚至退出了 —— 认一次代再说
             if (round !== r || _playing.value?.episodeIndex != r.episodeIndex) return@launch
+            if (found == null) {
+                // 查不动不等于「别处也没有」：把这一轮交回给正常的推进路径，
+                // 让横幅说一句「都试过了」，而不是卡在「正在找」。
+                r.findingSiblings = false
+                advance(r)
+                return@launch
+            }
             r.candidates = (r.candidates + found.items.filter {
                 it.sourceId != self.sourceId && it.item.id.isNotEmpty()
             }).distinctBy { it.sourceId }
@@ -1503,7 +1562,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 _resolving.value = true
-                val res = mediaRepo.resolveStream(cfg, episodeUrl)
+                // mediaId 一起给：有的源（PPnix）的取链地址要按「哪一部片」查
+                val res = mediaRepo.resolveStream(cfg, episodeUrl, mediaId)
                 if (mine != playGen) return@launch
                 _resolving.value = false
 
@@ -1727,6 +1787,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val mine = p?.sourceId
+        // 这一趟的身份：问的是哪一部片、哪个源。回来时对不上就不落 —— 播放中换了集、
+        // 换了源，上一趟的答案就不能再往面板上写（和 play() 的 playGen 同一道道理，
+        // 那边顶多写错一次，这里会把上一集的源列表安到下一集上）。
+        val askedMediaId = media.id
+        val askedSourceId = p?.sourceId
         _playingSiblingsQuery.value = SiblingsQuery.Running
         playingSiblingsJob?.cancel()
         playingSiblingsJob = viewModelScope.launch {
@@ -1734,6 +1799,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // 顶掉的时候不该在屏上留一句「加载失败」
             quietly { mediaRepo.siblingsOf(media) }
                 .onSuccess { s ->
+                    val now = _playing.value
+                    if (now?.mediaId != askedMediaId || now.sourceId != askedSourceId) return@onSuccess
                     val found = s.items.sortedByDescending { it.sourceId == mine }
                     // 一个源都没对上也仍然要摆出正在播的这个：它确实就在这儿播着，
                     // 面板里报「没有别的源」比报「这部片没有源」诚实
@@ -1756,7 +1823,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 .onFailure { _playingSiblingsQuery.value = SiblingsQuery.Idle }
         }
     }
-
     // ---------- 离线缓存 ----------
 
     fun downloadTask(sourceId: String, mediaId: String, episodeIndex: Int): DownloadTask? =
@@ -2074,13 +2140,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 连点两次会并发跑两份搜索、回来两笔导航 —— 先占住，正在找的时候点不动。
         // 但这一闸门得说一句：只挡住、不给说法，用户看到的就是「这张卡片按下去没反应」，
         // 而且「找片中」那枚标记只挂在正在找的那一张上，别的卡片看起来完全是活的。
+        //
+        // **占位必须在 launch 之前**：写在协程里的话，两张不同的卡片连点两下，
+        // 两次检查都发生在「协程还没开跑」那一刻，于是都过了闸 —— 两份全源扇出同时跑，
+        // 而 _doubanResolving 最后留下谁还不一定，「找片中」会从真正还在找的那张卡上消失。
         if (_doubanResolving.value != null) {
             showNotice("正在源里找《${doubanResolvingTitle ?: "那一片"}》，这一条回来之前别的点不动")
             return
         }
+        doubanResolvingTitle = item.title
+        _doubanResolving.value = item.id
         viewModelScope.launch {
-            doubanResolvingTitle = item.title
-            _doubanResolving.value = item.id
             try {
                 val want = titleFingerprint(item.title)
                 var cands = emptyList<AggregatedMedia>()
@@ -2123,9 +2193,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 不在应用启动时拉 —— 用户可能根本不点片库，没必要一开屏就去敲豆瓣的门。
      */
     fun ensureDouban() {
-        if (_doubanItems.value.isEmpty()) doubanRepo.cached(_doubanChart.value.id)?.let {
-            _doubanItems.value = it.items
-            _doubanAt.value = it.at
+        // 放缓存上前先认一句「盘上那份是不是当前这个榜的」。
+        //
+        // 原来判的是「手上这份空不空」：A → B → A 走一圈，手上那份其实是 B 的
+        // （切到 B 时覆盖过，而切回 A 时 selectDoubanChart 只在两个 id 不同时才放缓存），
+        // 于是 isEmpty() 为假、A 的缓存一次都没上屏 —— 标题写着 A、内容挂着 B，
+        // 要等网络回来才换对。判据换成 id 相等，就不会再拿别的榜顶着。
+        if (_doubanChart.value.id != doubanShownChartId || _doubanItems.value.isEmpty()) {
+            doubanRepo.cached(_doubanChart.value.id)?.let {
+                _doubanItems.value = it.items
+                _doubanAt.value = it.at
+                doubanShownChartId = _doubanChart.value.id
+            }
         }
         // 每次进片库都去敲豆瓣的门没道理（这一屏是 Tab，切来切去都会重新组合），
         // 但也不能拿一个布尔当门闩：那一笔要是中途被切榜顶掉了，标记留在 true 上，
@@ -2145,6 +2224,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val snap = doubanRepo.cached(chart.id)
         _doubanItems.value = snap?.items ?: emptyList()
         _doubanAt.value = snap?.at ?: 0L
+        doubanShownChartId = chart.id
         _doubanError.value = null
         refreshDouban()
     }
@@ -2171,6 +2251,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     doubanRepo.put(chart, items)
                     _doubanItems.value = items
                     _doubanAt.value = System.currentTimeMillis()
+                    doubanShownChartId = chart.id
                     _doubanError.value = null
                 }.onFailure {
                     // 有旧数据就留着旧数据，只把原因写在旁边：

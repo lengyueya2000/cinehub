@@ -202,7 +202,7 @@ class HtmlAdapter(override val config: SourceConfig) : SourceAdapter {
      * 每条分支各对应一种真实成因，按「先看是不是别人的页面，再看本站怎么取」的顺序判断：
      * 第三方平台的播放页是确定性事实，任何模式下都该如实说明，而不是硬塞给播放器。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution {
         // 1. 爱奇艺 / 腾讯 / B 站那类播放页 —— 本机解不了别人的页面
         VideoPlatforms.platformOf(episodeUrl)?.let {
             return StreamResolution.ThirdPartyPage(episodeUrl, it)

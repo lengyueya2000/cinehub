@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Icon
@@ -72,6 +73,7 @@ fun MineScreen(
     onOpenHistory: () -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenDownloadSettings: () -> Unit,
+    onOpenPlaybackSettings: () -> Unit,
     onOpenDetail: (sourceId: String, mediaId: String) -> Unit,
 ) {
     val sources by vm.sources.collectAsState()
@@ -80,6 +82,9 @@ fun MineScreen(
     val history by vm.watchHistory.collectAsState()
     val downloads by vm.downloads.collectAsState()
     val segParallel by vm.segParallel.collectAsState()
+    // 播放设置那一行把当前两档值直接写在副标题上：不点进去也看得见自己设成了什么
+    val autoNext by vm.autoPlayNext.collectAsState()
+    val skipSec by vm.skipIntroOutroSec.collectAsState()
     // 这一页是收藏 / 观看记录 / 缓存三份本机数据的落地页，三份都可能读不通：
     // 读不通时仓库回落成空列表，不说清楚的话空态会被读成「我自己删光了」。
     // （源那一份这一页不摆原文，只在设置行里报个数，SourceScreen 会把话说全。）
@@ -237,6 +242,16 @@ fun MineScreen(
                 )
                 GroupDivider(rowTextStart)
                 SettingRow(
+                    icon = Icons.Outlined.PlayCircle,
+                    tint = T.Play500,
+                    title = "播放设置",
+                    // 当前两档值直接写在行上：这一页不用点进去也能看见自己设成了什么
+                    sub = "自动连播 ${if (autoNext) "开" else "关"} · " +
+                        "跳过片头片尾 ${if (skipSec == 0) "关" else "$skipSec 秒"}",
+                    onClick = onOpenPlaybackSettings,
+                )
+                GroupDivider(rowTextStart)
+                SettingRow(
                     icon = Icons.Outlined.Tune,
                     tint = T.Gold,
                     title = "下载设置",
@@ -251,7 +266,10 @@ fun MineScreen(
                 buildString {
                     // 版本号读不到时（versionName 为空的包）不能留下一个开头的「 · 」
                     if (version != null) append("影枢 v$version · ")
-                    append("收藏、进度与凭证只存这台设备")
+                    // 收藏 / 进度 / 搜索词会随系统自动备份迁到新机（allowBackup 开着），
+                    // 站点凭证不会 —— 那句话得按这个说，写成「只存这台设备」是假的：
+                    // 用户换机时发现收藏没跟上，会以为被谁传出去了。
+                    append("收藏、进度随系统备份迁移 · 站点凭证只存这台设备")
                 },
                 color = T.TextDim,
                 fontSize = Fs.xs,

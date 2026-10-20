@@ -224,10 +224,13 @@ class MediaRepository(private val sources: SourceRepository) {
      *
      * 成因由适配器自己判断（只有它知道自己那个站的规则），这里只做一件事：
      * 适配器抛异常时兜底，别让用户看到一个没头没尾的失败。
+     *
+     * [mediaId] 一路传给适配器：有的型（PPnix）要拿它查「这一部的取链参数」，
+     * 见 [SourceAdapter.resolveStream]。
      */
-    suspend fun resolveStream(cfg: SourceConfig, episodeUrl: String): StreamResolution =
+    suspend fun resolveStream(cfg: SourceConfig, episodeUrl: String, mediaId: String? = null): StreamResolution =
         withContext(Dispatchers.IO) {
-            quietly { SourceAdapters.create(cfg).resolveStream(episodeUrl) }
+            quietly { SourceAdapters.create(cfg).resolveStream(episodeUrl, mediaId) }
                 .getOrElse { e ->
                     VideoPlatforms.platformOf(episodeUrl)
                         ?.let { StreamResolution.ThirdPartyPage(episodeUrl, it) }

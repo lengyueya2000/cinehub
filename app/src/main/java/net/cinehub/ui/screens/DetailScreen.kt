@@ -489,17 +489,12 @@ fun DetailScreen(
                 )
                 Spacer4()
                 // 动作行那一格删掉之后，这一格就是这一集唯一的缓存入口 —— 光一颗图标
-                // 说不出它现在到底处在哪一步，进度得跟着任务真实状态写
+                // 说不出它现在到底处在哪一步，进度得跟着任务真实状态写。
+                // 写什么由 [cacheLabel] 一处决定：这里原来另抄了一份 when，抄的时候
+                // 「继续缓存」缩成了「继续」、「缓存中 N%」缩成了「N%」—— 同一个量
+                // 在两种写法之间漂，就是 ByteFormat 那份注释里说的那类毛病。
                 Text(
-                    when {
-                        curTask == null -> "缓存"
-                        curTask.status == DownloadStatus.Done -> "已缓存"
-                        curTask.status == DownloadStatus.Running ->
-                            if (curTask.hasPercent) "${(curTask.progress * 100).toInt()}%" else "缓存中"
-                        curTask.status == DownloadStatus.Queued -> "排队中"
-                        curTask.status == DownloadStatus.Paused -> "继续"
-                        else -> "重试"
-                    },
+                    cacheLabel(curTask),
                     color = if (curTask?.status == DownloadStatus.Done) T.Play400 else T.TextDim,
                     fontSize = Fs.xxs,
                 )
@@ -556,14 +551,17 @@ fun DetailScreen(
     }
 }
 
-private fun fmtBytesLocal(b: Long): String {
-    val tenthsMb = b * 10 / (1L shl 20)
-    return when {
-        b >= 1L shl 30 -> "%.1f GB".format(b / 1073741824.0)
-        b >= 1L shl 20 -> "${tenthsMb / 10}.${tenthsMb % 10} MB"
-        else -> "%.0f KB".format(b / 1024.0)
-    }
-}
+/**
+ * 字节数 → 人话。全应用只有 [ByteFormat] 一份，这里只是转个手。
+ *
+ * 曾经这里另写了一套：GB 档用 `%.1f`（四舍五入）、KB 档带小数 —— 而 ByteFormat 的口径是
+ * **截断 + KB 写整数**。于是「已经下好的 1.4 GB 会一起没掉」这个弹窗报的数，
+ * 和缓存页、播放器报的同一条任务的数不一样。这个弹窗的全部作用就是告诉用户要失去什么，
+ * 数字对不上比不报更糟。
+ *
+ * `internal`：这一条被单测钉着（转个手也会被改坏），不给 `private`。
+ */
+internal fun fmtBytesLocal(b: Long): String = net.cinehub.data.ByteFormat.bytes(b)
 
 @Composable
 private fun Backdrop(
@@ -714,8 +712,13 @@ private fun ActionTile(
     }
 }
 
-/** 缓存按钮上的字 —— 每一句都要对得上任务真实处在的那一步。 */
-private fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
+/**
+ * 缓存按钮上的字 —— 每一句都要对得上任务真实处在的那一步。
+ *
+ * `internal`：单测钉着这一份（详情页那颗按钮、缓存页、播放器三处都读它），
+ * 不给 `private`。
+ */
+internal fun cacheLabel(t: DownloadTask?): String = when (t?.status) {
     DownloadStatus.Done -> "已缓存"
     // 对方不给总大小的那种单文件，百分比压根算不出来（progress 恒为 0）—— 报「0%」是假话
     DownloadStatus.Running -> if (t.hasPercent) "缓存中 ${(t.progress * 100).toInt()}%" else "缓存中"
@@ -842,12 +845,11 @@ private fun SourcePanel(
 }
 
 /**
- * 详情页的画质徽标：只写这份元数据里真的存在的说法。
+ * 源站简介里常见的 HTML 实体。`&amp;` 不在表里 —— 它要最后单独解，否则会二次解码。
  *
- * 影枢在详情页还不知道实际分辨率（要等播放器解出 master playlist 才有几档高度），
- * 所以这里不能替站点吹 —— 站点写「高清」就显示「高清」本来该显示的样子，没写就不显示。
+ * （这里原来还挂着一份讲「画质徽标」的注释，而那句话真正该待的地方是
+ * `Models.qualityTagOf` 那边，函数早搬走了，注释没人管就成了孤魂。）
  */
-/** 源站简介里常见的 HTML 实体。`&amp;` 不在表里 —— 它要最后单独解，否则会二次解码。 */
 private val ENTITIES = mapOf(
     "&nbsp;" to " ", "&ensp;" to " ", "&emsp;" to " ", "&thinsp;" to " ",
     "&quot;" to "\u0022", "&apos;" to "\u0027", "&lt;" to "<", "&gt;" to ">",
@@ -868,8 +870,11 @@ private val WS_BEFORE_NL = Regex("[ \t]+\n")
 /**
  * 源站的简介是 HTML：实体和 `<br/>` 都混在正文里。
  * 不处理就会显示成「…10号房是一个特别的存在&nbsp;，别看…」，那是把转义当内容给用户看。
+ *
+ * `internal`：单测钉着（实体二次解码、越界码点、行尾空格这几条都静默地错），
+ * 不给 `private`。
  */
-private fun cleanIntro(raw: String?): String? {
+internal fun cleanIntro(raw: String?): String? {
     val s = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
     var t = s.replace(BR, "\n").replace(TAG, "")
     ENTITIES.forEach { (k, v) -> t = t.replace(k, v) }

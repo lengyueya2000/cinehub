@@ -78,7 +78,6 @@ fun SearchScreen(
     val searching by vm.searching.collectAsState()
     val history by vm.history.collectAsState()
     val sources by vm.sources.collectAsState()
-    val health by vm.health.collectAsState()
 
     val enabled = sources.filter { it.enabled }
     val hitSources = results.flatMap { it.availability }.map { it.sourceId }.distinct().size
@@ -304,37 +303,11 @@ fun SearchScreen(
                             }
                             Spacer12()
                         }
-                        Spacer8()
-                        Text("当前接入的播放源", color = T.Text, fontSize = Fs.body2, fontWeight = FontWeight.Bold)
-                        Spacer8()
-                        enabled.forEach { cfg ->
-                            val h = health[cfg.id]?.health ?: Health.Unknown
-                            Row(
-                                Modifier.fillMaxWidth().padding(vertical = 9.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                StatusDot(h)
-                                Spacer8()
-                                Text(cfg.name, color = T.Text, fontSize = Fs.body2, modifier = Modifier.weight(1f))
-                                Text(
-                                    when (h) {
-                                        // 拿不到毫秒时写「已连通」，不拼出 "-ms" 这种不可能的字。
-                                        // washHealth 会给「探根路径没答话、但搜索答上了」的源
-                                        // 留下 latencyMs = null —— 那一格是绿的，数字却编不出来。
-                                        // 判法同详情页那一栏（见 DetailScreen 的同一段）。
-                                        Health.Ok -> if (health[cfg.id]?.latencyMs != null)
-                                            "${health[cfg.id]?.latencyMs}ms" else "已连通"
-                                        Health.Slow -> "较慢"
-                                        Health.Down -> "不可用"
-                                        Health.Unknown -> "未检测"
-                                    },
-                                    // 这一格承载的是「哪个源没答上话」这个事实，不是装饰；
-                                    // TextFaint 在纯黑上只有 3.5:1，够不上正文 4.5:1 的门槛
-                                    color = T.TextDim,
-                                    fontSize = Fs.xxs,
-                                )
-                            }
-                        }
+                        // 「当前接入的播放源」那一块整删了：搜索页是找片的地方，
+                        // 源的健康状况在「我的 → 播放源管理」有完整的一页，摆在这里
+                        // 只是把界面变成源列表 —— 用户要搜的是片，不是源。
+                        // （结果行上「这条来自哪个源」的小字保留：那是点开详情要用的信息，
+                        // 不是源的体检报告。）
                     }
                 }
             }
@@ -437,7 +410,7 @@ private fun NoResultBlock(
             Spacer8()
             Text(
                 "这几个源这次没返回任何内容。换个关键词再搜一次，" +
-                    "或到下面「当前接入的播放源」和底部「我的 → 播放源管理」里看它们现在的状态。",
+                    "或者到「我的 → 播放源管理」那一页看它们现在的状态。",
                 color = T.TextDim,
                 fontSize = Fs.xs,
                 lineHeight = Fs.xs * 1.6f,

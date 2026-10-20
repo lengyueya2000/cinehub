@@ -137,7 +137,7 @@ class MaccmsAdapter(override val config: SourceConfig) : SourceAdapter {
      * 换流这一步交给了它自己的解析器 —— 我们照着走同一遍就能播。所以先问
      * [ApiRules.resolveMode]：标了麒麟那一型就走 [QilinResolver]，其余照旧。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution {
         if (rules.resolveMode == net.cinehub.data.model.ApiRules.MODE_QILIN) {
             return QilinResolver.resolve(episodeUrl, config)
         }

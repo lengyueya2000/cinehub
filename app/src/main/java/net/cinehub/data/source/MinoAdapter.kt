@@ -250,7 +250,7 @@ class MinoAdapter(override val config: SourceConfig) : SourceAdapter {
      *
      * 票据验签不在客户端做，见 [MinoProtocol.ticketPayload] 的说明。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution {
         if (!episodeUrl.startsWith(MARK)) {
             if (StreamUrls.isMediaUrl(episodeUrl)) return StreamResolution.Ready(episodeUrl)
             return VideoPlatforms.platformOf(episodeUrl)

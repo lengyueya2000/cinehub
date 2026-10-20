@@ -191,7 +191,6 @@ object LocalKeyProxy {
                         return
                     }
                     val trimmed = runBlockingKey(siteUrl, cfg)
-                    android.util.Log.e("PPNIXDBG", "keyfetch site=$siteUrl -> ${trimmed?.size ?: -1}B")
                     if (trimmed == null) {
                         write(out, 502, "text/plain; charset=utf-8", "取不到密钥".toByteArray())
                         return

@@ -16,6 +16,7 @@ Android 视频聚合播放器。核心产品逻辑只有一句话：**用户自�
 ```bash
 ./gradlew :app:assembleDebug        # 调试包
 ./gradlew :app:assembleRelease      # 发布包（需要签名凭据，见下）
+./gradlew :app:testDebugUnitTest    # 单元测试（约 245 例，不碰网络）
 ```
 
 产物在 `app/build/outputs/apk/{debug,release}/`。
@@ -58,7 +59,7 @@ keytool -genkeypair -keystore .signing/cinehub-release.jks -alias cinehub \
 
 当前发布证书的 SHA-256 指纹：`10:61:03:3E:DF:BB:36:4B:69:B8:56:18:26:3B:B0:ED:67:8C:B5:9C:0A:C7:86:74:ED:90:32:4A:FD:9C:F9:E`
 
-Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。打包后 2.8 MB，debug 包 21 MB。
+Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。release 包 3 MB 上下、debug 包 20 MB 上下 —— 确切数字每个版本都不同，以发布页上给的为准，这里只给个量级（曾经写过死的 2.8 / 21 MB，和实际对不上）。
 
 如果依赖已经在本地 Gradle 缓存里，加 `--offline` 会明显更快。
 
@@ -135,6 +136,7 @@ app/src/main/java/net/cinehub/
    ├─ theme/                    Tokens（T）/ Dimens（Sp、R、Fs）/ Theme
    └─ screens/                  Home / Search / Detail / Player / Mine / Source
                                 Library（豆瓣榜单）/ Downloads / Favorites / History
+                                PlaybackSettings / DownloadSettings / SiteBrowser（站点页取链）
 ```
 
 技术栈：Kotlin 2.0.21 · AGP 8.7.3 · Jetpack Compose（BOM 2024.10.01）· Material3 · Media3/ExoPlayer 1.4.1（HLS + OkHttp datasource）· OkHttp 4.12.0 · jsoup 1.18.1 · Coil 2.7.0 · DataStore Preferences 1.1.7 · kotlinx-serialization-json 1.6.3。`compileSdk 35` / `minSdk 24`，namespace 与 applicationId 均为 `net.cinehub`。
@@ -352,7 +354,7 @@ HLS 规范（RFC 8216）说 `#EXT-X-KEY` 的 `URI` 指向的文件里存的就�
   搜不到就明说「豆瓣有这部，接的源里没搜到同名」，并把去豆瓣的路递过去，不拿一部名字相近的片糊上去。
   它哪天收紧这些接口，界面就如实写原因，不会装成「这个榜没片」。
 
-应用本身不托管、不存储、不分发任何视频内容，也不内置任何资源站：仓库里带的四个源地址都是用户提供的公开站点。加什么源、看什么内容，由使用者自己决定。
+应用本身不托管、不存储、不分发任何视频内容，也不内置任何资源站：仓库里带的六个内置源都是用户提供的公开站点，或自己搭的（MINO自建）。加什么源、看什么内容，由使用者自己决定。
 
 ---
 
@@ -428,8 +430,14 @@ HLS 规范（RFC 8216）说 `#EXT-X-KEY` 的 `URI` 指向的文件里存的就�
   竖屏的片子会拿到一颗方窗、两边留黑边；进小窗那一刻定下的比例不跟着换源改，换到另一家的片同样只是黑边。
 - **倍速记的是全局那一档，不是这一集**：`PlaybackRepository`（单独一份 `cinehub_playback` DataStore）存上一次选的倍速，
   起播、换集、换线路、换源、重开应用都读它 —— 以前它是播放器那一屏的 `remember(1f)`，同一部剧连看八集要点八次。
-  面板里那几档也由仓库给出，界面上不再抄第二份字面量。有意不做按作品记忆：那会让「这一部 1.25、下一部回到 1.0」
-  变成用户得自己记的事，而倍速是他手上调出来的手感，不是片子的属性。
+  面板里那几档（`speedChoices`）与自定义滑杆能拖到的头尾（`speedRange`，0.5~3.0）都由仓库给出，界面上不再抄第二份字面量：
+  两件事分开报，是因为「值得摆成芯片的几档」和「允许停在哪一段」本来就可以各自改。有意不做按作品记忆：那会让
+  「这一部 1.25、下一部回到 1.0」变成用户得自己记的事，而倍速是他手上调出来的手感，不是片子的属性。
+- **自动连播默认关，跳过片头/片尾默认 90 秒**，两样都在「我的 → 播放设置」里改，也从播放器底部那颗「连播」芯片直接翻。
+  连播默认关：自动接下一集是替用户做主的行为，没打招呼就换片比多看一眼按钮更打扰人（老用户盘上那份由 `auto_next_chosen_v1`
+  区分「谁真点过」，没点过的一律跟到新默认）。跳过是**一个数管两头**（国产剧片头片尾时长接近，两个框是负担）：
+  起播后越过这个数就跳，播到只剩这一段就跳到结尾；整集不足三倍的不跳（不然一集短片会被跳没）、手动拖回开头不再跳、
+  拖进片尾区不算播进片尾区（那是用户自己拖的，播放器不该替他按结束）。
 - **收藏与观看记录都挂在 `Media.key` 上**，不是挂在某个源的 id 上 —— 同一部片从另一个源进来，收藏还是那一条，进度也还是那一条。
   位置每 10 秒落一次盘、退出播放时补一次，所以最多丢 10 秒；「看不看完」取 `min(30 秒, 时长的 10%)` 且不低于 5 秒 ——
   固定 30 秒会把一条 30 秒的预览在第 5 秒就判成看完，续播提示永远出不来。首页「继续观看」只列没看完的。
@@ -437,6 +445,11 @@ HLS 规范（RFC 8216）说 `#EXT-X-KEY` 的 `URI` 指向的文件里存的就�
   所以这一步是拿片名去搜、**只认归一化后完全同名**的那一条：差一点就猜进去，用户看到的是另一部片，比说搜不到更糟。
   同名有好几部时（翻拍、续集、同名综艺）按豆瓣给的 `year` 挑；源那边没写年份就只有「唯一一条候选」才敢认，
   两条以上就说「对不上 $year 年那部」，不硬指。没命中就把「去豆瓣看」递到手上。
+- **搜索历史落盘，不是内存**（`SearchHistoryRepository`，单独一份 `cinehub_search` DataStore，最多 8 条）。
+  曾经它是 ViewModel 里的一个内存 `StateFlow`，重启就没了，而搜索页那句「只存在这台设备上」一直写着 ——
+  那句话得是真的。冷启动头几帧内删掉/清空的那几条由墓碑记着，读盘回来时不把它们合并回去。
+- **搜索页不摆源的健康状况**：那是「我的 → 播放源管理」那一页的职责。搜索页只回答「这部片在哪个源里有」——
+  结果行上「这条来自哪个源」的小字留着（点开详情要用），空态里那份带延迟毫秒的体检报告整块删了。
 
 ---
 

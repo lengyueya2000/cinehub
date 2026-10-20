@@ -317,7 +317,7 @@ class AiMovieAdapter(override val config: SourceConfig) : SourceAdapter {
      * - `resolve://` 票证 → 拿这张票再问站点一次，换成能播的地址（见 [resolveTicket]）；
      * - 已经是媒体直链 → 直接给播放器。
      */
-    override suspend fun resolveStream(episodeUrl: String): StreamResolution {
+    override suspend fun resolveStream(episodeUrl: String, mediaId: String?): StreamResolution {
         if (episodeUrl.startsWith(MARK)) {
             ensureSession()
             val parts = episodeUrl.removePrefix(MARK).split('|')

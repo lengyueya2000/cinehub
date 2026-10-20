@@ -31,8 +31,13 @@ interface SourceAdapter {
      * 只有适配器自己知道「拿不到直链」是哪一种成因（登录态？第三方播放页？
      * 地址要靠站点脚本现算？），所以这里直接返回 [StreamResolution]，
      * 上层只负责把它翻译成给用户看的话，不再靠猜。
+     *
+     * [mediaId] 是这一集所属的那一部片（`Media.id`）。多数适配器用不上它 ——
+     * 地址就在 `episodeUrl` 里；但有的型（PPnix）的取链地址要一个只在详情页出现过的
+     * 值，那个值是**一部片一份**的，所以必须知道在问哪一部（见
+     * [PpnixAdapter] 的 infoid 缓存）。默认 `null`：用不上的一方不必知道这件事。
      */
-    suspend fun resolveStream(episodeUrl: String): StreamResolution
+    suspend fun resolveStream(episodeUrl: String, mediaId: String? = null): StreamResolution
 }
 
 /** 适配器工厂。 */
