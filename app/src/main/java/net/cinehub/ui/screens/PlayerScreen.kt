@@ -15,12 +15,14 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -85,6 +87,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.viewinterop.AndroidView
@@ -348,6 +351,16 @@ fun PlayerScreen(
     val autoNext by vm.autoPlayNext.collectAsState()
     /** 画面比例模式（fit/fill/zoom），同样读全局那份。 */
     val resizeMode by vm.playbackResizeMode.collectAsState()
+    /**
+     * 视频自己的宽高比（还没解出来是 null）。
+     *
+     * 「自适应」不再只是 PlayerView 的 RESIZE_MODE_FIT：那一档把 16:9 的画面摆在
+     * 16:9 的**全屏**视口里，于是上下各留一条与画面同宽的黑带 —— 而黑带本可以不占地方。
+     * 做法是让装视频的那个 Box 自己按这个比例收窄（宽度撑满、高度按比例算），
+     * 剩下的地方归顶栏与底部控件：画面一点没少，控件还多了一块不乱压画面的落脚处。
+     * 详见下面 AndroidView 外面那个 Box 的注释。
+     */
+    var videoAspect by remember { mutableStateOf<Float?>(null) }
     /** 跳过片头/片尾的秒数（0 = 关），全局一份；改动从下一集起算（见轮询里的判法）。 */
     val skipSec by vm.skipIntroOutroSec.collectAsState()
     var lineIndex by remember { mutableIntStateOf(0) }
@@ -766,9 +779,12 @@ fun PlayerScreen(
                 playingHeight = 0
             }
             if (sel > 0 && sel != playingHeight) playingHeight = sel
-            // 顺手报一句「现在能按什么形状进小窗」：画面还没解出来就是 null，
+            // 顺手记一下画面自己的宽高比：「自适应」要靠它把视口收窄（见下面那个 Box）。
+            // 顺便报一句「现在能按什么形状进小窗」：画面还没解出来就是 null，
             // 那时候按 Home 就还是普通退出 —— 小窗是给已经在放的东西留的。
-            vm.publishPipRatio(playerDisplayRatio(player))
+            val ratio = playerDisplayRatio(player)
+            if (ratio != null && ratio > 0f && ratio != videoAspect) videoAspect = ratio
+            vm.publishPipRatio(ratio)
             // 缓冲中把采样加密到 100ms：进度条的分母只有 1.2~2.5 秒，
             // 按平时的 500ms 一采只能画出四五帧，进度看着是跳的而不是走的。
             // 只在 BUFFERING 期间加密，正常播放仍走 500ms —— 上面那些
@@ -1129,34 +1145,71 @@ fun PlayerScreen(
     BackHandler { goBack() }
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
-        Box(Modifier.weight(1f).fillMaxWidth()) {
+        // BoxWithConstraints 是为了知道「这一屏自身多大」：画面区按内容宽高比收缩之后，
+        // 渐变罩、手势层、右侧浮层、锁屏那颗图标四处都要按「画面区多大」摆，
+        // 而 Box 撑的是整块屏幕 —— 两个数不是一回事（见下面 areaW / areaH）。
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val boxW: Dp = maxWidth
+            val boxH: Dp = maxHeight
+            // 自适应（fit）的画面区按内容自己的宽高比收窄。
+            //
+            // 原来的样子：PlayerView 撑着整个 Box（也就是整块屏幕），再把 16:9 的画面
+            // FIT 进去 —— 于是上下各留一条**与画面同宽**的黑带， controls 的背景渐变
+            // 还得压在那两条带子上。用户看到的就是「上下一条大黑边 + 控件叠在黑边上」。
+            //
+            // 现在让装画面的那个 Box 自己按比例收：**高度**按宽高比算，上下那两块归
+            // 顶栏与底部控件。画面一个像素都没少（FIT 还是 FIT），但黑边不再是
+            // 「一块占着地方的死区」，而是控件名正言顺的落脚处 —— 横片竖看时尤其明显：
+            // 原来控件压在两条大黑带上，现在它们待在画面外面自己的地方。
+            //
+            // 高度算法（不是 aspectRatio 修饰符）：按比例算出来的高度可能**超过** Box 高
+            // （竖屏源、4:3 老片，宽高比小于「Box 宽 / Box 高」时就是），那时候按
+            // aspectRatio + fillMaxWidth 会把内容顶出 Box 被父布局裁掉。所以这里自己算：
+            // 宽高比够宽就按宽度算高（画面横向铺满，上下收缩）；否则按高度算宽（画面
+            // 纵向铺满，左右收缩）—— 两种情况都是「一边贴满、另一边按比例」，
+            // 而 PlayerView 的 FIT 会在剩下的那一点余量里居中，最终黑白边只剩一条。
+            //
+            // 这一对数是这一屏「画面区有多大」的**唯一**说法：装画面的 Box、手势层、
+            // 两块渐变罩、右侧浮层、锁屏那颗图标的位置，五处都读它。
+            // 各算一遍正是这次改岔子的来源：手势层原来挂着 aspectRatio（拿 Box 宽去算，
+            // 窄片时算出来的高度超过 Box 高，手势区会跑到画面外面），浮层自己抄了一份
+            // boxW / ratio（同样只在宽片时成立），图标那份也是 —— 那次修完只剩这一处。
+            val (areaW, areaH) = fitVideoArea(boxW, boxH, resizeMode, videoAspect)
             if (playing?.streamUrl != null) {
-                AndroidView(
-                    factory = { c ->
-                        PlayerView(c).apply {
-                            useController = false
-                            // this. 不能省：外层那个同名 val（全局偏好，String）
-                            // 会把这里的 PlayerView.resizeMode（Int）整个遮掉
-                            this.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                            )
-                            setShutterBackgroundColor(android.graphics.Color.BLACK)
-                        }
-                    },
-                    update = { view ->
-                        view.player = player
-                        // 画面比例跟着全局偏好走：update 每次重组都会跑，
-                        // 值没变时 setFrameLayoutResizeMode 内部自己去重
-                        view.resizeMode = when (resizeMode) {
-                            "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
-                            "zoom" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
+                Box(
+                    Modifier
+                        .align(Alignment.TopCenter)
+                        .width(areaW)
+                        .height(areaH)
+                        .background(Color.Black),
+                ) {
+                    AndroidView(
+                        factory = { c ->
+                            PlayerView(c).apply {
+                                useController = false
+                                // this. 不能省：外层那个同名 val（全局偏好，String）
+                                // 会把这里的 PlayerView.resizeMode（Int）整个遮掉
+                                this.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                )
+                                setShutterBackgroundColor(android.graphics.Color.BLACK)
+                            }
+                        },
+                        update = { view ->
+                            view.player = player
+                            // 画面比例跟着全局偏好走：update 每次重组都会跑，
+                            // 值没变时 setFrameLayoutResizeMode 内部自己去重
+                            view.resizeMode = when (resizeMode) {
+                                "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                                "zoom" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                                else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             } else {
                 Box(
                     Modifier.fillMaxSize().background(
@@ -1166,19 +1219,36 @@ fun PlayerScreen(
             }
 
             if (!fullscreen || controls) {
+                // 两块渐变罩也只铺**画面区**（收缩后的那一块）。
+                //
+                // 原来它们是按整块屏幕铺的：收缩之后画面下方多出一块干净的底色，
+                // 底部那块 180dp 的罩子就会从画面外面开始发黑 —— 控件像是浮在一块
+                // 与画面无关的黑布上，而那块布边缘还能看出一条直线。
+                // 跟着画面区走，罩子的上边正好压在画面下边缘上，跟不收缩时一个样。
                 Box(
-                    Modifier.fillMaxWidth().height(70.dp).background(
-                        Brush.verticalGradient(listOf(Color.Black.copy(alpha = .86f), Color.Transparent))
+                    Modifier
+                        .align(Alignment.TopCenter)
+                        .width(areaW)
+                        .height(areaH),
+                ) {
+                    Box(
+                        Modifier.fillMaxWidth().height(70.dp).background(
+                            Brush.verticalGradient(listOf(Color.Black.copy(alpha = .86f), Color.Transparent))
+                        )
                     )
-                )
-                Box(
-                    Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(180.dp).background(
-                        Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = .95f)))
+                    Box(
+                        Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(180.dp).background(
+                            Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = .95f)))
+                        )
                     )
-                )
+                }
             }
 
             // ---------- 手势层：在控件之下，吃掉画面区的拖动与点击 ----------
+            //
+            // 尺寸跟**画面区**一致（自适应收窄后的那个 Box），不是整块屏幕：
+            // 收窄之后上下那两块归控件，手指点在控件区里已经是在点控件，
+            // 手势层再铺一层就会把「点一下收起控件」和「点空白处显隐控件」搅在一起。
             //
             // 锁屏时整块**不挂**而不是「挂着、里面判一个 locked 开关」：
             // awaitEachGesture 一旦启动就跑完整个指头生命周期，判开关只是白跑一遍，
@@ -1188,7 +1258,9 @@ fun PlayerScreen(
             if (!screenLocked) {
                 Box(
                     Modifier
-                        .fillMaxSize()
+                        .width(areaW)
+                        .height(areaH)
+                        .align(Alignment.TopCenter)
                         .playerGestures(
                             currentPosition = { player.currentPosition.coerceAtLeast(0) },
                             durationMs = { player.duration.coerceAtLeast(0) },
@@ -1242,6 +1314,15 @@ fun PlayerScreen(
             // 半锁比不锁更骗人。而锁的场景（揣兜里、横着放）本来就只发生在全屏，
             // 竖屏预览是「正在用这台手机看详情」，不是口袋。
             if (fullscreen && !inPip) {
+                // 这一颗要贴在**画面**的右中，不是整个 Box 的右中。
+                //
+                // 画面区收缩之后两者不再是同一个地方：Box 还撑着整块屏幕，而画面只占上面
+                // 一段，CenterEnd 会落到画面下面那块空处里。所以竖向上按画面高度算一次偏移
+                // （画面顶天立着，中心 = 画面高度的一半；没收缩时那个偏移恰好是 0，
+                // 因为画面高度就是 Box 高度）。
+                //
+                // 窄片（4:3、竖屏源）时画面是左右收缩、高度仍然满的，areaH == boxH，
+                // 偏移正好是 0 —— 同一个式子宽片窄片都对，不必再判一次内容形状。
                 LockScreenToggle(
                     locked = screenLocked,
                     onClick = {
@@ -1249,7 +1330,11 @@ fun PlayerScreen(
                     },
                     // align 必须由调用方给：这颗要贴在画面右中，而 composable 自己
                     // 不知道会被放进哪种父布局里（这里是 BoxScope，能 align）。
-                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 6.dp)
+                        // 把「Box 中心」挪到「画面中心」：画面顶着上边，所以向上挪半个差值
+                        .offset(y = (areaH - boxH) / 2),
                 )
             }
 
@@ -1729,14 +1814,6 @@ fun PlayerScreen(
                                     panel = Panel.Speed
                                 }
                                 Spacer8()
-                                // 自动连播单独一颗摆在底部：它是「这一屏之外的行为」开关
-                                // （播完接不接下一集），以前藏在倍速面板底下，找一个开关
-                                // 得先开面板 —— 而它只有两档，一颗芯片点一下就翻，犯不着浮层。
-                                // 芯片上的字就是当前档：点了立刻从「开」变「关」，反馈即状态。
-                                Chip(if (autoNext) "连播 开" else "连播 关") {
-                                    vm.setAutoPlayNext(!autoNext)
-                                }
-                                Spacer8()
                                 // 画面比例三档走面板：轮换式一点一圈，按快了会跳过想要的那档，
                                 // 也不知道下一点落到哪 —— 摆成三个选项，看一眼再选。
                                 Chip("画面 ${resizeLabel(resizeMode)}") { panel = Panel.Resize }
@@ -1835,13 +1912,20 @@ fun PlayerScreen(
 
             // ---------- 右侧浮层：选集 / 线路 / 画质 / 倍速 ----------
             panel?.let { p ->
+                // 浮层也只覆盖**画面区**：原来它是整块屏幕的一块半透明罩 + 右侧一列，
+                // 画面区收缩之后，罩子会盖到画面下面那块本来归控件的干净区域，
+                // 看起来像「面板把整个屏幕都盖住了」—— 而它该盖的只是画面。
                 Box(
-                    Modifier.fillMaxSize()
+                    Modifier
+                        .width(areaW)
+                        .height(areaH)
+                        .align(Alignment.TopCenter)
                         .background(Color.Black.copy(alpha = .45f))
                         .clickable { panel = null },
                 )
                 Column(
-                    Modifier.align(Alignment.CenterEnd).fillMaxHeight()
+                    Modifier.align(Alignment.TopEnd)
+                        .height(areaH)
                         .width(if (p == Panel.Episodes) 300.dp else 200.dp)
                         .background(T.Surface.copy(alpha = .97f))
                         .padding(horizontal = Sp.s4, vertical = Sp.s3),
@@ -2645,6 +2729,53 @@ private fun resizeLabel(mode: String): String = when (mode) {
     "fill" -> "铺满"
     "zoom" -> "裁切"
     else -> "自适应"
+}
+
+/**
+ * 自适应（fit）的画面区占多大：按内容自己的宽高比收窄，让上下那两块黑边归控件。
+ *
+ * 原来的样子是 PlayerView 撑着整个 Box（也就是整块屏幕），再把 16:9 的画面 FIT 进去 ——
+ * 于是上下各留一条**与画面同宽**的黑带，控件的背景渐变还得压在那两条带子上。
+ * 用户看到的就是「上下一条大黑边 + 控件叠在黑边上」。
+ *
+ * 现在装画面的那个 Box 自己按比例收：画面一个像素都没少（FIT 还是 FIT），
+ * 但黑边不再是「一块占着地方的死区」，而是顶栏与底部控件名正言顺的落脚处 ——
+ * 横片竖看时尤其明显：原来控件压在两条大黑带上，现在它们待在画面外面自己的地方。
+ *
+ * 为什么不用 `Modifier.aspectRatio`：按比例算出来的高度可能**超过** Box 高
+ * （竖屏源、4:3 老片，宽高比小于「Box 宽 / Box 高」时就是），那时候
+ * `aspectRatio + fillMaxWidth` 会把内容顶出 Box 被父布局裁掉。所以按哪一边为基准
+ * 分两种情况算：宽高比够宽就按宽度算高（画面横向铺满，上下收缩）；否则按高度算宽
+ * （画面纵向铺满，左右收缩）—— 两种都是「一边贴满、另一边按比例」，
+ * 而 PlayerView 的 FIT 会在剩下的那一点余量里居中，最终黑白边只剩一条。
+ *
+ * 「拉满」和「放大」不收窄：那两种本来就是让 PlayerView 自己去裁去拉，
+ * 画面区收窄了反而和它对着干。宽高比还解不出来（null 或非正数）时按整块 Box 算 ——
+ * 等它自己报，那一瞬之后会重排。
+ *
+ * 这一屏有**五处**读这个数：装画面的 Box、手势层、两块渐变罩、右侧浮层、
+ * 以及锁屏那颗图标的纵向偏移（它要贴在画面右中，而 Box 的右中不是画面的右中）。
+ * 五处各算一遍正是出过事的地方 —— 手势层曾挂着 aspectRatio（拿 Box 宽去算，
+ * 窄片时算出的高度超过 Box 高，手势区跑到画面外面），浮层与图标也各自抄了一份
+ * `boxW / ratio`。所以收成这一个纯函数，谁也别再写第二遍。
+ */
+internal fun fitVideoArea(
+    boxW: Dp,
+    boxH: Dp,
+    resizeMode: String,
+    videoAspect: Float?,
+): Pair<Dp, Dp> {
+    if (resizeMode in setOf("fill", "zoom") || videoAspect == null || videoAspect <= 0f) {
+        return boxW to boxH
+    }
+    val ar = videoAspect
+    return if (ar * boxH.value >= boxW.value) {
+        // 画面比 Box 更「宽」⇒ 以宽为基准，上下收缩
+        boxW to (boxW.value / ar).dp
+    } else {
+        // 画面比 Box 更「窄」（竖片、4:3）⇒ 以高为基准，左右收缩
+        (boxH.value * ar).dp to boxH
+    }
 }
 
 /**

@@ -22,8 +22,8 @@ android {
         applicationId = "net.cinehub"
         minSdk = 24
         targetSdk = 35
-        versionCode = 34
-        versionName = "1.4.11"
+        versionCode = 35
+        versionName = "1.4.12"
     }
 
     if (hasReleaseKeystore) {
