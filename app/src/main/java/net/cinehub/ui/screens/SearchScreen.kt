@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -277,38 +278,49 @@ fun SearchScreen(
                                     fontWeight = FontWeight.Bold,
                                     modifier = Modifier.weight(1f),
                                 )
-                                Text(
-                                    "清空",
-                                    color = T.TextDim,
-                                    fontSize = Fs.xs,
-                                    // 44dp：这一颗没有别的护栏，点不准就等于没有
-                                    modifier = Modifier.clip(R.full)
-                                        .heightIn(min = Touch.min)
-                                        .clickable { confirmClearHistory = true }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                                )
+                                Box(
+                                    Modifier.heightIn(min = Touch.min),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        "清空",
+                                        color = T.TextDim,
+                                        fontSize = Fs.xs,
+                                        // 44dp：这一颗没有别的护栏，点不准就等于没有。
+                                        // 挂在 Box 上而不是 Text 上 —— 见上面那排历史词同样的讲究。
+                                        modifier = Modifier.clip(R.full)
+                                            .clickable { confirmClearHistory = true }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    )
+                                }
                             }
                             Spacer8()
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(Sp.s2)) {
                                 // 键用词本身：长按删掉一条之后，靠位置认项会把邻居的
                                 // 组合槽位接过去（删的是第三个，动的却是第四个）。
                                 items(history, key = { it }) { h ->
-                                    Text(
-                                        h,
-                                        color = T.TextDim,
-                                        fontSize = Fs.xs,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.clip(R.full).background(T.Surface2)
-                                            // 长按删一条，不弹确认：删错了重新搜一次就回来了
-                                            .combinedClickable(
-                                                onClick = { vm.search(h) },
-                                                onLongClick = { vm.removeSearchHistory(h) },
-                                            )
-                                            // 44dp：这一排是按词走的，手指头一点就点不准
-                                            .heightIn(min = Touch.min)
-                                            .padding(horizontal = 12.dp, vertical = 7.dp),
-                                    )
+                                    // 44dp 的命中区必须挂在**外层 Box** 上并让它居中：
+                                    // 挂在 Text 上时 padding 是最内层，Text 拿到 44dp 后
+                                    // 从顶开始画 —— 药丸是 44dp 高、字却贴着上沿。
+                                    Box(
+                                        Modifier.heightIn(min = Touch.min),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            h,
+                                            color = T.TextDim,
+                                            fontSize = Fs.xs,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.clip(R.full).background(T.Surface2)
+                                                // 长按删一条，不弹确认：删错了重新搜一次就回来了
+                                                .combinedClickable(
+                                                    onClick = { vm.search(h) },
+                                                    onLongClick = { vm.removeSearchHistory(h) },
+                                                )
+                                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                                        )
+                                    }
                                 }
                             }
                             Spacer12()
@@ -490,18 +502,27 @@ private fun resultChips(items: List<AggregatedMedia>): List<Pair<String, Int>> =
  */
 @Composable
 private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
-    Text(
-        label,
-        color = if (on) Color.White else T.TextDim,
-        fontSize = Fs.sm,
-        fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.clip(R.full)
-            .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
-            .selectable(selected = on, onClick = onClick)
-            // 44dp：这一排芯片是筛选用的高频点击目标
+    // 同上：44dp 挂在 Box 上并居中，挂在 Text 上会让字贴到药丸上沿。
+    Box(
+        Modifier
             .heightIn(min = Touch.min)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-    )
+            .selectable(
+                selected = on,
+                role = Role.Tab,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = if (on) Color.White else T.TextDim,
+            fontSize = Fs.sm,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clip(R.full)
+                .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+    }
 }
 
 

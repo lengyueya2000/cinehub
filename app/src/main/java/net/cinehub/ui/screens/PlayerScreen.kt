@@ -122,6 +122,7 @@ import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
+import net.cinehub.ui.theme.Touch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -1197,7 +1198,10 @@ fun PlayerScreen(
             // 各算一遍正是这次改岔子的来源：手势层原来挂着 aspectRatio（拿 Box 宽去算，
             // 窄片时算出来的高度超过 Box 高，手势区会跑到画面外面），浮层自己抄了一份
             // boxW / ratio（同样只在宽片时成立），图标那份也是 —— 那次修完只剩这一处。
-            val (areaW, areaH) = fitVideoArea(boxW, boxH, resizeMode, videoAspect)
+            //
+            // 「收窄只在全屏发生」这条规则在 [fitVideoArea] 里面，不在这里判 ——
+            // 它是边界条件之一，和「拉满/放大不收窄」同一类，得被单测钉住。
+            val (areaW, areaH) = fitVideoArea(boxW, boxH, resizeMode, videoAspect, fullscreen)
             if (playing?.streamUrl != null) {
                 Box(
                     Modifier
@@ -2724,21 +2728,36 @@ private fun IconBtn(
     }
 }
 
+/**
+ * 底部那一排芯片（选集 / 倍速 / 画面 / 源 / 线路 / 画质 / 缓存）。
+ *
+ * 1.4.13 给这一排补 44dp 命中区时把 `heightIn` 直接挂在了 `Text` 上，
+ * 顺序是 `heightIn → padding → Text`：padding 是最内层，它只把文字往上顶，
+ * 而 `Text` 拿到 44dp 之后**从顶开始画** —— 于是边框是 44dp 高的方框，
+ * 字却贴在方框上沿，看着就是「中文没有居中」。
+ *
+ * 改成外面套一层 `Box` 并给它 `contentAlignment = Center`：多出来的高度由 Box
+ * 负责把内容摆正，边框和命中区是 44dp，字在中间。
+ */
 @Composable
 private fun Chip(label: String, onClick: () -> Unit) {
-    Text(
-        label,
-        color = Color.White,
-        fontSize = Fs.xxs,
-        fontWeight = FontWeight.Bold,
-        modifier = Modifier.clip(R.sm)
+    Box(
+        Modifier.clip(R.sm)
             .border(1.dp, Color.White.copy(alpha = .26f), R.sm)
             .clickable(onClick = onClick)
-            // 44dp：这一排（选集 / 倍速 / 画面 / 缓存）是暗底上的小字，
-            // 不护住高度就点不准 —— 而它们是播放器里最常用的几个入口。
-            .heightIn(min = 44.dp)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-    )
+            // 44dp：这一排是暗底上的小字，不护住高度就点不准 ——
+            // 而它们是播放器里最常用的几个入口。
+            .heightIn(min = Touch.min)
+            .padding(horizontal = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = Color.White,
+            fontSize = Fs.xxs,
+            fontWeight = FontWeight.Bold,
+        )
+    }
 }
 
 private fun setVolume(audio: AudioManager, frac: Float) {
@@ -2816,6 +2835,16 @@ private fun resizeLabel(mode: String): String = when (mode) {
  * 画面区收窄了反而和它对着干。宽高比还解不出来（null 或非正数）时按整块 Box 算 ——
  * 等它自己报，那一瞬之后会重排。
  *
+ * **[fullscreen] 为 false 时一律不收窄**（1.4.13 修）：收窄这件事是按全屏的形状算的 ——
+ * 全屏横屏时 Box 与画面几乎同形，上下各剩 25dp，顶栏与控件正好落进那两条窄带里。
+ * 竖屏是另一种形状：360 dp 宽的 Box 里放一条 16:9 的画面只有 202.5dp 高，
+ * 而那一格有 ~460dp（640 的屏减掉下面 180dp 的选集抽屉），
+ * 收窄会把那 ~257dp **全堆到画面下面**，用户看到的就是「画面下面就是没有」——
+ * 一块不属于任何东西的死黑区，进度条与暂停键还被推到最底下、离画面老远。
+ * 具体数值随屏幕变，「余量全堆到画面下面」这件事与屏幕无关，所以一律不收窄。
+ * 竖屏让画面在 Box 里上下居中（PlayerView 的 FIT 本来就这么做），两条黑带对称，
+ * 那才是这部片自己的信箱黑边，而不是布局漏出来的一块。
+ *
  * 这一屏有**五处**读这个数：装画面的 Box、手势层、两块渐变罩、右侧浮层、
  * 以及锁屏那颗图标的纵向偏移（它要贴在画面右中，而 Box 的右中不是画面的右中）。
  * 五处各算一遍正是出过事的地方 —— 手势层曾挂着 aspectRatio（拿 Box 宽去算，
@@ -2827,7 +2856,9 @@ internal fun fitVideoArea(
     boxH: Dp,
     resizeMode: String,
     videoAspect: Float?,
+    fullscreen: Boolean,
 ): Pair<Dp, Dp> {
+    if (!fullscreen) return boxW to boxH
     if (resizeMode in setOf("fill", "zoom") || videoAspect == null || videoAspect <= 0f) {
         return boxW to boxH
     }

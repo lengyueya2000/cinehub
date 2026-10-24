@@ -14,11 +14,13 @@ import org.junit.Test
  * 这正是出过的事：手势层曾自己挂着 aspectRatio（拿 Box 宽去算，窄片时算出的高度超过
  * Box 高），浮层和锁屏图标也各抄了一份 `boxW / ratio`。抽成纯函数，把边界钉在这里。
  *
- * 边界分三类：
+ * 边界分四类：
  * ① 宽片按宽算高（横向铺满、上下收缩）—— 黑边归顶栏与底部控件，这是这次要修的那件事；
  * ② 窄片按高算宽（纵向铺满、左右收缩）—— 宽度一超 Box 宽就会被父布局裁掉，
  *    所以必须反过来算，`aspectRatio + fillMaxWidth` 在这里是错的；
- * ③ 拉满 / 放大 / 宽高比还没解出来，一律按整块 Box —— 那几种本来就不该收窄。
+ * ③ 拉满 / 放大 / 宽高比还没解出来，一律按整块 Box —— 那几种本来就不该收窄；
+ * ④ **竖屏一律不收窄** —— 收窄是按全屏那个「Box 与画面几乎同形」的比例算的，
+ *    竖屏照搬会把整块余量堆到画面下面，成为一块死黑区（1.4.13 修的就是这个）。
  *
  * 数值断言带容差（0.01 dp）：800/(16/9) 在 Float 里是 450.00001，不是 450。
  * 真要钉的是「宽高比保持」「不超 Box」「一边贴满」这三条不变量，不是第几位小数。
@@ -43,7 +45,7 @@ class FitVideoAreaTest {
     fun wideContentIsWidthAnchoredAndKeepsFullWidth() {
         // 16:9 画面在 800 dp 宽的视口里高 450 dp，上下各剩 25 dp 归控件 ——
         // 这就是真机量出来的那个 900 px（密度 2）。宽不变，否则等于自己给自己加黑边。
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", wide)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", wide, true)
         assertEquals(boxW, w)
         assertArea(800f, 450f, w to h)
     }
@@ -52,7 +54,7 @@ class FitVideoAreaTest {
     fun theStripBelowBelongsToTheControls() {
         // 上下那两块各拿到「Box 高 − 画面高」的一半。顶栏与底部控件之所以能名正言顺地
         // 待在画面外面，靠的就是这一条 —— 要是画面区不收窄，它们就得压在黑带上。
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", wide)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", wide, true)
         assertEquals(boxW, w)
         assertEquals(25f, (boxH.value - h.value) / 2f, 0.01f)
     }
@@ -60,7 +62,7 @@ class FitVideoAreaTest {
     @Test
     fun cinemaScopeFoldsEvenFurther() {
         // 2:1 的内容：宽还是 800 dp，高只剩 400 dp，剩下 100 dp 全归控件。
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", 2f)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", 2f, true)
         assertEquals(boxW, w)
         assertArea(800f, 400f, w to h)
     }
@@ -71,7 +73,7 @@ class FitVideoAreaTest {
     fun narrowContentIsHeightAnchored() {
         // 4:3 老片在 800×500 的 Box 里：按宽算会是 600 dp 高，撑破 Box 50 dp，
         // 超出那截会被父布局裁掉。所以改成按高算宽 —— 高用满，宽 666.67 dp。
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", 4f / 3f)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", 4f / 3f, true)
         assertEquals(boxH, h)
         assertArea(666.67f, 500f, w to h)
     }
@@ -79,7 +81,7 @@ class FitVideoAreaTest {
     @Test
     fun verticalShortDramaAlsoFits() {
         // 竖屏短剧 9:16：宽度只有 Box 高的 9/16 = 281.25 dp，高度用满。
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", 9f / 16f)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", 9f / 16f, true)
         assertEquals(boxH, h)
         assertArea(281.25f, 500f, w to h)
     }
@@ -89,7 +91,7 @@ class FitVideoAreaTest {
         // 无论多窄，宽度都不许超过 Box 宽 —— 超了就会被父布局裁掉一截，
         // 而手势层/渐变罩/浮层都按这个数摆，一超出就统统跑到画面外面。
         for (ar in listOf(0.1f, 0.5f, 9f / 16f, 0.75f, 1f, 4f / 3f)) {
-            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar)
+            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar, true)
             assertEquals(boxH, h)
             assertTrue("宽 $w 超过了 Box 宽 $boxW（宽高比 $ar）", w <= boxW)
         }
@@ -102,7 +104,7 @@ class FitVideoAreaTest {
         // 宽高比刚好等于 Box 的（800/500）：画面铺满、一个像素的边都不留。
         // 容差是因为 1.6f 在二进制里不精确，800/1.6f 除出来是 499.99999。
         val ar = boxW.value / boxH.value
-        val (w, h) = fitVideoArea(boxW, boxH, "fit", ar)
+        val (w, h) = fitVideoArea(boxW, boxH, "fit", ar, true)
         assertArea(800f, 500f, w to h)
     }
 
@@ -110,18 +112,18 @@ class FitVideoAreaTest {
     fun unknownAspectFillsTheBox() {
         // 画面还没解出来（videoSize 是 0）：按整块 Box 算，等它自己报再重排。
         // 提前收窄会让控件在起播那一瞬闪一个错误的位置。
-        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", null))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", null, true))
         // 非正数同理 —— 那和「不知道」是一回事，更不该拿去当除数。
-        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", 0f))
-        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", -2f))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", 0f, true))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", -2f, true))
     }
 
     @Test
     fun fillAndZoomNeverShrink() {
         // 那两种本来就是让 PlayerView 自己去裁去拉，画面区收窄了反而和它对着干。
         for (ar in listOf(0.5f, 4f / 3f, wide, 2f)) {
-            assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fill", ar))
-            assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "zoom", ar))
+            assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fill", ar, true))
+            assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "zoom", ar, true))
         }
     }
 
@@ -131,7 +133,7 @@ class FitVideoAreaTest {
     fun theAreaAlwaysStaysInsideTheBox() {
         // 不管什么内容，画面区都不许超出 Box —— 超出去的部分会被父布局裁掉。
         for (ar in listOf(0.1f, 0.5625f, 0.75f, 1f, 4f / 3f, 1.6f, wide, 2f, 3.5f)) {
-            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar)
+            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar, true)
             assertTrue("宽 $w 超出 Box（宽高比 $ar）", w <= boxW)
             assertTrue("高 $h 超出 Box（宽高比 $ar）", h <= boxH)
         }
@@ -143,7 +145,7 @@ class FitVideoAreaTest {
         // 两边都不贴 = 画面比能放的还小，白费一块屏幕；
         // 两边都贴而比例又不对 = 画面被拉变形了。
         for (ar in listOf(0.1f, 0.5625f, 0.75f, 1f, 4f / 3f, 1.6f, wide, 2f, 3.5f)) {
-            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar)
+            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar, true)
             assertTrue("宽高比 $ar 时两边都没贴满", w == boxW || h == boxH)
         }
     }
@@ -154,7 +156,7 @@ class FitVideoAreaTest {
         // 一个像素的黑边都不会有 —— 黑边全在画面区外面，归控件。
         // 这条是这次改动的**目的**本身，比任何具体数值都值得钉。
         for (ar in listOf(0.5625f, 4f / 3f, wide, 2f)) {
-            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar)
+            val (w, h) = fitVideoArea(boxW, boxH, "fit", ar, true)
             assertEquals(ar, w.value / h.value, 0.001f)
         }
     }
@@ -164,12 +166,51 @@ class FitVideoAreaTest {
         // 换一块 Box 只是挪那条线的位置，判据本身不变：同样是 16:9 内容，
         // 在 4:3 的 Box 里按宽算高得 450 dp；换成竖 Box（500×800）内容相对更「宽」了，
         // 于是仍然按宽算高、得 281.25 dp。都是同一条判据，不用为屏幕形状改代码。
-        val flat = fitVideoArea(800.dp, 600.dp, "fit", wide)   // 4:3 的 Box
+        val flat = fitVideoArea(800.dp, 600.dp, "fit", wide, true)   // 4:3 的 Box
         assertArea(800f, 450f, flat)
 
-        val tall = fitVideoArea(500.dp, 800.dp, "fit", wide)   // 竖着的 Box
+        val tall = fitVideoArea(500.dp, 800.dp, "fit", wide, true)   // 竖着的 Box
         // 竖 Box 高 800 dp，16:9 内容还是比 Box「宽」（1.778 × 800 ≫ 500），
         // 所以仍然按宽算高：宽用满 500 dp、高 281.25 dp，剩下的全归控件。
         assertArea(500f, 281.25f, tall)
+    }
+
+    // ---------- ④ 竖屏一律不收窄（1.4.13 修）----------
+
+    @Test
+    fun portraitNeverShrinksRegardlessOfAspect() {
+        // 收窄是按**全屏的形状**算的：横屏时 Box 与画面几乎同形，上下各剩 25 dp，
+        // 顶栏与控件正好落进那两条窄带里。
+        //
+        // 竖屏不是那个形状。拿 360×640 dp 这一档竖屏算（bb 模拟器实测 720×1280 @320dpi；
+        // 画面区那一格是 640 减掉下面 180 dp 的选集抽屉 ≈ 460 dp 高、360 dp 宽）：
+        // 一条 16:9 的画面在 360 dp 宽里只有 202.5 dp 高 ——
+        // 收窄会把剩下那 ~257 dp **全堆到画面下面**，用户看到的就是「画面下面就是没有」：
+        // 一块不属于任何东西的死黑区，进度条与暂停键被推到最底下、离画面老远。
+        // 具体数值随屏幕变，但「余量全堆到画面下面」这件事与屏幕无关，所以一律不收窄。
+        //
+        // 竖屏要的是画面在 Box 里上下居中（PlayerView 的 FIT 本来就这么做），
+        // 两条黑带对称 —— 那才是这部片自己的信箱黑边，而不是布局漏出来的一块。
+        val pw = 360.dp
+        val ph = 460.dp
+        for (ar in listOf(0.1f, 0.5625f, 0.75f, 1f, 4f / 3f, wide, 2f, 3.5f)) {
+            assertEquals(pw to ph, fitVideoArea(pw, ph, "fit", ar, false))
+        }
+    }
+
+    @Test
+    fun portraitIgnoresResizeModeAndUnknownAspectToo() {
+        // 竖屏这一条排在最前面：拉满 / 放大 / 宽高比还没解出来，同样按整块 Box ——
+        // 反正结果一样，不必为它分情况。
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", wide, false))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fill", wide, false))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "zoom", wide, false))
+        assertEquals(boxW to boxH, fitVideoArea(boxW, boxH, "fit", null, false))
+    }
+
+    @Test
+    fun fullscreenStillShrinksTheSameWay() {
+        // 反向确认：这一条不是「把收窄整个关掉」。全屏时与 1.4.12 完全一致。
+        assertArea(800f, 450f, fitVideoArea(boxW, boxH, "fit", wide, true))
     }
 }
