@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -21,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import net.cinehub.ui.AppViewModel
@@ -167,13 +169,21 @@ private fun <Opt> Segmented(
         options.forEach { n ->
             val on = n == selected
             Box(
+                // 选中态原来**只靠底色和字重**表达：看得见的人知道选的是哪一档，
+                // 读屏软件看不见颜色，只会把这一排念成一串一样的数字，
+                // 而「现在生效的是哪一档」一个字都不说。
+                // selectable + Role.Tab 让它念成「90 · 已选中」。
                 Modifier.weight(1f).heightIn(min = 44.dp)
                     .clip(R.sm)
                     .background(
                         if (on) Brush.verticalGradient(listOf(T.Play400, T.Play500))
                         else Brush.verticalGradient(listOf(Color.Transparent, Color.Transparent))
                     )
-                    .clickable { onSelect(n) },
+                    .selectable(
+                        selected = on,
+                        role = Role.Tab,
+                        onClick = { onSelect(n) },
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(

@@ -973,9 +973,25 @@ class DownloadRepository(
                     if (e is Transient) error(e.message ?: "$label 取不到")
                     throw e
                 }
-                delay(RETRY_BACKOFF_MS.getOrElse(attempt - 1) { RETRY_BACKOFF_MS.last() })
+                // 退避要带**抖动**：一集同时下 8 个分片，8 个 worker 撞上同一个 429
+                // 会同时等 400ms、同时醒来、同时再打 —— 于是对方那边看到的正是
+                // 「8 个请求在同一毫秒里重来一遍」，比一次都不重试更像在砸门。
+                // 加 ±30% 的随机抖动之后，这 8 个 worker 会散开在 280~520ms 之间醒。
+                delay(jittered(RETRY_BACKOFF_MS.getOrElse(attempt - 1) { RETRY_BACKOFF_MS.last() }))
             }
         }
+    }
+
+    /**
+     * 给一个退避时长加 ±30% 的随机抖动。
+     *
+     * 固定时长在并发重试里等于「整齐排队」—— 大家一起等、一起醒、一起再被打一次。
+     * 抖动把它们错开，站点那边看到的就是散开的请求而不是一堵墙。
+     */
+    private fun jittered(base: Long): Long {
+        val delta = (base * 0.3).toLong()
+        if (delta <= 0) return base
+        return (base - delta + kotlin.random.Random.nextLong(2 * delta + 1)).coerceAtLeast(1L)
     }
 
     /** 值得再试一次的失败：里面装的是已经能直接给用户看的那句话。 */

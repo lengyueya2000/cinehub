@@ -42,6 +42,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -196,7 +198,10 @@ fun SiteBrowserScreen(
             Box(
                 // 这颗是这一页唯一的出口，32dp 太小 —— 而且它旁边就是状态栏的边
                 Modifier.size(44.dp).clip(CircleShape).background(T.Surface2)
-                    .clickable(onClick = onClose),
+                    .clickable(onClick = onClose)
+                    // 这一屏只有这一个出口，不给它一个名字的话读屏只会念「按钮」——
+                    // 用户不知道怎么从站点页面里退出来。
+                    .semantics { contentDescription = "关闭站点页面" },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(Icons.Filled.ArrowBack, null, tint = T.Text, modifier = Modifier.size(16.dp))

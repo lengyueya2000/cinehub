@@ -8,6 +8,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,10 +17,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import net.cinehub.data.model.Favorite
 import net.cinehub.data.model.HistoryEntry
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val Context.watchStore by preferencesDataStore(name = "cinehub_watch")
 
@@ -36,6 +39,42 @@ class WatchRepository(private val context: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true }
+
+    /**
+     * 这一份仓库退休了没有。
+     *
+     * [scope] 的根是 [SupervisorJob] —— 它**永远不会自己结束**，所以不显式取消的话，
+     * 这一颗作用域和它身上的每一个子任务都会一直活到进程结束。VM 是 activity 作用域的
+     * （`AppViewModel` 由 `MainActivity` 的 `ViewModelProvider` 拿），Activity 重建一次
+     * 就多一套仓库、多一套 `SupervisorJob`、多一份「还在写盘」的协程。
+     *
+     * 用 [AtomicBoolean] 而不是 `@Volatile var`：关的动作要和「起一个落盘协程」并发发生
+     * （主线程关仓库、IO 线程正好在写盘），单纯一个 volatile 标志读-改-写不是原子的。
+     */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * 这一份仓库退休：把还在跑的协程全停掉。
+     *
+     * 幂等：调几次都是同一个结果 —— `scope.cancel()` 对一个已取消的作用域再调一次没有副作用，
+     * [closed] 也只让第一次真正生效。
+     *
+     * **关之前先把待写的落盘做掉**。这个仓库的每一次改动（收藏、观看记录）都是
+     * 「改内存 + 起一个协程写盘」两条腿，而写盘那一条是异步的：用户在写盘落地之前
+     * 退出应用，这一笔就跟着那个被取消的协程一起没了 —— 用户明明刚点过收藏，
+     * 下次进来它不在。
+     *
+     * 所以这里先同步落一次盘（见 [flushNow]），再取消作用域。取消只停**还没开始**的活，
+     * 已经在写的那一笔由 DataStore 自己的事务保证要么写完要么不写，不会写一半。
+     */
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        flushNow()
+        pendingSave?.cancel()
+        pendingSave = null
+        scope.cancel()
+    }
+
     private val KEY_FAV = stringPreferencesKey("favorites_v1")
     private val KEY_HIS = stringPreferencesKey("history_v1")
     /** 收藏页那一排 SortChip 当前选中哪一档（0 最近加入 / 1 名称 / 2 年份）。 */
@@ -88,6 +127,9 @@ class WatchRepository(private val context: Context) {
         val v = if (value in 0..2) value else DEFAULT_FAV_SORT
         sortLoaded = true
         _favoriteSort.value = v
+        // 仓库已经退休就不再起协程了（起了也不会执行，见 [close]）——
+        // 这一档的落盘由 close 里那次 [flushNow] 带走。
+        if (closed.get()) return
         scope.launch { runCatching { context.watchStore.edit { it[KEY_FAV_SORT] = v } } }
     }
 
@@ -186,6 +228,12 @@ class WatchRepository(private val context: Context) {
             save()
             return
         }
+        // 仓库已经退休：这一笔延后的写等不到它了（作用域已被取消）。
+        // 立刻同步写一次，别让用户刚续的那一集留在内存里就散了 —— 见 [flushNow]。
+        if (closed.get()) {
+            flushNow()
+            return
+        }
         pendingSave?.cancel()
         pendingSave = scope.launch {
             delay(wait)
@@ -201,6 +249,9 @@ class WatchRepository(private val context: Context) {
      * 用户刚点的收藏、刚续的那一集就被盖回去了。
      */
     private fun snapshot() {
+        // 仓库已经退休就别再起新的写盘协程了：那个作用域已被取消，
+        // 起出来的活一件也不会执行（见 [close]）。真正要保住的那一份由 [flushNow] 写。
+        if (closed.get()) return
         scope.launch {
             runCatching {
                 context.watchStore.edit {
@@ -212,6 +263,45 @@ class WatchRepository(private val context: Context) {
                         ?.let { raw -> it[KEY_HIS_BAK] = raw }
                     it[KEY_FAV] = json.encodeToString(_favorites.value)
                     it[KEY_HIS] = json.encodeToString(_history.value)
+                }
+            }
+        }
+    }
+
+    /**
+     * 立刻把内存里那一份落盘，**等它真的落完才回来**。
+     *
+     * 这是 [close] 用的最后一道：关仓库的时候可能正有一笔写盘协程在飞
+     * （用户刚点完收藏、落盘那一趟还没落地），把它取消掉就等于把这一笔丢了。
+     * 所以这里同步地写一次，写完再让作用域停下来。
+     *
+     * 用 `runBlocking` 而不是 `scope.launch`：后者是异步的，close 紧接着就把作用域取消了，
+     * 那一笔多半还没开始跑就被取消掉 —— 等于没写。`runBlocking` 等的是 DataStore 那一个文件的写，
+     * DataStore 内部自己走 Dispatchers.IO，不靠调用方的线程，所以不会死锁。
+     *
+     * 代价：`runBlocking` 会**占住调用线程**直到这一笔落完（几十毫秒量级，一个小文件）。
+     * `close` 是在 Activity 拆除时调的（`AppViewModel.onCleared`），主线程被占住一小会儿
+     * 是可以接受的 —— 换来的是「用户刚点的那一下收藏」不会因为拆除而丢。
+     * 真正不能接受的是不落盘：丢的是用户看得见的东西。
+     *
+     * 读盘还没回来之前**不写**（见 [loaded]）：内存这份还是空的，写下去就是清空用户的收藏。
+     * 这种情况下 close 没什么可保的 —— 盘上那份还在，没有改动会丢。
+     */
+    private fun flushNow() {
+        if (!loaded) return
+        runCatching {
+            runBlocking {
+                context.watchStore.edit {
+                    // 和 [snapshot] 同一道保险：盘上那份解不通就先挪进备份键，再写新的。
+                    // 这一份是「关仓库时最后写的」—— 它要是把一份解不通的旧 blob 直接盖掉，
+                    // 用户那份原文就彻底没了（备份键是它唯一的去处）。
+                    it[KEY_FAV]?.takeIf { raw -> raw.isNotBlank() && !readable<Favorite>(raw) }
+                        ?.let { raw -> it[KEY_FAV_BAK] = raw }
+                    it[KEY_HIS]?.takeIf { raw -> raw.isNotBlank() && !readable<HistoryEntry>(raw) }
+                        ?.let { raw -> it[KEY_HIS_BAK] = raw }
+                    it[KEY_FAV] = json.encodeToString(_favorites.value)
+                    it[KEY_HIS] = json.encodeToString(_history.value)
+                    it[KEY_FAV_SORT] = _favoriteSort.value
                 }
             }
         }

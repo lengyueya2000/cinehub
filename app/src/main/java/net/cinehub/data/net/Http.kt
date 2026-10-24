@@ -1,7 +1,14 @@
 package net.cinehub.data.net
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import net.cinehub.data.quietly
 import okhttp3.Call
@@ -13,6 +20,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -24,6 +32,51 @@ import kotlin.coroutines.resumeWithException
  * 由调用方按站点传合适的头。
  */
 object Http {
+    /**
+     * 按超时预算缓存的客户端：同一个预算复用同一颗。
+     *
+     * 原来每一处请求都写 `client.newBuilder().withBudget(timeoutSec).build()` ——
+     * 每请求一颗新客户端。
+     *
+     * **核实结论（重要，别当成已知的前提去推断）**：
+     * `OkHttpClient.newBuilder()` 走的是 `Builder(okHttpClient)`，而那份构造器
+     * **复制的是引用** —— `dispatcher` 与 `connectionPool` 两个字段都是从旧客户端
+     * **搬过来**的同一个对象（对着 okhttp 4.12.0 的字节码 `javap -c` 能看到
+     * `getDispatcher$okhttp()` / `getConnectionPool$okhttp()` 紧接着
+     * `putfield dispatcher` / `putfield connectionPool`），**不是**各造一份新的。
+     *
+     * 所以：**每请求建一颗新客户端，并不是实机抓包里「58 条新建 TCP 连接、
+     * 无一条被复用」的直接原因** —— 连接池与派发器本来就是共享的。
+     * 那 58 条连接的成因在别处（同一 URL 被反复取、站点回 `Connection: close`、
+     * 以及 `Dispatcher.maxRequestsPerHost` 默认 5 给整轮扇出踩的刹车），
+     * 见 `.scratch/review/01-network-rate-limit.md` 的 F4 与 F16。
+     *
+     * 即便如此，这处仍要改 —— 代价是实的：
+     *
+     *  - 每请求一颗客户端，等于每请求**重新分配**一整套 config、任务队列、
+     *    `RouteDatabase`、SSL 配置 —— 纯粹的浪费。
+     *  - 每颗新客户端都带**自己的** `callTimeout`，而 `callTimeout` 是在
+     *    **这一颗**上生效的 —— 想让不同调用点各有各的总预算，就只能每请求换一颗
+     *    客户端。这就把「预算」和「客户端身份」绑在了一起。
+     *  - 所有这些客户端共用**同一个** `Dispatcher` 实例，而
+     *    `maxRequestsPerHost`（默认 5）是**按 dispatcher 算**的 ——
+     *    同一个 dispatcher 被几百颗不同客户端轮流喂，队列里的 call 属于不同客户端，
+     *    那个限制的语义被搅得更乱。
+     *
+     * 现在的做法：**按预算缓存客户端**，同一个预算复用同一颗；
+     * 单请求的总预算改用 OkHttp 的 **per-call timeout**
+     * （`call.timeout().timeout(...)`）—— 它挂在**这一次调用**上，
+     * 不影响共享的客户端，也不影响别的调用点各自的预算。
+     */
+    private val clientsByBudget = ConcurrentHashMap<Long, OkHttpClient>()
+
+    /**
+     * 基础客户端：超时、跟随重定向、失败重连都在这里定死。
+     *
+     * 对外也留着它：`DownloadRepository` 的下载客户端就是从它派生的
+     * （`Http.client.newBuilder()…build()`），那条路要自己的 dispatcher
+     * （分段并发 8、整体并发 3），不能走这里的出站闸。
+     */
     val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -32,6 +85,50 @@ object Http {
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
         .build()
+
+    /** 拿一颗配好预算的客户端；同一个预算复用同一颗。 */
+    private fun clientFor(timeoutSec: Long): OkHttpClient = clientsByBudget.getOrPut(timeoutSec) {
+        client.newBuilder()
+            .readTimeout(timeoutSec, TimeUnit.SECONDS)
+            .callTimeout(timeoutSec * 3, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * 探测那一路专用的客户端：它的时间预算与页面请求不同（8s 连 / 8s 读 / 24s 总）。
+     *
+     * 单独一颗、也单独缓存 —— 它同样不能每请求新建。
+     */
+    private val probeClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .readTimeout(8, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(24, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * 出站请求的总闸。
+     *
+     * 原来**完全没有**这道闸：`healthAll` / `searchOnIo` / `siblingsOnIo` 全是无上限
+     * `async` 扇出，一次全源操作就是几颗站同时被打、每颗站还可能连着打三四次
+     * （同一片名的几种写法，见 `MediaRepository.findInSource`）。站点那边看到的
+     * 是一片机器人 —— 而这几句话正是「连着打就回 429」那批站最忌讳的。
+     *
+     * 6 是这么定的：够放下「一次搜索扇出」而不至于把界面拖死，又能把瞬时并发压到
+     * 个位数。超出的请求**排队等**，不丢 —— 所以功能不缺，只是慢一点。
+     */
+    private val egressGate = Semaphore(6)
+
+    /**
+     * 出站时占住闸门的包装。
+     *
+     * 放在真正发请求的那一层（[fetchOnce] / [postForm] / [post] / [getBytes] /
+     * [probeOnce]），这样**所有**路径自动受约束 —— 包括以后新加的调用点，
+     * 不用记得再手工过一次。
+     */
+    private suspend fun <T> gated(block: suspend () -> T): T =
+        egressGate.withPermit { block() }
 
     const val UA =
         "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -114,16 +211,133 @@ object Http {
         return runCatching { java.nio.charset.Charset.forName(name) }.getOrNull() ?: Charsets.UTF_8
     }
 
+    // ------------------------------------------------------------------
+    // 并发去重（SingleFlight）与响应缓存
+    //
+    // 两者针对的是同一件事的两个时间尺度：**同一个请求被发出多次**。
+    //  - 去重管的是「**同时**在飞的那几趟」：合并成一趟网络往返。
+    //  - 缓存管的是「刚刚已经拿过的那一份」：TTL 内直接复用，不走网络。
+    //
+    // 为什么这两样都不能省：实机抓包（bb 模拟器，冷启动→搜索→详情）看到
+    // **58 条新建 TCP 连接、1 秒内 17 条、同一 host 11 条、无一条连接被复用**。
+    // 那些连接里有一大把是**同一个 URL 被重复取**的：详情页的 `siblingsOf`
+    // 与搜索页的 `search` 各自扇出一遍，`findInSource` 还会为同一片名换三种写法
+    // 再各打一遍。站点那边看到的就是一个机器人反复问同一个问题 ——
+    // 于是它回 429，而 429 又让下一轮扇出打得更凶。
+    // ------------------------------------------------------------------
+
     /**
-     * 一次请求的总预算。
+     * 同一请求的「飞行中」表：key -> 这一趟共享的结果。
      *
-     * readTimeout 只管「两次读之间最多等多久」，一个每次挤几百字节、永远不断流的慢站
-     * 可以把一次请求拖成几分钟，而这期间界面一直挂着「正在查询…」。
-     * 这里给每条页面类请求加一个总时限 —— 下载那条路不加：一集本来就要下十几分钟。
+     * 用 [CompletableDeferred] 而不是 `Future`：等待方要能**各自**被取消，
+     * 而共享的那一趟不能因为一个等待方走了而被取消（那会连累还在等的人）。
      */
-    private fun OkHttpClient.Builder.withBudget(timeoutSec: Long): OkHttpClient.Builder =
-        readTimeout(timeoutSec, TimeUnit.SECONDS)
-            .callTimeout(timeoutSec * 3, TimeUnit.SECONDS)
+    private val inFlight = ConcurrentHashMap<String, CompletableDeferred<ResponseBody>>()
+
+    /**
+     * 共享那一趟跑的地方：一个**独立**的作用域，不挂在任何调用方的协程下面。
+     *
+     * 为什么要有它：发起方（第一个到的人）随时可能被取消 —— 用户划走页面、
+     * 协程被结构化并发取消。若那一趟挂在发起方的作用域里，发起方一被取消，
+     * 这一趟就被掐了：它已经占着出站闸、已经在网络上了，白跑一趟，
+     * 而**还在等着的别的人**拿到的还是一个失败。
+     *
+     * 所以那一趟走自己的作用域：[SupervisorJob] 让它不被别人的失败带走，
+     * [Dispatchers.IO] 是网络等待该待的线程池。
+     */
+    private val flightScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 这里**没有**响应缓存 —— 只并「同一时刻的重复请求」（[singleFlight]），
+     * 不缓存「隔一会儿再要一次」的结果。
+     *
+     * 审查时一度加过一份 60 秒的正文缓存，随后被实机代码走查撤掉，理由是
+     * **这一批站里有好几个把「重试」写在了对同一 URL 的连续请求上**：
+     *
+     * - `PpnixAdapter.playlistOrRetry`（`data\source\PpnixAdapter.kt:257-266`）：
+     *   站点对同一个取链地址有三种回答 —— 标准 m3u8、301 到首页、以及 **200 +
+     *   一份首页 HTML**。最后那种必须重发才可能拿到真清单。缓存会把第一次的
+     *   坏正文原样喂给第二、第三次重试，PPnix 直接播不了 —— 而这正是 1.4.9
+     *   那一版修过的病（`4027d0e`）。
+     * - `MaccmsParseResolver`（`data\source\MaccmsParseResolver.kt:127-130`）：
+     *   先吃一张 403 拿 cookie、再带 cookie 重走一遍。重走那一步要是命中了
+     *   403 那次的缓存，会话永远建立不起来。
+     * - `SlideChallenge` 的交卷接口：那张题页缓存 60 秒等于把「答完题重发」
+     *   变成「再拿一张题页」。
+     *
+     * 跨时间的重复请求在**语义层**收掉更准（那里知道「同一部片」是什么）：
+     * 见 `MediaRepository` 的 `searchCache`（120 秒、按片名指纹+年份+类型）
+     * 与 `detailShared`（同 key 并发合并）。实机抓包：修复后同一条链路的
+     * 新建连接从 58 降到 9。
+     */
+
+    /**
+     * 去重 / 缓存用的 key。
+     *
+     * **必须包含头**：不同源可能给同一个 URL 配上不同的 `Referer`、不同的
+     * `x-ai-movie-signature` —— 站点按这些头决定给什么。把它们并成同一把
+     * key 就会「拿 A 源的响应回给 B 源」。
+     *
+     * 头的顺序也不能影响 key，所以这里排序后再拼。
+     */
+    private fun requestKey(url: String, referer: String?, headers: Map<String, String>): String {
+        val hs = headers.entries
+            .sortedBy { it.key.lowercase() }
+            .joinToString("&") { "${it.key.lowercase()}=${it.value}" }
+        return "$url\n${referer.orEmpty()}\n$hs"
+    }
+
+    /**
+     * 并发的同一趟请求合并成一次网络往返。
+     *
+     * 谁先到谁发；后来的等它那一趟的结果。
+     *
+     * **等待方被取消时不能取消共享的那一趟** —— 那是发起方的责任，
+     * 而等待方只是恰好也想知道同一个答案。取消它会连累还在等的人。
+     *
+     * 所以那一趟网络往返跑在一个**独立的作用域**里（[flightScope]），不挂在
+     * 任何等待方的协程下面：发起方自己被取消（用户划走页面）时，
+     * 那一趟照跑到底，别的还在等的人照样拿到答案 ——
+     * 而这一趟本来就已经占着出站闸、已经在网络上了，让它白跑才是浪费。
+     *
+     * 注意这里**只并同一时刻的重复请求**，不缓存跨时间的结果 ——
+     * 为什么不能缓存，见 [flightScope] 下面那段「这里没有响应缓存」的说明。重试型调用点
+     * （`PpnixAdapter.playlistOrRetry`、`MaccmsParseResolver` 先吃 403 再带 cookie 重走）
+     * 的两次请求是**先后**发的、不重叠，所以不会被这一层并掉，重试语义完好。
+     */
+    private suspend fun singleFlight(
+        key: String,
+        url: String,
+        referer: String?,
+        headers: Map<String, String>,
+        timeoutSec: Long,
+        browserHeaders: Boolean,
+    ): ResponseBody {
+        val mine = CompletableDeferred<ResponseBody>()
+        // putIfAbsent：只有一个赢家会去发那一趟，其余的人拿到**赢家那颗** Deferred 去等。
+        // （注意：等的是**别人**那颗，不是自己这颗 —— 等错一颗就成永远等下去。）
+        val winner = inFlight.putIfAbsent(key, mine)
+        if (winner != null) {
+            // 等待方：只等，不发。它被取消时不影响这一趟（见上）。
+            return winner.await()
+        }
+        // 发起方：把这一趟丢进独立作用域去跑。
+        flightScope.launch {
+            try {
+                val r = fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
+                mine.complete(r)
+            } catch (e: Throwable) {
+                // 共享那一趟失败了：把同样的失败原样交给所有等待方。
+                // 不在这里重发 —— 那正是「同一时刻几趟一起打」的来源。
+                mine.completeExceptionally(e)
+            } finally {
+                // 这一趟结束了（或失败了），把它从「飞行中」表里摘掉。
+                // 摘的是**自己那颗** —— 别把别人的（新一轮已经占上同一个 key）摘掉。
+                inFlight.remove(key, mine)
+            }
+        }
+        return mine.await()
+    }
 
     /**
      * 一条请求的头：UA 由这里统一给，调用方只补站点真正要看的那几个头。
@@ -182,20 +396,29 @@ object Http {
     private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host }.getOrNull()
 
     /**
-     * 两个 host 是不是同一个可注册域。
+     * 两个 host 是不是同一个站。
      *
-     * 只比最后两段点分标签：`a.example.com` 与 `example.com` 同为 `example.com`，
-     * 这一条覆盖的正是 apex→www、http→https 那种**同站**重定向；`a.example.com` 与
-     * `b.other.com` 不算，于是跨站重定向的 cookie 不会再被抄给发起方。
+     * **比完整主机名**，不再只比最后两段标签。
      *
-     * 不看公共后缀表：`a.co.uk` 与 `b.co.uk` 会被判成同域，于是多记一份。这个方向是安全的 ——
-     * 真正会伤人的那一步（把 B 站的 cookie 记到 A 站名下、下次发给 B）只在两颗域名最后两段
-     * 相同时也发生，而那时它们几乎必定是同一个站。
+     * 原来那版（末两段）是错的，而且错的方向正好是要命的方向：`evil.co.uk` 与
+     * `bank.co.uk` 的末两段都是 `co.uk` → 判成同域 → `remember()` 把最后一跳
+     * 下发的 cookie 记到发起方名下 → 下一次就把 **B 站的凭据发给 A 站**。
+     * 「只看末两段大概就是同一个站」这个假设在公共后缀是 `co.uk` / `com.cn` /
+     * `com.hk` 这一档时完全不成立 —— 而这批源里带 `co.uk` 的站就有几个。
+     *
+     * 现在比完整主机名（大小写不敏感、去尾部 `.`），另开一个口子：**去掉开头的
+     * `www.` 之后相同**也算同站。这一条覆盖的正是 apex→www、http→https 那种
+     * **同站**重定向 —— 那种重定向两边共用一份会话，所以要都记上。
+     *
+     * 代价：原来 `a.example.com` 与 `b.example.com` 也算同域，现在不算。
+     * 这是对的 —— 那是**两个不同的站**，把一边的 cookie 记到另一边名下正是
+     * 本文件「绝不把 A 站的 cookie 带进 B 站」那条规矩要拦住的事。
      */
     private fun sameSite(a: String, b: String): Boolean {
-        if (a.equals(b, ignoreCase = true)) return true
-        fun tail(h: String): String = h.lowercase().trimEnd('.').split('.').takeLast(2).joinToString(".")
-        return tail(a) == tail(b)
+        val x = a.lowercase().trimEnd('.')
+        val y = b.lowercase().trimEnd('.')
+        if (x == y) return true
+        return x.removePrefix("www.") == y.removePrefix("www.")
     }
 
     /**
@@ -261,24 +484,130 @@ object Http {
     /** 浏览器导航页面时会发的那组头里，站点真正会看的就是 Accept-Language 这一条。 */
     private const val ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
 
-    /** 一次页面请求：发出去、收下它下发的 cookie，正文和状态码一起带回，不抛。 */
+    /**
+     * 一次页面请求：发出去、收下它下发的 cookie，正文和状态码一起带回，不抛。
+     *
+     * 这一层管三件事：限流冷却、429 退避重试、出站闸（[gated]）。
+     */
     private suspend fun fetchOnce(
         url: String,
         referer: String?,
         headers: Map<String, String>,
         timeoutSec: Long,
         browserHeaders: Boolean,
-    ): ResponseBody = withContext(Dispatchers.IO) {
-        val request = builder(url, referer, headers)
-            .apply { if (browserHeaders) header("Accept-Language", ACCEPT_LANGUAGE) }
-            .build()
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(request).await().use { r ->
-                val body = r.bodyText()
-                remember(url, r)
-                ResponseBody(body = body, status = r.code, setCookie = setCookieOf(r))
+    ): ResponseBody {
+        // 这个站刚因限流被拒过、还在冷却期里 → **不去打扰它**。
+        //
+        // 这一步是整轮扇出的止血阀：站点回了 429 之后，同一轮还在跑的
+        // 其它请求、以及下一轮的整轮扇出，都会在这里被挡下，
+        // 于是这个站这一次扇出里只被打「已经打过的那些次」，不再加码。
+        //
+        // 放在闸门**外面**：被挡下的请求根本不该占着出站的额度。
+        //
+        // 回一份状态码 429 的空响应，与真被拒时上层看到的**完全一样**
+        // （[failureReason] 里那句「请求过于频繁」）—— 不骗人。
+        if (SlideChallenge.isRateLimited(url)) {
+            return ResponseBody(body = "", status = 429, setCookie = null)
+        }
+        return gated {
+            withContext(Dispatchers.IO) {
+                val request = builder(url, referer, headers)
+                    .apply { if (browserHeaders) header("Accept-Language", ACCEPT_LANGUAGE) }
+                    .build()
+                var attempt = 0
+                var result: ResponseBody? = null
+                while (result == null) {
+                    val call = clientFor(timeoutSec).newCall(request)
+                    // 单请求的总预算挂在**这一次调用**上（见 [clientFor]）：客户端是共享的，
+                    // 不能为了每次不同的预算去新建一颗 —— 那正是连接复用失效的帮凶。
+                    call.timeout().timeout(timeoutSec * 3, TimeUnit.SECONDS)
+                    val outcome = try {
+                        call.await().use { r ->
+                            val status = r.code
+                            val body = r.bodyText()
+                            // cookie 先记下来 —— 哪怕这一次是 429：要重试的话，
+                            // 站点这一趟顺手下发的会话（限流前发的）也得留着。
+                            remember(url, r)
+                            if (status == 429 && attempt < RATE_LIMIT_RETRIES) {
+                                // 429：对方在限流。退避 + 重试，别把这当一次普通失败就交出去 ——
+                                // 一次普通的 429 会让整轮扇出少一个源，而站点那边看到的是
+                                // 「这个客户端被限了」，于是下一轮它更狠。详见 [retryAfter429]。
+                                Outcome.Retry(retryAfter429(r, attempt + 1))
+                            } else {
+                                if (status == 429) {
+                                    // 重试用完了还是 429：给这个站记一笔**冷却**，
+                                    // 后面那一整轮扇出就都别去打扰它了。
+                                    // 见 [SlideChallenge.noteRateLimited]。
+                                    SlideChallenge.noteRateLimited(url)
+                                }
+                                Outcome.Done(
+                                    ResponseBody(body = body, status = status, setCookie = setCookieOf(r)),
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // 同一种情况：连接被掐（对方限流时常常直接断连，而不是回 429）。
+                        // 这种情况退避重试比直接失败好 —— 但同样有上限，不做成死循环。
+                        if (attempt < RATE_LIMIT_RETRIES && e is IOException) {
+                            Outcome.Retry(backoffMs(attempt + 1))
+                        } else {
+                            throw e
+                        }
+                    }
+                    when (outcome) {
+                        is Outcome.Done -> result = outcome.body
+                        is Outcome.Retry -> {
+                            attempt++
+                            delay(outcome.waitMs)
+                        }
+                    }
+                }
+                result ?: ResponseBody(body = "", status = 500, setCookie = null)
             }
+        }
     }
+
+    /** 一次请求的两种结局：拿到了，或者该退避再打一次。 */
+    private sealed interface Outcome {
+        class Done(val body: ResponseBody) : Outcome
+        class Retry(val waitMs: Long) : Outcome
+    }
+
+    /**
+     * 429 之后该等多久。
+     *
+     * 对方给了 `Retry-After` 就用它（那是它自己说的「我什么时候有空」），
+     * 但**封顶 5 秒** —— 有些站会写一个很大的值，照着等下去界面像卡死了。
+     * 没给就按指数退避 + 抖动（第 1 次约 800ms、第 2 次约 2000ms）。
+     */
+    private fun retryAfter429(r: Response, attempt: Int): Long {
+        val hdr = r.headers("Retry-After").firstOrNull()?.trim()
+        val secs = hdr?.toLongOrNull()
+        if (secs != null && secs >= 0) return minOf(secs * 1000L, RATE_LIMIT_MAX_WAIT_MS)
+        return backoffMs(attempt)
+    }
+
+    /**
+     * 指数退避 + 随机抖动。
+     *
+     * 抖动是**必须**的：几路并发同时撞上 429，若都等一模一样的时长，它们会在
+     * 同一毫秒一起再打一次 —— 那是把限流再踩深一次（重试风暴）。
+     * ±30% 的抖动足以把它们错开，又不至于散得太开。
+     */
+    private fun backoffMs(attempt: Int): Long {
+        val base = RATE_LIMIT_BACKOFF_MS.getOrElse(attempt - 1) { RATE_LIMIT_BACKOFF_MS.last() }
+        val jitter = 0.7 + Math.random() * 0.6   // 0.7 ~ 1.3
+        return (base * jitter).toLong().coerceAtMost(RATE_LIMIT_MAX_WAIT_MS)
+    }
+
+    /** 429 最多重试几次。 */
+    private const val RATE_LIMIT_RETRIES = 2
+
+    /** 退避的基准值：第 1 次等 800ms，第 2 次等 2000ms。 */
+    private val RATE_LIMIT_BACKOFF_MS = longArrayOf(800L, 2_000L)
+
+    /** 单次等待的上限（毫秒）。超过就照发，别把界面拖成「看着像卡了」。 */
+    private const val RATE_LIMIT_MAX_WAIT_MS = 5_000L
 
     /**
      * 取一页。撞上「滑动验证」那道题时，照站点自己那条路答一次，答完立刻重发这一页。
@@ -299,8 +628,13 @@ object Http {
         viaBrowser: Boolean = false,
     ): ResponseBody {
         if (viaBrowser) return BrowserEngine.get(url, timeoutSec)
-        val first = fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
+        // 先过一次去重：同一页在同一时刻被两处要（详情页与搜索页各问一遍、
+        // 播放器里「查一次」与详情页那栏撞上）时，只发一次网络往返。
+        val first = singleFlight(requestKey(url, referer, headers), url, referer, headers, timeoutSec, browserHeaders)
         if (!SlideChallenge.isSlideGate(first.status, first.body)) return first
+        // 撞上滑块题：答一次题再重发。
+        // **重发走 fetchOnce、不回去过单飞** —— 那一趟刚把题页记在单飞的牌上，
+        // 重发要是命中它，拿回来的还是同一张题页，这道题就永远答不过去。
         if (!SlideChallenge.solve(url, first.body)) return first
         return fetchOnce(url, referer, headers, timeoutSec, browserHeaders)
     }
@@ -356,13 +690,16 @@ object Http {
         form: Map<String, String>,
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
-    ): ResponseBody = withContext(Dispatchers.IO) {
-        val body = FormBody.Builder().apply { form.forEach { (k, v) -> add(k, v) } }.build()
-        val b = builder(url, headers["Referer"], headers).post(body)
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(b.build()).await().use { r ->
+    ): ResponseBody = gated {
+        withContext(Dispatchers.IO) {
+            val body = FormBody.Builder().apply { form.forEach { (k, v) -> add(k, v) } }.build()
+            val b = builder(url, headers["Referer"], headers).post(body)
+            val call = clientFor(timeoutSec).newCall(b.build())
+            call.timeout().timeout(timeoutSec * 3, TimeUnit.SECONDS)
+            call.await().use { r ->
                 ResponseBody(body = r.bodyText(), status = r.code, setCookie = setCookieOf(r))
             }
+        }
     }
 
     /** POST 一段 JSON，同样把 Set-Cookie 带回来。 */
@@ -371,17 +708,20 @@ object Http {
         json: String,
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
-    ): ResponseBody = withContext(Dispatchers.IO) {
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val b = builder(url, headers["Referer"], headers).post(json.toRequestBody(mediaType))
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(b.build()).await().use { r ->
+    ): ResponseBody = gated {
+        withContext(Dispatchers.IO) {
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val b = builder(url, headers["Referer"], headers).post(json.toRequestBody(mediaType))
+            val call = clientFor(timeoutSec).newCall(b.build())
+            call.timeout().timeout(timeoutSec * 3, TimeUnit.SECONDS)
+            call.await().use { r ->
                 ResponseBody(
                     body = r.bodyText(),
                     status = r.code,
                     setCookie = setCookieOf(r),
                 )
             }
+        }
     }
 
     /** 服务端这次下发的 cookie（只要 name=value，属性它自己管不着我们）。 */
@@ -404,10 +744,12 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         timeoutSec: Long = 20,
         maxBytes: Int = MAX_KEY_BYTES,
-    ): ByteArray = withContext(Dispatchers.IO) {
-        val b = builder(url, referer, headers)
-        client.newBuilder().withBudget(timeoutSec).build()
-            .newCall(b.build()).await().use { r ->
+    ): ByteArray = gated {
+        withContext(Dispatchers.IO) {
+            val b = builder(url, referer, headers)
+            val call = clientFor(timeoutSec).newCall(b.build())
+            call.timeout().timeout(timeoutSec * 3, TimeUnit.SECONDS)
+            call.await().use { r ->
                 if (!r.isSuccessful) error(failureReason(r.code, ""))
                 val src = r.body?.source() ?: error("响应是空的")
                 // 读到流结束为止（密钥本来就是几十字节），再用上限卡「指到别的文件」。
@@ -418,6 +760,7 @@ object Http {
                 if (buf.size > maxBytes) error("响应有 ${buf.size} 字节，超过 $maxBytes 上限")
                 buf
             }
+        }
     }
 
     /** 响应正文 + 状态码 + 服务端下发的会话 Cookie（没有则为 null）。 */
@@ -428,7 +771,7 @@ object Http {
     )
 
     /** 探一次连通性：成功带回耗时，失败带回状态码和那张错误页的正文片段。 */
-    private suspend fun probeOnce(url: String, referer: String?): Triple<Long?, Int, String> =
+    private suspend fun probeOnce(url: String, referer: String?): Triple<Long?, Int, String> = gated {
         withContext(Dispatchers.IO) {
             val t0 = System.currentTimeMillis()
             val b = builder(url, referer, emptyMap())
@@ -444,19 +787,17 @@ object Http {
                 .header("Sec-Fetch-Site", "none")
                 .header("Sec-Fetch-User", "?1")
             referer?.let { b.header("Referer", it) }
-            client.newBuilder()
-                .readTimeout(8, TimeUnit.SECONDS)
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .callTimeout(24, TimeUnit.SECONDS)
-                .build()
-                .newCall(b.build()).await().use { r: Response ->
-                    remember(url, r)
-                    when {
-                        r.isSuccessful -> Triple(System.currentTimeMillis() - t0, r.code, "")
-                        else -> Triple(null, r.code, errorSnippet(r))
-                    }
+            val call = probeClient.newCall(b.build())
+            call.timeout().timeout(24, TimeUnit.SECONDS)
+            call.await().use { r: Response ->
+                remember(url, r)
+                when {
+                    r.isSuccessful -> Triple(System.currentTimeMillis() - t0, r.code, "")
+                    else -> Triple(null, r.code, errorSnippet(r))
                 }
+            }
         }
+    }
 
     /**
      * 探测连通性并返回延迟；失败抛出异常。

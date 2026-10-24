@@ -7,14 +7,17 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val Context.searchStore by preferencesDataStore(name = "cinehub_search")
 
@@ -34,6 +37,50 @@ class SearchHistoryRepository(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY_TERMS = stringPreferencesKey("search_terms_v1")
+
+    /**
+     * 这一份仓库退休了没有。
+     *
+     * 和 `WatchRepository` 同一个理由：[scope] 的根是 [SupervisorJob]，它**永远不会自己结束**，
+     * 不显式取消就等于每次 Activity 重建都留下一套还活着的协程。
+     */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * 这一份仓库退休：把还在跑的协程全停掉。
+     *
+     * 幂等：调几次都是同一个结果 —— [closed] 的 compareAndSet 只让第一次真正生效，
+     * `scope.cancel()` 对一个已取消的作用域再调一次也没有副作用。
+     *
+     * **关之前先把待写的落盘做掉**。搜索历史是「搜一次记一条」，而落盘是异步的
+     * （见 [save]）：用户刚搜完就退出应用，这一条跟着被取消的协程一起没了 ——
+     * 而搜索页那句「这些搜索词只存在这台设备上」承诺的是它**留着**。
+     *
+     * 所以这里先同步落一次盘（见 [flushNow]），再取消作用域。
+     */
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        flushNow()
+        scope.cancel()
+    }
+
+    /**
+     * 立刻把内存里那几条词落盘，**等它真的落完才回来**。
+     *
+     * 和 `WatchRepository.flushNow` 同一个道理：关仓库时可能正有一笔写盘协程在飞，
+     * 把它取消掉就等于把这一条丢了。用 `runBlocking` 而不是 `scope.launch`：
+     * 后者是异步的，close 紧接着就把作用域取消了，那一笔多半还没开始跑就被取消掉。
+     * DataStore 内部自己走 Dispatchers.IO，不靠调用方的线程，所以不会死锁。
+     */
+    private fun flushNow() {
+        // 读盘还没回来之前不写（见 [loaded]）：内存这份还是空的，写下去就是拿半截的内存盖掉盘上的全部。
+        if (!loaded) return
+        runCatching {
+            runBlocking {
+                context.searchStore.edit { it[KEY_TERMS] = json.encodeList(_terms.value) }
+            }
+        }
+    }
 
     private val _terms = MutableStateFlow<List<String>>(emptyList())
 
@@ -106,6 +153,9 @@ class SearchHistoryRepository(private val context: Context) {
     private fun save() {
         // 读盘没回来之前不写（见 [loaded]）：整份覆盖，写早了就是拿半截的内存盖掉盘上的全部。
         if (!loaded) return
+        // 仓库已经退休就不再起协程了（起了也不会执行，见 [close]）——
+        // 这一份的落盘由 close 里那次 [flushNow] 带走。
+        if (closed.get()) return
         // 内存那份要在 `edit` 的变换里取（和 WatchRepository.snapshot 同一个坑）：
         // 发协程之前抓快照的话，两次写的落地顺序没有保证，后落地的可能正是那一份旧的。
         scope.launch {

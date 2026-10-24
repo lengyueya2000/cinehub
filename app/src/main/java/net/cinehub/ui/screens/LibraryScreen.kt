@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
@@ -42,6 +43,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import coil.compose.AsyncImage
@@ -663,13 +665,15 @@ private fun Segmented(
         options.forEach { n ->
             val on = n == selected
             Box(
+                // 选中态原来只靠底色与字重表达，读屏软件看不见颜色 ——
+                // 「现在选的是哪一档」一个字都不说。selectable + Role.Tab 补上这一层。
                 Modifier.weight(1f).heightIn(min = 44.dp)
                     .clip(R.sm)
                     .background(
                         if (on) Brush.verticalGradient(listOf(T.Play400, T.Play500))
                         else Brush.verticalGradient(listOf(Color.Transparent, Color.Transparent))
                     )
-                    .clickable { onSelect(n) },
+                    .selectable(selected = on, role = Role.Tab, onClick = { onSelect(n) }),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(

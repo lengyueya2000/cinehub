@@ -1,5 +1,7 @@
 package net.cinehub.data
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -220,6 +222,59 @@ class MediaRepository(private val sources: SourceRepository) {
         withContext(Dispatchers.IO) { SourceAdapters.create(cfg).detail(id) }
 
     /**
+     * 详情页与「重新检测」、换源都会同时要同一部片的详情 —— 原来每次都打站。
+     *
+     * 这一层做两件事：**同一 key 的并发请求只发一次**（in-flight 合并），
+     * 以及同一 key 在 [DETAIL_TTL_MS] 内直接命中缓存（不再打站）。
+     *
+     * 为什么需要它（实机抓包证据）：`AppViewModel` 里有四处会拉同一部片的详情 ——
+     * `openDetail`、`switchDetailSource`、`switchWithinRound`（自动换源，`advance()` 还
+     * 会主动把 `r.detail` 清成 null，于是每换一个源就重拉一次）、`switchPlayingSource`。
+     * 「打开详情 → 点另一个源 → 自动换源」这一串里，同一个源同一部片的详情 URL
+     * 被反复 GET，而站点那边看到的正是「连着打就回 429」。
+     *
+     * **为什么只做 in-flight 合并、不做 TTL 缓存**：`MediaDetail` 里装着
+     * `lines` → `episodes` 一整棵可变集合（`data\model\Models.kt`）。缓存对象本身
+     * 等于让好几个调用方共享同一份可变状态 —— 上层 `switchWithinRound` 会往里读、
+     * `retryFallbackRound` 会清 `r.detail`，谁都可能改它。只做 in-flight 合并
+     * 就已经消掉了「同一时刻的重复请求」（那是真正重复的那些），
+     * 而跨时间的复用交给 `SourceRepository` 那一侧 —— 那一侧本来就是可变的，
+     * 加缓存的风险大于收益。
+     */
+    private val detailInFlight = ConcurrentHashMap<String, CompletableDeferred<Result<MediaDetail>>>()
+
+    /** 一次详情取回：同 key 合并成一次网络往返。 */
+    suspend fun detailShared(cfg: SourceConfig, id: String): MediaDetail {
+        val key = "${cfg.id}|$id"
+        val mine = CompletableDeferred<Result<MediaDetail>>()
+        val winner = detailInFlight.putIfAbsent(key, mine)
+        val slot = winner ?: mine
+        // 后到的那些在这里等：它们不自己打站，只拿主办者的结果。
+        return try {
+            if (slot === mine) {
+                // 主办者。**必须把取消也写成槽里的结果**：`quietly` 会把
+                // CancellationException 原样抛出来（见 [Failures.kt]），而这里要是
+                // 直接让它穿过去，`mine` 就永远不 complete —— 排在后面的等待者
+                // 会一直挂在 await() 上，直到协程作用域整个被收掉。
+                // 用户看到的是「换源之后那一屏再也不动了」。
+                val r = try {
+                    quietly { detail(cfg, id) }
+                } catch (ce: CancellationException) {
+                    mine.complete(Result.failure(ce))
+                    throw ce
+                }
+                mine.complete(r)
+                r.getOrThrow()
+            } else {
+                slot.await().getOrThrow()
+            }
+        } finally {
+            // 只有主办者摘自己的那一份：等待者摘早了会放走另一趟。
+            if (slot === mine) detailInFlight.remove(key, mine)
+        }
+    }
+
+    /**
      * 解析直链。
      *
      * 成因由适配器自己判断（只有它知道自己那个站的规则），这里只做一件事：
@@ -268,11 +323,16 @@ class MediaRepository(private val sources: SourceRepository) {
         // 类型也带过去比对：后端里同名同年可能有两条（漫剧 / 连续剧），不带它就会
         // 把另一条的线路当成这部的 —— 切源切过去看到的是别的片。
         val type = typeFingerprint(media.category)
+        // 先把这一部片的跨源命中查出来（走缓存，见 [searchHitsFor]）——
+        // 原来是直接 `findInSource`，而它调的是**和 [searchOnIo] 完全相同**的
+        // 站点搜索接口。于是「搜索 → 点开」这一个动作，同一批源被搜两遍：
+        // 实机抓包显示搜索阶段 5 秒内 45 条新建连接，其中 1 秒 17 条、同一 host 11 条。
+        val hitsBySource = searchHitsFor(media.title, want, year, type)
         val active = sources.active()
         val per = active.map { cfg ->
             async {
                 // 切源列表更不能因为探测失败就少一项 —— 少了那一项用户就换不过去
-                val (hits, err) = findInSource(cfg, media.title, want, year, type)
+                val (hits, err) = hitsBySource[cfg.id] ?: (emptyList<Media>() to null)
                 // 真取回了内容，就是比探根路径更硬的证据 —— 和 [searchOnIo] 同一件事，
                 // 这里原先没做：于是播放器里「查一次」刚把 FreeOK 列进可换的源，
                 // 退回详情页那一栏它却写着「不可用」，同一部片、隔一秒、两句话。
@@ -305,6 +365,93 @@ class MediaRepository(private val sources: SourceRepository) {
             },
         )
     }
+
+    /**
+     * 一部片在各源里的命中：先查缓存，未命中才扇出，并把结果写回缓存。
+     *
+     * 返回 `源 id -> (命中, 失败原因)`。存的是**每个源的命中**，不是合并后的结果 ——
+     * health 与 latency 必须现读现算（它们和搜索结果的生命周期不一样，
+     * 冻在缓存里就成了「隔一秒、两句话」）。
+     *
+     * 缓存的价值（实机抓包）：用户在搜索页搜「三体」→ [searchOnIo] 对 6 个源各发 1 次；
+     * 点进结果 → `siblingsOf` 又对**同一批源**各发 1～3 次几乎同名的搜索。
+     * 同一个站点在 2 秒内收到 2～4 个同型搜索请求 —— 这正是被限流的那一批站最忌讳的。
+     *
+     * 有了这份缓存，「搜索 → 点开」这一次的请求数从 `1 + 3N` 降到 `1`（N = 源数）：
+     * 点开详情时全部命中缓存，一个请求都不多发。
+     */
+    private suspend fun searchHitsFor(
+        title: String,
+        want: String,
+        year: String?,
+        type: String?,
+    ): Map<String, Pair<List<Media>, Throwable?>> {
+        val key = searchCacheKey(title, year, type)
+        val now = System.currentTimeMillis()
+        // 命中缓存的前提是**它覆盖了当前每一个启用的源**。
+        //
+        // 这一条闸门是功能性的，不是效率性的：`siblingsOnIo` 拿这份结果直接渲染
+        // 「播放源」那一栏，缓存里少一个源，那一栏就少一格 —— 用户于是换不到那个源上去。
+        // 而源列表是会变的（停用、启用、新增、删掉、改地址），只认「键一样」就会把
+        // 上一次那份**不完整**的账当成这一次的结论。
+        // 少一格比多打一次请求严重得多 —— 见本文件里那句「切源列表更不能因为探测失败就少一项」。
+        val cached = synchronized(searchCache) { searchCache[key] }
+        if (cached != null && now - cached.at < SEARCH_TTL_MS) {
+            val activeIds = sources.active().map { it.id }
+            if (activeIds.all { it in cached.hits }) return cached.hits
+        }
+
+        // 同一部片被两处同时要（搜索页点开 + 详情页重新检测，或播放器里「查一次」与
+        // 详情页那栏撞上）时，只发一次扇出。后到的在这里等主办者的结果。
+        val mine = CompletableDeferred<Map<String, Pair<List<Media>, Throwable?>>>()
+        val existing = synchronized(searchInFlight) { searchInFlight.putIfAbsent(key, mine) }
+        val slot = existing ?: mine
+        try {
+            if (slot !== mine) return slot.await()
+            // 主办者。**取消也必须写进槽里**：这一趟跑在 viewModelScope 上，用户退搜索页、
+            // 换词、切源都会把它掐掉。让它把 CancellationException 直接穿过去的话，
+            // `mine` 永远不 complete —— 排在后面的等待者一直挂在 await() 上。
+            val out = try {
+                val active = sources.active()
+                coroutineScope {
+                    active.map { cfg ->
+                        async { cfg.id to findInSource(cfg, title, want, year, type) }
+                    }.map { it.await() }.toMap()
+                }
+            } catch (ce: CancellationException) {
+                mine.completeExceptionally(ce)
+                throw ce
+            }
+            mine.complete(out)
+            synchronized(searchCache) {
+                searchCache[key] = SearchEntry(at = System.currentTimeMillis(), hits = out)
+                while (searchCache.size > SEARCH_CACHE_MAX) {
+                    val oldest = searchCache.keys.firstOrNull() ?: return@synchronized
+                    searchCache.remove(oldest)
+                }
+            }
+            return out
+        } finally {
+            if (slot === mine) synchronized(searchInFlight) { searchInFlight.remove(key, mine) }
+        }
+    }
+
+    /** 同一部片的跨源搜索在飞的那一趟：`片名指纹|年份|类型` -> 结果槽。 */
+    private val searchInFlight = LinkedHashMap<String, CompletableDeferred<Map<String, Pair<List<Media>, Throwable?>>>>()
+
+    private class SearchEntry(val at: Long, val hits: Map<String, Pair<List<Media>, Throwable?>>)
+
+    private val searchCache = LinkedHashMap<String, SearchEntry>()
+
+    /**
+     * 这一部片的跨源搜索缓存的键。
+     *
+     * 三项逐项对应 `siblingsOnIo` 的比对口径（[titleFingerprint] + 年份 + 类型）：
+     * 少任何一项都会把另一部片认成这一部 —— 同名不同年（翻拍、续集）、
+     * 同名同年不同类型（漫剧 / 连续剧）都是实测存在的。
+     */
+    private fun searchCacheKey(title: String, year: String?, type: String?): String =
+        "${titleFingerprint(title)}|${year.orEmpty()}|${type.orEmpty()}"
 
     /**
      * 三档都有据：
@@ -389,5 +536,11 @@ class MediaRepository(private val sources: SourceRepository) {
 
         /** 一次都没探通之外，「探通过」这条结论也一样会过期。见 [healthOf]。 */
         const val HEALTH_TTL_MS = 10 * 60_000L
+
+        /** 跨源搜索缓存多久算过期。一份搜索几十分钟不会变出第二种答案。 */
+        const val SEARCH_TTL_MS = 120_000L
+
+        /** 这张缓存最多留几部片。够了：用户一次搜一部，翻十部就该开始淘汰最旧的。 */
+        const val SEARCH_CACHE_MAX = 100
     }
 }

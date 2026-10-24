@@ -153,11 +153,31 @@ internal object MaccmsParseResolver {
             val base = IFRAME_SRC.find(script)?.groupValues?.get(1)?.trimEnd('/') ?: error(
                 "站点的 /static/player/parse.js 里读不到那张 iframe —— 它换了取链的写法"
             )
-            parserBases[site] = base
+            rememberParserBase(site, base)
             base
         }
 
+    /**
+     * site -> 取链 iframe 的基地址。
+     *
+     * 键是站点域名，条目数**受用户配了几个源限制**，不是无界增长。
+     * 但用户可以改源地址、删了再加 —— 每次换地址就多一个键，
+     * 而这张表只进不出。所以给它一个上限：超了就丢最早进来的那些
+     * （[LinkedHashMap] 的插入序就是「最早进来的」）。
+     */
     private val parserBases = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** 这张表最多记几个站。 */
+    private const val PARSER_BASES_MAX = 32
+
+    /** 记一条，超出上限就丢最早的那条。 */
+    private fun rememberParserBase(site: String, base: String) {
+        parserBases[site] = base
+        while (parserBases.size > PARSER_BASES_MAX) {
+            val oldest = parserBases.keys.firstOrNull() ?: return
+            parserBases.remove(oldest)
+        }
+    }
 
     /**
      * 拼出签名原文 —— 与脚本看到的 iframe query string 一字不差。

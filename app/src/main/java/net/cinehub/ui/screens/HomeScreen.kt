@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -40,6 +41,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -188,16 +191,30 @@ fun HomeScreen(
                             Spacer4()
                             Text(error!!, color = T.TextDim, fontSize = Fs.xs)
                             Spacer12()
-                            Text(
-                                if (loading) "正在取…" else "↻ 再取一次",
-                                color = if (loading) T.TextFaint else T.Src500,
-                                fontSize = Fs.sm,
-                                fontWeight = FontWeight.SemiBold,
-                                // 这是这一屏唯一的出路，得点得中
+                            // 「↻」原来直接写在这行字里。它是**字体**不是图标：
+                            // 各家 Android 字体里这个字形长得不一样，读屏还会把
+                            // 「↻ 再取一次」念成「逆时针箭头 再取一次」。换成 Material 的刷新图标。
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.clip(R.sm).heightIn(min = 44.dp)
                                     .clickable(enabled = !loading, onClick = vm::refreshHome)
-                                    .padding(vertical = 10.dp),
-                            )
+                                    .padding(vertical = 10.dp)
+                                    .semantics { contentDescription = "再取一次" },
+                            ) {
+                                Icon(
+                                    Icons.Filled.Refresh,
+                                    contentDescription = null,
+                                    tint = if (loading) T.TextFaint else T.Src500,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer4()
+                                Text(
+                                    if (loading) "正在取…" else "再取一次",
+                                    color = if (loading) T.TextFaint else T.Src500,
+                                    fontSize = Fs.sm,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
                         }
                     }
                 }
@@ -266,18 +283,30 @@ fun HomeScreen(
                                 )
                             }
                             Box(Modifier.weight(1f))
-                            Text(
-                                if (loading) "正在取…" else "↻ 刷新这一页",
-                                color = if (loading) T.TextFaint else T.Src500,
-                                fontSize = Fs.xs,
-                                fontWeight = FontWeight.SemiBold,
-                                // 44dp：同一件事在页顶那条横幅上是 44dp，这里两处的门不一样高
+                            // 同上：那个「↻」是字体里的字形，换成 Material 的刷新图标。
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
                                     .clip(R.full)
                                     .heightIn(min = 44.dp)
                                     .clickable(enabled = !loading, onClick = vm::refreshHome)
-                                    .padding(horizontal = 8.dp, vertical = 8.dp),
-                            )
+                                    .padding(horizontal = 8.dp, vertical = 8.dp)
+                                    .semantics { contentDescription = "刷新这一页" },
+                            ) {
+                                Icon(
+                                    Icons.Filled.Refresh,
+                                    contentDescription = null,
+                                    tint = if (loading) T.TextFaint else T.Src500,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer4()
+                                Text(
+                                    if (loading) "正在取…" else "刷新这一页",
+                                    color = if (loading) T.TextFaint else T.Src500,
+                                    fontSize = Fs.xs,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
                         }
                         Spacer4()
                     }

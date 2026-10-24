@@ -91,13 +91,18 @@ fun MineScreen(
     val watchUnreadable by vm.watchUnreadable.collectAsState()
     val downloadsUnreadable by vm.downloadsUnreadable.collectAsState()
 
-    val cached = downloads.filter { it.status == DownloadStatus.Done }
+    // 这几趟过滤/计数在每次重组时都跑一遍是白花的（切 Tab、弹确认框都会重组这一屏）。
+    val cached = remember(downloads) { downloads.filter { it.status == DownloadStatus.Done } }
     // 这一页自己排一次优先级：SourceRepository.sources 落盘那份不保证有序，
     // 而下面对比的「页面上的顺序」是源管理页按 priority 排出来的那份。
-    val enabled = sources.filter { it.enabled }.sortedBy { it.priority }
-    val down = enabled.count { health[it.id]?.health == Health.Down }
-    val slow = enabled.count { health[it.id]?.health == Health.Slow }
-    val ok = enabled.count { health[it.id]?.health == Health.Ok }
+    val enabled = remember(sources) { sources.filter { it.enabled }.sortedBy { it.priority } }
+    val (down, slow, ok) = remember(enabled, health) {
+        Triple(
+            enabled.count { health[it.id]?.health == Health.Down },
+            enabled.count { health[it.id]?.health == Health.Slow },
+            enabled.count { health[it.id]?.health == Health.Ok },
+        )
+    }
 
     val ctx = LocalContext.current
     // 版本号从包里取，不写死 —— 写死的那份迟早开始说谎

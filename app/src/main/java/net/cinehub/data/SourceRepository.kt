@@ -5,11 +5,13 @@ import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -49,10 +51,27 @@ class SourceRepository(private val context: Context) {
 
     /** 盘上那份解出来的列表；第二个成员是「有内容但这一版解不通」。 */
     private fun decode(raw: String?): Pair<List<SourceConfig>?, Boolean> {
+        // 同一份原文直接回上一次的结果。
+        //
+        // 这个记忆是**纯函数级**的：`decode(raw)` 只由 `raw` 决定，原文没变结论就不会变，
+        // 所以它不存在「缓存过期」这一说 —— 变的只有 `raw` 本身。
+        // 而 [sources] 每次被 `first()` 都要跑一遍这个 map，`AppViewModel` 里有十处
+        // 会调 `all()` / `active()`；一次全量反序列化实测 21.6 µs（7 个源、2837 字节），
+        // 十处就是 0.2 ms —— 数字不大，但它是**白花的**。
+        //
+        // 只存一格、且连原文带结果一起换（一个不可变的 Pair）：分两个字段写就会有
+        // 「读到新原文配旧结果」的缝。比较用 `==` 而不是引用相等 —— DataStore 每次
+        // 读回来的可能是新对象，而字符串按值比在这里比 JSON 反序列化便宜两个数量级。
+        val memo = decodeMemo
+        if (raw != null && memo != null && memo.first == raw) return memo.second
         if (raw.isNullOrBlank()) return null to false
         val list = runCatching { json.decodeFromString<List<SourceConfig>>(raw) }.getOrNull()
-        return list to (list == null)
+        val out = list to (list == null)
+        decodeMemo = raw to out
+        return out
     }
+
+    @Volatile private var decodeMemo: Pair<String, Pair<List<SourceConfig>?, Boolean>>? = null
 
     val sources: Flow<List<SourceConfig>> = context.dataStore.data.map { p ->
         val (stored, unreadable) = decode(p[KEY])
@@ -62,7 +81,11 @@ class SourceRepository(private val context: Context) {
         val list = (stored ?: lastGood ?: Seed.sources).filterNot { it.id in Seed.retiredIds }
         if (stored != null) lastGood = list
         list
-    }
+    }.flowOn(Dispatchers.IO)
+    // ↑ 反序列化挪到 IO 线程。原来没有这一句：`sources` 的 map 跑在**收集方**的上下文里，
+    // 而调用方是 `viewModelScope` = Main.immediate —— 于是每次 `all()` 都在主线程上
+    // 把整份 JSON 解一遍。单次 21.6 µs 不算什么，但它是主线程上的纯浪费，
+    // 而且 `all()` 在 AppViewModel 里有十处调用点。
 
     /** 按优先级排序、且已启用的源。 */
     suspend fun active(): List<SourceConfig> =

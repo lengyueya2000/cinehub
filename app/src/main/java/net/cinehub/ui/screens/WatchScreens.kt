@@ -87,16 +87,19 @@ fun FavoritesScreen(
     // 取消收藏要过一道确认：收藏的片常常是找了好久才定位到某一源的，点错一下就得重来
     var pendingDrop by remember { mutableStateOf<Fav?>(null) }
 
-    val sorted = when (sort) {
-        1 -> favorites.sortedBy { it.title }
-        // 年份这一档只认四位数年份。原来写的是「把数字全滤出来再转 int」：
-        // 站点把 `2024-05-01` 这种整串日期塞进 year 时，它滤成 20240501 —— 一个写法不对的
-        // 值于是沉到最前面，把真年份全挤下去。按规矩来：认不出的当没有年份，一律排到最后，
-        // 不拿它参与比较。
-        2 -> favorites.sortedWith(
-            compareBy<Fav> { yearOf(it.year) == null }.thenByDescending { yearOf(it.year) ?: 0 },
-        )
-        else -> favorites.sortedByDescending { it.addedAt }
+    // 排一次要过一遍整张收藏表；这一屏每次重组（切 Tab、弹确认框）都跑一遍是白花的。
+    val sorted = remember(favorites, sort) {
+        when (sort) {
+            1 -> favorites.sortedBy { it.title }
+            // 年份这一档只认四位数年份。原来写的是「把数字全滤出来再转 int」：
+            // 站点把 `2024-05-01` 这种整串日期塞进 year 时，它滤成 20240501 —— 一个写法不对的
+            // 值于是沉到最前面，把真年份全挤下去。按规矩来：认不出的当没有年份，一律排到最后，
+            // 不拿它参与比较。
+            2 -> favorites.sortedWith(
+                compareBy<Fav> { yearOf(it.year) == null }.thenByDescending { yearOf(it.year) ?: 0 },
+            )
+            else -> favorites.sortedByDescending { it.addedAt }
+        }
     }
 
     Column(Modifier.fillMaxSize().background(T.Bg)) {

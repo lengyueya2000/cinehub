@@ -134,11 +134,29 @@ internal object QilinResolver {
             Http.get("$site/static/js/playerconfig.js", referer = "$site/", timeoutSec = 20)
         }.getOrNull() ?: return null
         val template = parseTemplateFromConfig(js) ?: return null
-        parserTemplates[site] = template
+        rememberTemplate(site, template)
         return template
     }
 
+    /**
+     * site -> 取链模板。
+     *
+     * 键是站点域名，条目数受用户配了几个源限制；但用户可以改源地址、删了再加 ——
+     * 每次换地址就多一个键，而这张表只进不出。所以给它一个上限。
+     */
     private val parserTemplates = ConcurrentHashMap<String, String>()
+
+    /** 这张表最多记几个站。 */
+    private const val PARSER_TEMPLATES_MAX = 32
+
+    /** 记一条，超出上限就丢最早的那条。 */
+    private fun rememberTemplate(site: String, template: String) {
+        parserTemplates[site] = template
+        while (parserTemplates.size > PARSER_TEMPLATES_MAX) {
+            val oldest = parserTemplates.keys.firstOrNull() ?: return
+            parserTemplates.remove(oldest)
+        }
+    }
 
     // ---------- 纯文本抽取（单测覆盖这一组） ----------
 

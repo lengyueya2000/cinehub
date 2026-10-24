@@ -19,6 +19,11 @@ import okhttp3.Response
  */
 class CineHubApplication : Application(), ImageLoaderFactory {
 
+    /** 前台有几个 Activity 活着。归零 = 应用整个退到后台。 */
+    private var startedActivities = 0
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     override fun onCreate() {
         super.onCreate()
         // 挂了浏览器验证那道题的源要靠一颗后台 WebView 取数，而那颗 WebView 只能在
@@ -27,7 +32,40 @@ class CineHubApplication : Application(), ImageLoaderFactory {
         // 自建签名接口那一型每一次请求都要带「本机」的设备 id：适配器工厂拿不到 Context，
         // 和浏览器内核同一个先例，在这里递给它。
         net.cinehub.data.source.MinoDeviceId.appContext = applicationContext
+        // 那颗 WebView 是进程级的，一颗就占几十 MB 原生内存。原来它**从来没有被销毁过** ——
+        // 用户把应用退到后台、甚至几小时不再碰它，那几十 MB 还钉在内存里等着被 LMK 杀掉，
+        // 而下次进来整个进程重头来过。
+        //
+        // 所以退到后台一段时间后把它收掉；下次要用时 BrowserEngine.ensure 会重新起一颗干净的
+        // （这是它文档里写明的契约）。留一段宽限期而不是立刻收，是因为
+        // 「切出去回个消息再回来」是常态，那颗内核正在给这一趟取数的话不该半路拆掉。
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            // 前后台的判定用 started/stopped，不用 resumed/paused：
+            // 弹一个系统对话框、下拉通知栏都会让当前 Activity 走一遍 pause，
+            // 拿 pause 计数的话「用户只是拉下通知栏看一眼」就会触发收内核 ——
+            // 而那颗内核正在给这一趟取数。started/stopped 才是「有没有可见界面」的口径。
+            override fun onActivityStarted(activity: android.app.Activity) {
+                if (startedActivities == 0) mainHandler.removeCallbacks(releaseEngine)
+                startedActivities++
+            }
+
+            override fun onActivityStopped(activity: android.app.Activity) {
+                startedActivities--
+                if (startedActivities <= 0) {
+                    startedActivities = 0
+                    mainHandler.postDelayed(releaseEngine, ENGINE_RELEASE_DELAY_MS)
+                }
+            }
+
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) = Unit
+            override fun onActivityResumed(activity: android.app.Activity) = Unit
+            override fun onActivityPaused(activity: android.app.Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) = Unit
+            override fun onActivityDestroyed(activity: android.app.Activity) = Unit
+        })
     }
+
+    private val releaseEngine = Runnable { net.cinehub.data.net.BrowserEngine.shutdown() }
 
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
         .okHttpClient {
@@ -65,5 +103,8 @@ class CineHubApplication : Application(), ImageLoaderFactory {
 
     private companion object {
         const val DOUBAN_PAGE = "https://movie.douban.com/"
+
+        /** 退到后台多久之后放手那颗 WebView。 */
+        const val ENGINE_RELEASE_DELAY_MS = 60_000L
     }
 }

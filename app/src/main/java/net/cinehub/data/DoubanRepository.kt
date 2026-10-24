@@ -9,8 +9,10 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
@@ -26,6 +28,7 @@ import kotlinx.serialization.json.long
 import net.cinehub.data.model.DoubanChart
 import net.cinehub.data.model.DoubanItem
 import net.cinehub.data.net.Http
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val Context.doubanStore by preferencesDataStore(name = "cinehub_douban")
 
@@ -49,6 +52,65 @@ class DoubanRepository(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true }
     private val KEY = stringPreferencesKey("snapshots_v1")
+
+    /**
+     * 这一份仓库退休了没有。
+     *
+     * 和 `WatchRepository` 同一个理由：[scope] 的根是 [SupervisorJob]，它**永远不会自己结束**，
+     * 不显式取消就等于每次 Activity 重建都留下一套还活着的协程。
+     */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * 盘上那一份读回来了没有。
+     *
+     * 和 `WatchRepository.loaded` 同一道闸：落盘是整份覆盖写，而内存这份一开始是空的 ——
+     * 读盘没回来就落一次盘，写下去的就是「一个快照都没有」。
+     * 这个仓库的快照是「上次那个榜的结果」，冲掉了用户下次进来就得重新联网拉一次。
+     */
+    @Volatile
+    private var loaded = false
+
+    /**
+     * 这一份仓库退休：把还在跑的协程全停掉。
+     *
+     * 幂等：调几次都是同一个结果 —— [closed] 的 compareAndSet 只让第一次真正生效，
+     * `scope.cancel()` 对一个已取消的作用域再调一次也没有副作用。
+     *
+     * **关之前先把待写的落盘做掉**。这个仓库每次取回一个榜都会起一个写盘协程（见 [put]），
+     * 那一笔是异步的：取回成功、用户退出应用，这一份快照就跟着被取消的协程一起没了 ——
+     * 用户下次进来这一格是空的，得重新联网拉一次。
+     *
+     * 所以这里先同步落一次盘（见 [flushNow]），再取消作用域。
+     */
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        flushNow()
+        scope.cancel()
+    }
+
+    /**
+     * 立刻把内存里那几份快照落盘，**等它真的落完才回来**。
+     *
+     * 和 `WatchRepository.flushNow` 同一个道理：关仓库时可能正有一笔写盘协程在飞，
+     * 把它取消掉就等于把这一份丢了。用 `runBlocking` 而不是 `scope.launch`：
+     * 后者是异步的，close 紧接着就把作用域取消了，那一笔多半还没开始跑就被取消掉。
+     * DataStore 内部自己走 Dispatchers.IO，不靠调用方的线程，所以不会死锁。
+     */
+    private fun flushNow() {
+        // 读盘还没回来之前不写（见 [loaded]）：内存这份还是空的，
+        // 而 [load] 读回来的是**盘上那一份** —— 此刻写下去就是拿空的一份盖掉全部快照。
+        // 这种情况下 close 没什么可保的：盘上那份还在，没有改动会丢。
+        if (!loaded) return
+        runCatching {
+            runBlocking {
+                val all = snapshots.entries.associate { (k, v) -> k to v }
+                context.doubanStore.edit {
+                    it[KEY] = json.encodeToString(SNAPSHOTS, all)
+                }
+            }
+        }
+    }
 
     private val snapshots = ConcurrentHashMap<String, Snapshot>()
 
@@ -81,6 +143,9 @@ class DoubanRepository(private val context: Context) {
     /** 取回成功后存一份，顺带落盘。 */
     fun put(chart: DoubanChart, items: List<DoubanItem>) {
         snapshots[chart.id] = Snapshot(System.currentTimeMillis(), items)
+        // 仓库已经退休就不再起协程了（起了也不会执行，见 [close]）——
+        // 这一份的落盘由 close 里那次 [flushNow] 带走。
+        if (closed.get()) return
         scope.launch {
             runCatching {
                 val all = snapshots.entries.associate { (k, v) -> k to v }
@@ -142,9 +207,19 @@ class DoubanRepository(private val context: Context) {
     private fun subjectUrl(id: String) = "https://movie.douban.com/subject/$id/"
 
     private suspend fun load() {
-        val raw = context.doubanStore.data.first()[KEY] ?: return
-        val all = runCatching { json.decodeFromString(SNAPSHOTS, raw) }.getOrNull() ?: return
-        all.forEach { (k, v) -> snapshots.putIfAbsent(k, v) }
+        // 读盘回来了没有。和 `WatchRepository.loaded` 同一道闸：内存这份一开始是空的，
+        // 读盘没回来就落一次盘，写下去的就是「一个快照都没有」，盘上那几份当场没了。
+        // 这三处提前返回（没有那份键 / 解不通 / 空的）都算「读完了」——
+        // 盘上本来就没有东西可读，这时内存那份空着是对的。
+        try {
+            val raw = context.doubanStore.data.first()[KEY]
+            if (raw != null) {
+                val all = runCatching { json.decodeFromString(SNAPSHOTS, raw) }.getOrNull()
+                if (all != null) all.forEach { (k, v) -> snapshots.putIfAbsent(k, v) }
+            }
+        } finally {
+            loaded = true
+        }
     }
 
     private companion object {

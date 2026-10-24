@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
@@ -13,6 +14,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -94,7 +96,33 @@ object BrowserEngine {
     private val tokens = SecureRandom()
 
     private var appCtx: Context? = null
-    private var engine: WebView? = null
+
+    /**
+     * 当前那颗引擎。
+     *
+     * `@Volatile`：[ensure] 跑在 IO 线程上（它是一个挂起函数，由调用方的协程调度），
+     * 而 [shutdown] 可能在主线程上把它置空 —— 不加 volatile 的话，
+     * IO 线程有可能一直看着那个已经被销毁的旧引用。
+     */
+    @Volatile private var engine: WebView? = null
+
+    /**
+     * 换引擎的那把锁。
+     *
+     * [ensure] 造引擎和 [shutdown] 收引擎会撞上：前者「造好了正要挂上去」，
+     * 后者「把挂着的那颗摘下来毁掉」。撞上的后果有两种，都不好看 ——
+     * 挂上去的那颗是已经被毁掉的（下一趟拿到一个死 WebView），
+     * 或者刚造好的那颗漏掉了（从此没人管它，它自己不走）。
+     *
+     * 用一把普通的 monitor，而不是拿 [gate] 那把协程锁：[shutdown] 是个**普通函数**
+     * （应用退到后台、进程要结束时由系统那一侧直接调），不能是挂起的；
+     * 而要在普通函数里等一把协程锁就得 `runBlocking` —— 它会**阻塞调用线程**。
+     * 调用方多半是主线程，那一阻塞就是一次 ANR（引擎正在取数的话，这把锁最长被握 70 秒）。
+     *
+     * 所以这里用 monitor：临界区里只有「读一个字段 / 换掉一个字段」，
+     * **一次都不阻塞**，真正费时的造 WebView、销毁 WebView 都放在锁外面做。
+     */
+    private val engineLock = Any()
 
     /**
      * 文档**现在真的**落在哪个源上（scheme://host）。
@@ -119,6 +147,75 @@ object BrowserEngine {
     /** 由 [net.cinehub.CineHubApplication] 在启动时接上，之后一直用 Application context。 */
     fun init(ctx: Context) {
         appCtx = ctx.applicationContext
+    }
+
+    /**
+     * 把这颗引擎彻底收掉：销毁 WebView、清掉静态引用。
+     *
+     * **为什么需要它**。`engine` 是一个静态字段，而 WebView 在 Android 上**必须显式
+     * `destroy()` 才会释放它的渲染进程和 native 内存** —— 放着不管，它就一直占着，
+     * 而且这块内存不小（一颗 WebView 的渲染上下文是几十 MB 量级）。
+     * 「站点页取链」那一页的 WebView 有完整的 teardown（见 `SiteBrowserScreen` 的
+     * `DisposableEffect`），但**这一颗是后台引擎，从来没有被 destroy 过**。
+     *
+     * **契约**：
+     * - 幂等：调几次都是同一个结果，没起过引擎时调用也是一个空操作。
+     * - 释放后**还能重新起一颗干净的**：[get] / [probe] 下一趟会走 [ensure] 重新造一颗。
+     *   这一条是必须的 —— 引擎是进程级的，拿来给源取数；把它收成永久不可用的话，
+     *   「需要浏览器的源」就再也进不来了。
+     * - 收掉的只是这颗 WebView。Cookie **不删**（`cf_clearance` 那种会话是跨启动有效的，
+     *   删了等于让用户重新过一遍题）。
+     *
+     * **销毁的顺序有讲究**：Android 上 WebView 还挂在 window manager 上时调 `destroy()` 会抛
+     * 「WebView.destroy() called while still attached to the window manager」。所以先
+     * `removeView` 从父容器摘下来，再 `destroy()`。这颗引擎的 WebView 从来没被加进任何
+     * 布局（它不显示，只在后台取数），所以父容器那一步通常是个空操作 —— 但仍然要写，
+     * 哪一天有人把它挂进某个容器里，顺序错了就是一次崩溃。
+     *
+     * **谁该调它**：应用退到后台一段时间之后（引擎这会儿多半闲着），
+     * 或者进程即将结束的时候。由 `CineHubApplication` 那一侧决定时机。
+     */
+    fun shutdown() {
+        // 先把静态引用摘掉 —— 这一步必须早于真正 destroy：
+        // 万一 destroy 抛了（它有可能），[ensure] 也不会把一颗已经半死的 WebView 再交出去。
+        //
+        // 和 [ensure] 用同一把锁（见 [engineLock]）：这���「摘掉」和那边「挂上去」
+        // 必须互斥，否则会出现「挂上去的那颗正好是这里要毁掉的」或者「这里要毁的那颗
+        // 刚被那边换掉了」这两种错配。
+        val wv = synchronized(engineLock) {
+            val old = engine
+            engine = null
+            old
+        }
+        // 文档落在哪儿、还在不在加载：这两面旗是跟着那颗 WebView 的，换一颗新引擎就得重置。
+        // 不重置的话，新引擎还没加载任何东西就被当成「已经停在这个源上」，
+        // 下一趟 warm 会直接跳过 —— fetch 就发到一颗空文档上，必挂。
+        liveOrigin = null
+        loading = false
+        // 还在等回话的 Deferred 一并结掉：它们等的是那颗要被销毁的引擎。
+        //
+        // 结的是**一个 0 号回话**（status = 0），不是取消：`request` 拿到 0 会照它
+        // 平时那条路回一句「这一页在 N 秒内没回话」；而 `cancel()` 会往等待方抛
+        // CancellationException —— 那一抛是穿过 `gate.withLock` 直接冒到调用方的，
+        // 变成一次没有上下文的失败。这里要的是「这一趟没问到」那一句人话。
+        pending.keys.toList().forEach { token ->
+            pending.remove(token)?.complete(Reply(0, "浏览器内核正在释放，这一趟没问到", 0))
+        }
+        if (wv == null) return
+        // WebView 的方法只能在主线程上动（见 [runOnMain]）。
+        // 这一段在锁外面 —— 见 [engineLock] 那段「销毁的动作放在锁外面」。
+        runOnMain {
+            // 先停掉正在跑的加载：它还在往这颗 WebView 里灌内容，
+            // 而下一句就要把这颗 WebView 拆了。
+            runCatching { wv.stopLoading() }
+            // 先摘父容器再 destroy —— 见上面那段「销毁的顺序有讲究」。
+            runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
+            // 摘掉 JS interface 和 client：它们是这颗引擎的内部对象，
+            // 留着会让一颗已销毁的 WebView 继续被引用。
+            runCatching { wv.removeJavascriptInterface("__cinehub") }
+            runCatching { wv.webViewClient = WebViewClient() }
+            runCatching { wv.destroy() }
+        }
     }
 
     /**
@@ -192,6 +289,8 @@ object BrowserEngine {
     }
 
     private suspend fun ensure(): WebView {
+        // 先看一眼：多数时候引擎已经在了，这一句省掉一次加锁。
+        // 读的是 volatile 字段，看到的是「此刻」的那颗，不是缓存下来的旧值。
         engine?.let { return it }
         val ctx = appCtx ?: error("浏览器内核没接上 —— 应用启动时没调 BrowserEngine.init")
         // 造不出来就让它抛出去（有的设备没有可用的 WebView 提供程序）。
@@ -232,8 +331,34 @@ object BrowserEngine {
                 }
             }
         }
-        engine = wv
-        return wv
+        // 挂上去这一步要和 [shutdown] 互斥（见 [engineLock]）：
+        // 造 WebView 是挂在锁外面做的，中间 [shutdown] 完全可能已经把这颗收走了 ——
+        // 那这一颗就得**当场自己毁掉**并重造，绝不能把一颗已经被收过的 WebView 挂上去。
+        // （挂上去一颗死 WebView 的后果：下一趟拿它去 fetch，静悄悄地什么都不回。）
+        //
+        // 销毁的动作**放在锁外面**：[onMain] 要等主线程，
+        // 而主线程那一侧 [shutdown] 正在等这把锁 —— 拿着锁等主线程、主线程等锁，死锁。
+        val keep = synchronized(engineLock) {
+            val current = engine
+            if (current == null) {
+                engine = wv
+                wv
+            } else {
+                // 已经有了一颗（多半是 [shutdown] 之后另一个请求重建的）：那颗留下，
+                // 自己这颗白造了 —— 毁掉它，别让它悬着。
+                current
+            }
+        }
+        if (keep !== wv) {
+            onMain {
+                runCatching { wv.stopLoading() }
+                runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
+                runCatching { wv.removeJavascriptInterface("__cinehub") }
+                runCatching { wv.webViewClient = WebViewClient() }
+                runCatching { wv.destroy() }
+            }
+        }
+        return keep
     }
 
     /**
@@ -374,6 +499,32 @@ object BrowserEngine {
                 if (v.isSuccess) Result.success(v.getOrThrow())
                 else Result.failure(v.exceptionOrNull() ?: IllegalStateException("主线程执行失败")),
             )
+        }
+    }
+
+    /**
+     * 把一段活丢到主线程上跑完，**等它真的跑完才回来**。
+     *
+     * 和 [onMain] 的区别只在一个「等」：[onMain] 是挂起式的（要等的话得自己包一层
+     * `runBlocking`），而这里是给 [shutdown] 那种「必须确认销毁完成了再走」的地方用的。
+     *
+     * 为什么非要主线程：WebView 的 `destroy()` / `removeView` / `loadUrl` 都得在
+     * 建它的那个线程上动 —— 在别的线程上调，WebView 内部会抛
+     * 「WebView method called on thread ... but expected thread」。
+     *
+     * 已经在主线程上的时候不 repost，直接跑 —— 否则那一趟会被推到消息队列的末尾，
+     * 而 `shutdown` 的调用方（主线程）在等它，等的就是自己队列里排着的那一条。
+     */
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runCatching(block)
+            return
+        }
+        runBlocking {
+            onMain {
+                runCatching(block)
+                Unit
+            }
         }
     }
 }

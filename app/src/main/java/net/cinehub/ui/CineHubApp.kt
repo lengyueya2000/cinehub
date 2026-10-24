@@ -3,9 +3,6 @@ package net.cinehub.ui
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -18,10 +15,13 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.ui.semantics.Role
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.Download
@@ -43,6 +43,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -330,13 +332,25 @@ private fun TabBar(active: Int, onPick: (Int) -> Unit) {
         ) {
             TABS.forEachIndexed { i, (label, icon, idx) ->
                 val on = i == active
+                // 选中态原来**只靠颜色**：图标变红、文字变白。看得见的人知道选的是哪一页，
+                // 但读屏软件看不见颜色 —— 它只会把这一排念成四个一样的「首页 片库 下载 我的」，
+                // 而选中的那一页是哪一页，一个字都不说。
+                //
+                // [Modifier.selectable] 把「选中了」这件事也念出去：选中那一页会念成
+                // 「首页 · 已选中」。图标加 [contentDescription]，念到的是名字而不是「按钮」。
+                // 命中区 48dp：底部四个 Tab 是最高频的点击目标。
                 Column(
-                    Modifier.weight(1f).clickable { onPick(idx) },
+                    Modifier
+                        .weight(1f)
+                        .selectable(selected = on, role = Role.Tab, onClick = { onPick(idx) })
+                        .heightIn(min = 48.dp)
+                        .semantics { contentDescription = label },
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
                     Icon(
-                        icon, null,
+                        icon,
+                        contentDescription = if (on) "$label · 已选中" else label,
                         tint = if (on) T.Play400 else T.TextFaint,
                         modifier = Modifier.size(22.dp),
                     )

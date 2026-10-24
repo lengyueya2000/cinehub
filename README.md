@@ -57,7 +57,13 @@ keytool -genkeypair -keystore .signing/cinehub-release.jks -alias cinehub \
   -dname "CN=CineHub, OU=Release, O=lengyueya2000, L=Beijing, ST=Beijing, C=CN"
 ```
 
-当前发布证书的 SHA-256 指纹：`10:61:03:3E:DF:BB:36:4B:69:B8:56:18:26:3B:B0:ED:67:8C:B5:9C:0A:C7:86:74:ED:90:32:4A:FD:9C:F9:E`
+当前发布证书的 SHA-256 指纹：`10:61:03:3E:DF:BB:36:4B:69:B8:56:18:26:3B:B0:ED:67:8C:B5:9C:0A:C7:86:74:ED:90:32:4F:AF:D9:CF:9E`
+
+> 这一串在 v1.0 写进来时抄错了一次（尾部 `4A:FD:9C:F9:E` 少一位、且把 `4F:AF:D9:CF:9E` 拆错了），
+> 1.4.13 发布前对着已发布的 `cinehub-v1.4.12.apk` 与本仓库 `.signing/cinehub-release.jks`
+> 各跑一遍 `apksigner verify --print-certs` 才核出来 —— 两份实测一致，都是上面这一串。
+> 这一句是用户核对「下载有没有被网盘改字节」的唯一锚点，写错等于让真包被当成假包。
+> 证书本身从来没换过（v1.0 到 v1.4.13 全程同一把 key，老用户可以直接覆盖升级）。
 
 Release 开了 R8 混淆 + 资源裁剪（`app/proguard-rules.pro` 里有 kotlinx-serialization 的 keep 规则，以及持久化模型的 keep —— 后者是为了让 debug 包升级到 release 包时，用户已存下的播放源还能解出来）。release 包 3 MB 上下、debug 包 20 MB 上下 —— 确切数字每个版本都不同，以发布页上给的为准，这里只给个量级（曾经写过死的 2.8 / 21 MB，和实际对不上）。
 

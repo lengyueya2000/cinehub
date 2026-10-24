@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.ArrowBack
@@ -77,6 +79,8 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -132,6 +136,15 @@ private const val SETTLED_NOTICE_MS = 10_000L
 
 /** 播完后留给「取消连播」的窗口。 */
 private const val AUTO_NEXT_MS = 3_000L
+
+/**
+ * 可点控件的最小命中区。
+ *
+ * 48dp 是 Android 上手指点得准的下限（比 iOS 的 44pt 略宽）。
+ * 视觉尺寸可以比它小 —— 圆看着 40dp、点着 48dp，两件事不必绑在一起；
+ * 播放器里那颗按钮在暗底上就 40dp，再大就压过画面了。
+ */
+private val TOUCH_TARGET = 48.dp
 
 /**
  * 播放器报的毫秒 → 秒。
@@ -427,7 +440,17 @@ fun PlayerScreen(
 
     val player = remember {
         // 缓冲的几档阈值集中在 PlayerBuffering，不在这里散着写
-        ExoPlayer.Builder(ctx)
+        //
+        // 传 applicationContext 而不是这一屏的 ctx：`LocalContext.current` 在这里拿到的是
+        // **Activity**。Media3 1.4.1 内部 `ExoPlayerImpl` / `DefaultDataSource.Factory` /
+        // `DefaultBandwidthMeter.Builder` 都自己调了 `getApplicationContext()`，
+        // 但 `DefaultRenderersFactory` **没有** —— 它的构造函数字节码是
+        // `aload_1; putfield context`，直接把传进来的 Context 存成字段，
+        // 再经 `ExoPlayer.Builder` 的 supplier 捕获。于是这颗播放器会钉住整个 Activity，
+        // 直到 `player.release()`。这一屏的 onDispose 确实会 release（见下面那个
+        // DisposableEffect），但小窗、旋转、以及 release 抛异常那几条路上
+        // 留下的就是一整棵 Activity 视图树。
+        ExoPlayer.Builder(ctx.applicationContext)
             .setLoadControl(PlayerBuffering.loadControl())
             .setBandwidthMeter(bandwidth)
             // 音频焦点两件套 + 拔耳机暂停。曾经一样都没配：
@@ -1345,9 +1368,10 @@ fun PlayerScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
-                        Modifier.size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = .42f))
+                        Modifier.size(TOUCH_TARGET).clip(CircleShape).background(Color.Black.copy(alpha = .42f))
                             // 和系统返回键同一套判断：全屏 + 面板开着时，这颗不该直接把人甩出播放器
-                            .clickable { goBack() },
+                            .clickable { goBack() }
+                            .semantics { contentDescription = "返回" },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White, modifier = Modifier.size(17.dp))
@@ -1370,9 +1394,10 @@ fun PlayerScreen(
                     }
                     if (!fullscreen) {
                         Box(
-                            Modifier.size(36.dp).clip(CircleShape)
+                            Modifier.size(TOUCH_TARGET).clip(CircleShape)
                                 .background(Color.Black.copy(alpha = .42f))
-                                .clickable { vm.refreshHealth(true) },
+                                .clickable { vm.refreshHealth(true) }
+                                .semantics { contentDescription = "重新检测播放源" },
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
@@ -1664,7 +1689,8 @@ fun PlayerScreen(
                     Modifier.align(Alignment.Center).size(64.dp).clip(CircleShape)
                         .background(Color.Black.copy(alpha = .42f))
                         .border(1.5.dp, Color.White.copy(alpha = .30f), CircleShape)
-                        .clickable { player.play() },
+                        .clickable { player.play() }
+                        .semantics { contentDescription = "播放" },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(27.dp))
@@ -1798,13 +1824,14 @@ fun PlayerScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconBtn(Icons.Filled.SkipPrevious) { stepEpisode(-1) }
+                                IconBtn(Icons.Filled.SkipPrevious, "上一集") { stepEpisode(-1) }
                                 IconBtn(
                                     if (wantsPlay) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    if (wantsPlay) "暂停" else "播放",
                                 ) { if (wantsPlay) player.pause() else player.play() }
-                                IconBtn(Icons.Filled.SkipNext) { stepEpisode(1) }
-                                IconBtn(Icons.Filled.Replay10) { seekBy(-10_000) }
-                                IconBtn(Icons.Filled.Forward10) { seekBy(10_000) }
+                                IconBtn(Icons.Filled.SkipNext, "下一集") { stepEpisode(1) }
+                                IconBtn(Icons.Filled.Replay10, "后退 10 秒") { seekBy(-10_000) }
+                                IconBtn(Icons.Filled.Forward10, "前进 10 秒") { seekBy(10_000) }
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Chip("选集") { panel = Panel.Episodes }
@@ -1851,11 +1878,7 @@ fun PlayerScreen(
                                     Chip(cacheLabel) { vm.cachePlaying() }
                                     Spacer8()
                                 }
-                                Icon(
-                                    Icons.Filled.FullscreenExit, null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(22.dp).clickable { fullscreen = false },
-                                )
+                                IconBtn(Icons.Filled.FullscreenExit, "退出全屏") { fullscreen = false }
                             }
                         }
                     } else {
@@ -1864,25 +1887,51 @@ fun PlayerScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             val noStream = playing?.streamUrl == null
-                            Text(
-                                when {
-                                    resolving -> "◌ 解析中"
-                                    noStream -> "↻ 重新解析"
-                                    wantsPlay -> "⏸ 暂停"
-                                    else -> "▶ 播放"
-                                },
-                                color = if (noStream) T.Src500 else Color(0xFFE2E8F0),
-                                fontSize = Fs.xs,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.clickable {
-                                    when {
-                                        resolving -> Unit
-                                        noStream -> vm.retryPlay()
-                                        wantsPlay -> player.pause()
-                                        else -> player.play()
+                            // 字形（◌ ↻ ⏸ ▶）原来直接写在这行字里当图标。
+                            // 它们是**字体**不是图标：不同手机上长得不一样（有的系统根本没有
+                            // 这个字形，渲染成豆腐块），而且读屏软件会把「⏸ 暂停」念成
+                            // 「暂停符号 暂停」。换成 Material 的图标 + 纯文字，
+                            // 每个平台上是同一个形状，读屏念出来也干净。
+                            val actionIcon = when {
+                                resolving -> Icons.Filled.HourglassTop
+                                noStream -> Icons.Filled.Refresh
+                                wantsPlay -> Icons.Filled.Pause
+                                else -> Icons.Filled.PlayArrow
+                            }
+                            val actionText = when {
+                                resolving -> "解析中"
+                                noStream -> "重新解析"
+                                wantsPlay -> "暂停"
+                                else -> "播放"
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(R.full)
+                                    .clickable(enabled = !resolving) {
+                                        when {
+                                            noStream -> vm.retryPlay()
+                                            wantsPlay -> player.pause()
+                                            else -> player.play()
+                                        }
                                     }
-                                },
-                            )
+                                    .padding(horizontal = 9.dp, vertical = 4.dp)
+                                    .semantics { contentDescription = actionText },
+                            ) {
+                                Icon(
+                                    actionIcon,
+                                    null,
+                                    tint = if (noStream) T.Src500 else Color(0xFFE2E8F0),
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer4()
+                                Text(
+                                    actionText,
+                                    color = if (noStream) T.Src500 else Color(0xFFE2E8F0),
+                                    fontSize = Fs.xs,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
                             Box(Modifier.weight(1f))
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -2649,15 +2698,26 @@ private fun LockScreenToggle(
     }
 }
 
+/**
+ * 播放器上那几颗圆形图标键。
+ *
+ * [label] 是给读屏软件念的名字 —— 这些键**只有图标、没有文字**，
+ * 不给名字的话读屏只会念出「按钮」两个字，用户根本不知道按的是上一集还是快进。
+ *
+ * 命中区是 48dp（[TOUCH_TARGET]）：视觉上是 40dp 的圆，但手指要点得中。
+ * 圆看着大一点、点着更稳，两件事不必绑在一起。
+ */
 @Composable
 private fun IconBtn(
     image: ImageVector,
+    label: String,
     onClick: () -> Unit,
 ) {
     Box(
-        Modifier.size(40.dp).clip(CircleShape)
+        Modifier.size(TOUCH_TARGET).clip(CircleShape)
             .background(Color.White.copy(alpha = .10f))
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
         Icon(image, null, tint = Color.White, modifier = Modifier.size(20.dp))
@@ -2674,6 +2734,9 @@ private fun Chip(label: String, onClick: () -> Unit) {
         modifier = Modifier.clip(R.sm)
             .border(1.dp, Color.White.copy(alpha = .26f), R.sm)
             .clickable(onClick = onClick)
+            // 44dp：这一排（选集 / 倍速 / 画面 / 缓存）是暗底上的小字，
+            // 不护住高度就点不准 —— 而它们是播放器里最常用的几个入口。
+            .heightIn(min = 44.dp)
             .padding(horizontal = 8.dp, vertical = 4.dp),
     )
 }

@@ -3,6 +3,8 @@ package net.cinehub.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -48,6 +50,7 @@ import net.cinehub.data.model.normalizeTitle
 import net.cinehub.data.model.userNote
 import net.cinehub.data.net.LocalKeyProxy
 import net.cinehub.data.source.SourceAdapters
+import java.util.concurrent.ConcurrentHashMap
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -105,9 +108,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * `LaunchedEffect(playing != null)` 只认「从没有到有了」，新 VM 里 wasPlaying 初值是
      * false，于是它当场把人塞进播放器，而那一屏连播放器都没有：一块黑画面 + 一堆按不动的键。
      * 人已经退出应用了，就不该再替他开门。
+     *
+     * **另外四个仓库也在这里关**：它们各自都带一颗 `CoroutineScope(SupervisorJob() + Dispatchers.IO)`
+     * 当字段，而原来只有下载那一颗在这里 close —— 其余四颗谁都不收，
+     * 每次 Activity 重建就多留一个 SupervisorJob 和它挂着的协程。
+     * AppViewModel 是 Activity 作用域的（见 [MainActivity]），所以这确实会发生。
      */
     override fun onCleared() {
         downloadRepo.close()
+        // 四个仓库各自的 scope：这一 VM 死了就一起收，别把 job 留给没人等的那一头。
+        watchRepo.close()
+        doubanRepo.close()
+        playbackRepo.close()
+        searchHistoryRepo.close()
         _playing.value = null
         _resolving.value = false
         _resumePosition.value = 0L
@@ -242,6 +255,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _health = MutableStateFlow<Map<String, HealthReport>>(emptyMap())
     val health: StateFlow<Map<String, HealthReport>> = _health.asStateFlow()
 
+    /**
+     * 探测是否在进行中。
+     *
+     * 这一个标志**只归健康探测那条线所有**（[healthGen]），跟详情那条线（[detailGen]）无关。
+     *
+     * 原来这里是两套代号合取：`mine == detailGen && mineH == healthGen`。那是个死锁 ——
+     * 「重新检测」（[rescanDetail]）同时 ++ 了两个代号，而用户在探测窗口内点另一个源时
+     * [switchDetailSource] 会 ++detailGen 并取消详情那趟，于是：
+     * - 被取消那趟的 finally：`mine != detailGen` 已成立 → 跳过清理；
+     * - 接手那趟的 finally：只清 `_detailLoading`，不管 `_checking`；
+     * - ⇒ 中间那一位没人管，`_checking` 永久停在 true。
+     * 实机复现：点「重新检测」→ 1.2 秒后点另一个源 → 按钮永久显示「检测中…」且不可点，
+     * 「我的 → 播放源管理」里那枚「全部重测」**也一起废了**（两个入口共用这一个标志），
+     * 而健康表其实早就填满了 —— 探测早就跑完，只有标志没落下。杀掉进程才能恢复。
+     *
+     * 所以：**标志的所有权归健康线，清理只认健康代号**。
+     */
     private val _checking = MutableStateFlow(false)
     val checking: StateFlow<Boolean> = _checking.asStateFlow()
 
@@ -551,6 +581,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 而它的 `_checking=false` 还会把新那趟正在转的圈关掉，界面显示的是过期健康表却没有加载痕迹；
      * ③ 多路同时扇出，同一个站被连打几次。
      * 所以和详情一样：只跑一个，后来的顶掉前面的，标记只由当代那一次来关。
+     *
+     * 标志的**所有权**归 [healthGen]，不归 [detailGen] —— 详见 [_checking]。
+     *
+     * 两处顺序是刻意的：
+     * - **先 ++healthGen 再 cancel()**：被顶掉那趟的收尾回调看到代号已经变了，
+     *   就不会把新一趟正在转的圈关掉。反过来（先 cancel 后 ++）的话，旧那趟的收尾
+     *   可能在新一趟把圈转起来之后才跑，于是新一趟刚开始转就被关掉 —— 表现是
+     *   「点了没反应」。
+     * - **用 [Job.invokeOnCompletion] 而不是 try/finally**：协程在**开跑之前**就被取消时，
+     *   函数体一次都不执行，try/finally 里的 finally 也就一次都不跑 —— 圈就永远留在
+     *   true 上了。invokeOnCompletion 对「还没开跑就被取消」也会照样回调。
      */
     private var healthJob: Job? = null
     private var healthGen = 0
@@ -558,14 +599,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshHealth(force: Boolean = true) {
         val mine = ++healthGen
         healthJob?.cancel()
-        healthJob = viewModelScope.launch {
-            try {
-                _checking.value = true
-                val h = mediaRepo.healthAll(force)
-                if (mine == healthGen) _health.value = h
-            } finally {
-                if (mine == healthGen) _checking.value = false
-            }
+        _checking.value = true
+        val job = viewModelScope.launch {
+            val h = mediaRepo.healthAll(force)
+            if (mine == healthGen) _health.value = h
+        }
+        healthJob = job
+        job.invokeOnCompletion {
+            if (mine == healthGen) _checking.value = false
         }
     }
 
@@ -577,6 +618,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 从健康缓存抄走）。只刷健康表的话，探测真的跑了、表也真的变了，屏幕上一个字
      * 都不动 —— 用户看到的就是「这个按钮没反应」。所以刷完健康表，紧接着把这部片
      * 的跨源比对重跑一遍。
+     *
+     * **这一趟拆成两个独立的事，两个独立的 job**（原来是一个 job 干两件事）：
+     *
+     * 1. **探所有源**（[healthJob]）—— 它拥有 [_checking] 这个标志。
+     * 2. **重跑跨源比对**（[detailJob]）—— 它拥有 [_siblings] 那几份状态。
+     *
+     * 原来合成一个 job，于是「用户在探测窗口内点另一个源」这件事会把整个 job 取消掉：
+     * [switchDetailSource] 取消的是 detailJob，而标志的清理条件又要求 detail 代号
+     * 也对得上 ⇒ 谁都管不着那个标志，「重新检测」和「全部重测」两个入口一起废掉
+     * （实机复现：按钮永久显示「检测中…」，只有杀进程才能恢复）。
+     *
+     * 拆开之后：换源只作废**比对**那半（它确实已经过期了），而标志归探测那半管 ——
+     * 探测跑完、取消、抛异常，标志一定落下。
      */
     fun rescanDetail() {
         val d = _detail.value
@@ -588,16 +642,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         detailJob?.cancel()
         // 重新检测跑通了，上一笔「换源没换成」那句话就该跟着收回去 —— 它原来会一直挂在面板上
         _switchError.value = null
+
+        // —— 第一半：探所有源。它拥有「检测中…」这个标志。——
         // 这一趟本身就在探所有源，所以把并发的那轮普通探测顶掉：
         // 两趟同时扇出等于挨着把每个站打两遍，而且谁先结束不好说，转圈标记会先灭。
         healthJob?.cancel()
         val mineH = ++healthGen
+        _checking.value = true
+        val hJob = viewModelScope.launch {
+            val h = mediaRepo.healthAll(force = true)
+            if (mineH == healthGen) _health.value = h
+        }
+        healthJob = hJob
+        // 用 invokeOnCompletion 而不是 try/finally：这一趟要是**还没开跑就被取消**
+        // （下一次点「重新检测」正好会这样），函数体一次都不执行，finally 也就一次都不跑 ——
+        // 标志就永远留在 true 上了。invokeOnCompletion 对「没开跑就被取消」照样回调。
+        hJob.invokeOnCompletion {
+            if (mineH == healthGen) _checking.value = false
+        }
+
+        // —— 第二半：重跑这一部的跨源比对。——
         detailJob = viewModelScope.launch {
             try {
-                _checking.value = true
-                val h = mediaRepo.healthAll(force = true)
-                if (mineH == healthGen) _health.value = h
-                if (mine != detailGen) return@launch
                 val s = mediaRepo.siblingsOf(d.media)
                 if (mine != detailGen) return@launch
                 _siblingFailures.value = s.failures
@@ -626,9 +692,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 _siblingsOf = d.media.key
             } finally {
-                // 只由当代这一次关转圈：被顶掉的那趟把新一次的圈关掉，
-                // 用户看到的就是「重新检测」点了以后探测还在跑、界面上却已经不动了
-                if (mine == detailGen && mineH == healthGen) _checking.value = false
+                // 比对这一半只清自己的东西 —— 标志不归它管（那是探测那半的事）。
+                if (mine == detailGen) _detailLoading.value = false
             }
         }
     }
@@ -641,6 +706,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sourceRepo.delete(id)
         // 实例连带它那份站点会话一起丢：留着它，同名 id 将来被另一个站复用时会带着旧会话去敲门
         SourceAdapters.forget(id)
+        // 本机 key 代理也一起收：源没了，那一路代理端口与线程池就没有主人了。
+        // 原来 forget 全仓零调用 —— 删掉一个 PPnix 型源，它的回环端口和
+        // `cinehub-key-proxy` 线程会一直留到进程结束。
+        LocalKeyProxy.forget(id)
         refreshHealth(false)
     }
 
@@ -802,7 +871,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _homeLoading.value = true
         homeJob = viewModelScope.launch {
             try {
-                val res = quietly { doubanRepo.fetch(homeChart) }
+                val res = quietly { fetchDoubanShared(homeChart, force = force) }
                 if (mine != homeGen) return@launch
                 res.onSuccess { items ->
                     doubanRepo.put(homeChart, items)
@@ -845,6 +914,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _searching.value = false
         _results.value = emptyList()
         _searchFailures.value = emptyList()
+        // 原来只加代号、不取消在跑的那一趟 —— 于是上一趟**照样把七个源打完**，
+        // 回来的结果被代号挡住扔掉，但那些请求已经发出去了。
+        // 用户每敲一个字、每删一个字，就是一轮全源扇出：同一个站被连打多次，
+        // 而这正是把限流踩深的行为（实机抓包：搜索阶段 5 秒 45 条新建连接）。
+        // 取消它，那一趟的七个源会在第一个字的时候就断掉。
+        searchJob?.cancel()
+        searchJob = null
     }
 
     /**
@@ -952,7 +1028,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // 用 quietly 而不是 runCatching：这一笔是会被后一次顶掉的，
                 // runCatching 把 CancellationException 也当成「加载失败」，
                 // 于是换得越快，屏幕上越会闪出一句莫名其妙的报错。
-                quietly { mediaRepo.detail(cfg, mediaId) }
+                quietly { mediaRepo.detailShared(cfg, mediaId) }
                     .onSuccess { raw ->
                         // 被顶掉的那一次不能往下写：它手里这份是上一部片的，
                         // 落下去就把新一次刚摆好的详情盖成了旧的（选集和源徽标分属两片）。
@@ -1028,7 +1104,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _detailError.value = null
                 val keepYear = _siblings.value.firstNotNullOfOrNull { it.item.year }
                     ?: yearKnownFor(av.sourceId, av.item.id, av.item.title)
-                quietly { mediaRepo.detail(cfg, av.item.id) }
+                quietly { mediaRepo.detailShared(cfg, av.item.id) }
                     .onSuccess {
                         if (mine != detailGen) return@onSuccess
                         val d = it.withYear(it.media.year ?: keepYear)
@@ -1388,7 +1464,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val genAtAsk = playGen
         viewModelScope.launch {
             val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId }
-            val d = cfg?.let { c -> runCatching { mediaRepo.detail(c, av.item.id) }.getOrNull() }
+            // 用 quietly 而不是 runCatching：runCatching 会把 CancellationException 一起吞掉，
+            // 取消信号就变得不可靠 —— 用户换了集/退了播放器，这一趟照样往下走，
+            // 把一条已经作废的线路递出去（见 [Failures.kt] 顶上那段话）。
+            val d = cfg?.let { c -> quietly { mediaRepo.detailShared(c, av.item.id) }.getOrNull() }
             if (!roundAlive(r, genAtAsk)) return@launch
             r.detail = d
             r.lineCursor = 0
@@ -1714,7 +1793,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val pos = _resumePosition.value
             val cfg = sourceRepo.all().firstOrNull { it.id == av.sourceId } ?: return@launch
-            val d = runCatching { mediaRepo.detail(cfg, av.item.id) }.getOrNull()
+            // 同上：quietly 保住取消信号，runCatching 把它吞了。
+            val d = quietly { mediaRepo.detailShared(cfg, av.item.id) }.getOrNull()
             val ep = d?.lines?.firstOrNull()?.episodes?.firstOrNull { it.index == episodeIndex }
                 ?: d?.lines?.firstOrNull()?.episodes?.firstOrNull()
             play(
@@ -1958,6 +2038,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
          * 切过去切回来都会重新组合、每次重取就是白敲一趟。
          */
         const val DOUBAN_TTL_MS = 10 * 60_000L
+
+        /**
+         * 同一个榜被首页与片库同时要时，共享窗口有多长。
+         *
+         * 只为把「首页 → 片库」这一下并掉（两处打的是同一个 URL），所以 60 秒足够。
+         * 比 [DOUBAN_TTL_MS] 短是故意的：用户手动刷新走强制路径不吃这份缓存，
+         * 而自动刷新（[ensureDouban]）本来就看 [DOUBAN_TTL_MS]。
+         */
+        const val DOUBAN_SHARE_TTL_MS = 60_000L
     }
 
     /**
@@ -2052,7 +2141,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return@launch
             }
-            val fetched = quietly { mediaRepo.detail(cfg, e.mediaId) }
+            val fetched = quietly { mediaRepo.detailShared(cfg, e.mediaId) }
             val d = fetched.getOrElse { err ->
                 refuseToPlay(
                     e, cfg.name,
@@ -2230,6 +2319,64 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 同一个榜被两处要：首页固定用「剧集 · 热门」([homeChart])，片库默认也停在同一张
+     * （[_doubanChart] 的初值就是 `DoubanChart.TV.first()`）。
+     *
+     * 两处的 `id` 完全相同 ⇒ 打的是**同一个 URL**。原来各拉各的：用户从首页切到片库，
+     * 同一个地址在几秒内被敲两遍 —— 这属于「同一份数据取两次」的纯浪费，
+     * 而豆瓣对同一 IP 的重复请求本来就敏感。
+     *
+     * 现在按 `chart.id` 合并：**同一个榜的并发取回只发一次**，
+     * 后来的那一个等前一趟的结果（[Mutex] + 一份 in-flight）。
+     *
+     * 共享窗口是 60 秒（[DOUBAN_SHARE_TTL_MS]）—— 一份榜单几十分钟不变，
+     * 60 秒足够把「首页 → 片库」这一下并掉；而用户手动刷新走 [refreshDouban]
+     * 的强制路径，**不吃**这份缓存，所以不会出现「按了刷新还是老数据」。
+     */
+    private val doubanInFlight = ConcurrentHashMap<String, Deferred<List<DoubanItem>>>()
+
+    /** 上一次成功取回的榜与时刻；用来判断这一份是不是还在共享窗口里。 */
+    private val doubanShared = ConcurrentHashMap<String, Pair<Long, List<DoubanItem>>>()
+
+    /**
+     * 取一个榜：同一个 id 的并发请求合并成一次网络往返。
+     *
+     * @param force 手动刷新时为 true —— 不吃共享窗口里的那份，强制重新打站。
+     */
+    private suspend fun fetchDoubanShared(chart: DoubanChart, force: Boolean): List<DoubanItem> {
+        val key = chart.id
+        if (!force) {
+            val hit = doubanShared[key]
+            if (hit != null && System.currentTimeMillis() - hit.first < DOUBAN_SHARE_TTL_MS) {
+                return hit.second
+            }
+        }
+        // 这一份的「主办者」由 computeIfAbsent 决定：并发进来的那些拿到**同一个** Deferred，
+        // 于是只有主办者去打站，其余人在 await() 上等。
+        val deferred = doubanInFlight.computeIfAbsent(key) { CompletableDeferred() }
+        try {
+            if (deferred.isCompleted) {
+                return deferred.getCompleted()
+            }
+            // 主办者：表里那一份还指着它、且它还没落定，谁先到这一步谁去打站。
+            // 判定必须原子 —— 两个线程同时到达时只有一个会通过下面这道门。
+            if (doubanInFlight[key] === deferred && !deferred.isCompleted) {
+                val fetched = quietly { doubanRepo.fetch(chart) }
+                fetched.onSuccess { list ->
+                    doubanShared[key] = System.currentTimeMillis() to list
+                    (deferred as CompletableDeferred<List<DoubanItem>>).complete(list)
+                }.onFailure { e ->
+                    (deferred as CompletableDeferred<List<DoubanItem>>).completeExceptionally(e)
+                }
+            }
+            return deferred.await()
+        } finally {
+            // 只有主办者负责把这一份从表里摘掉；等待者摘早了会放走另一趟。
+            if (doubanInFlight[key] === deferred) doubanInFlight.remove(key, deferred)
+        }
+    }
+
+    /**
      * 拉一次榜单。
      *
      * 只跑一个，后来的顶掉前一个，转圈标记也只由当代那次来关 —— 不然连切两个榜时，
@@ -2245,7 +2392,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _doubanLoading.value = true
         doubanJob = viewModelScope.launch {
             try {
-                val res = quietly { doubanRepo.fetch(chart) }
+                val res = quietly { fetchDoubanShared(chart, force = true) }
                 if (mine != doubanGen) return@launch
                 res.onSuccess { items ->
                     doubanRepo.put(chart, items)
@@ -2254,8 +2401,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     doubanShownChartId = chart.id
                     _doubanError.value = null
                 }.onFailure {
-                    // 有旧数据就留着旧数据，只把原因写在旁边：
-                    // 一次网络抖动不该把一整屏片清空。
+                    // 这一份要是盘上存过、只是这一次网络没答上话，就把存的那份放上去 ——
+                    // 一次抖动不该把一整屏片清空。
+                    //
+                    // 原来这里只有一句「有旧数据就留着旧数据」，但**旧数据早就被切榜时清掉了**
+                    // （[selectDoubanChart] 会先 `_doubanItems.value = emptyList()`，
+                    // 因为留着上一个榜的内容就是「标题写着 B、内容挂着 A」）。于是那句注释
+                    // 承诺的保护**完全落空**：失败之后屏幕上就是一片空白。
+                    // 现在补上「回落到盘上那份」这一条。
+                    if (_doubanItems.value.isEmpty()) {
+                        doubanRepo.cached(chart.id)?.let {
+                            _doubanItems.value = it.items
+                            _doubanAt.value = it.at
+                            doubanShownChartId = chart.id
+                        }
+                    }
                     _doubanError.value = it.message ?: "拉取失败"
                 }
             } finally {

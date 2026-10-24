@@ -29,10 +29,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.PauseCircleOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Share
@@ -366,18 +370,35 @@ fun DetailScreen(
                                     fontWeight = FontWeight.SemiBold,
                                 )
                                 t?.let {
-                                    Text(
-                                        when (it.status) {
-                                            DownloadStatus.Done -> "✓"
-                                            DownloadStatus.Failed -> "!"
-                                            DownloadStatus.Paused -> "‖"
-                                            else -> if (it.hasPercent) "${(it.progress * 100).toInt()}%" else "…"
-                                        },
-                                        color = if (on) Color.White else T.Src500,
-                                        fontSize = Fs.tiny,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
-                                    )
+                                    // 这几个符号（✓ ! ‖）原来也是写在文字里的字形。
+                                    // 它们在各家字体里长得不一样，读屏会把「✓」念成「对勾」，
+                                    // 而这一格要表达的是「缓存好了 / 缓存坏了 / 缓存停着」。
+                                    // 换成 Material 图标，并把状态念给读屏软件。
+                                    val (badgeIcon, badgeDesc) = when (it.status) {
+                                        DownloadStatus.Done -> Icons.Filled.CheckCircle to "已缓存"
+                                        DownloadStatus.Failed -> Icons.Filled.ErrorOutline to "缓存失败"
+                                        DownloadStatus.Paused -> Icons.Filled.PauseCircleOutline to "缓存已暂停"
+                                        else -> null to null
+                                    }
+                                    if (badgeIcon != null) {
+                                        Icon(
+                                            badgeIcon,
+                                            contentDescription = badgeDesc,
+                                            tint = if (on) Color.White else T.Src500,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .padding(2.dp)
+                                                .size(14.dp),
+                                        )
+                                    } else {
+                                        Text(
+                                            if (it.hasPercent) "${(it.progress * 100).toInt()}%" else "…",
+                                            color = if (on) Color.White else T.Src500,
+                                            fontSize = Fs.tiny,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp),
+                                        )
+                                    }
                                 }
                                 // 上次停在哪一集：右下角一个点，不跟右上角的缓存标记打架
                                 if (seen?.episodeIndex == e.index) {
@@ -637,15 +658,27 @@ private fun Backdrop(
                     // 站点明明给的是「高清」，界面上却替它吹成 4K —— 用户点进去才发现不是。
                     qualityTagOf(d.media)?.let { Pill(it, cyan = true) }
                 }
-                if (!d.media.score.isNullOrBlank()) {
-                    Spacer8()
-                    Text(
-                        "★ ${d.media.score}",
-                        color = T.Gold,
-                        fontSize = Fs.body2,
-                        fontWeight = FontWeight.ExtraBold,
-                    )
-                }
+                                if (!d.media.score.isNullOrBlank()) {
+                                    Spacer8()
+                                    // 原来这颗星是写在文字里的（"★ 9.1"）。它是**字体**不是图标：
+                                    // 各家 Android 字体里这个字形长得不一样，读屏还会把
+                                    // 「★ 9.1」念成「星号 9.1」。换成 Material 的星星图标。
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            Icons.Filled.Star,
+                                            contentDescription = null,
+                                            tint = T.Gold,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                        Spacer4()
+                                        Text(
+                                            d.media.score,
+                                            color = T.Gold,
+                                            fontSize = Fs.body2,
+                                            fontWeight = FontWeight.ExtraBold,
+                                        )
+                                    }
+                                }
             }
         }
     }

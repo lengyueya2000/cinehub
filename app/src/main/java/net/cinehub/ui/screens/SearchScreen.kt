@@ -12,10 +12,11 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -59,6 +60,7 @@ import net.cinehub.ui.theme.Fs
 import net.cinehub.ui.theme.R
 import net.cinehub.ui.theme.Sp
 import net.cinehub.ui.theme.T
+import net.cinehub.ui.theme.Touch
 
 /**
  * 跨源搜索结果。
@@ -79,8 +81,10 @@ fun SearchScreen(
     val history by vm.history.collectAsState()
     val sources by vm.sources.collectAsState()
 
-    val enabled = sources.filter { it.enabled }
-    val hitSources = results.flatMap { it.availability }.map { it.sourceId }.distinct().size
+    val enabled = remember(sources) { sources.filter { it.enabled } }
+    val hitSources = remember(results) {
+        results.flatMap { it.availability }.map { it.sourceId }.distinct().size
+    }
 
     // 离开搜索这条线才擦干净。原来挂的是 onDispose —— 可「点进某一部片的详情」也是一次
     // dispose，于是从详情页按返回回来，那一屏刚搜出来的结果没了，搜索框也空了：
@@ -94,9 +98,11 @@ fun SearchScreen(
     // 芯片只写结果里真出现过的类型。很多源不给 category，一个可信类型都取不到时
     // 整排直接不渲染 —— 留一排点了没反应的芯片比不排更糟。
     val chips = remember(results) { resultChips(results) }
-    val shown = if (cat == null) results else results.filter { it.media.category?.trim() == cat }
+    val shown = remember(results, cat) {
+        if (cat == null) results else results.filter { it.media.category?.trim() == cat }
+    }
     // 没给类型的条目只在「全部」里出现，筛完少了几条得说得出是为什么
-    val uncategorized = results.count { it.media.category?.trim().isNullOrEmpty() }
+    val uncategorized = remember(results) { results.count { it.media.category?.trim().isNullOrEmpty() } }
 
     // 「都没有〈关键词〉」这句话要有依据才能说：有源没答话就是搜过的硬证据，
     // 否则看 VM 里那个「上一次真的发出去搜过的词」。
@@ -275,7 +281,9 @@ fun SearchScreen(
                                     "清空",
                                     color = T.TextDim,
                                     fontSize = Fs.xs,
+                                    // 44dp：这一颗没有别的护栏，点不准就等于没有
                                     modifier = Modifier.clip(R.full)
+                                        .heightIn(min = Touch.min)
                                         .clickable { confirmClearHistory = true }
                                         .padding(horizontal = 8.dp, vertical = 4.dp),
                                 )
@@ -297,6 +305,8 @@ fun SearchScreen(
                                                 onClick = { vm.search(h) },
                                                 onLongClick = { vm.removeSearchHistory(h) },
                                             )
+                                            // 44dp：这一排是按词走的，手指头一点就点不准
+                                            .heightIn(min = Touch.min)
                                             .padding(horizontal = 12.dp, vertical = 7.dp),
                                     )
                                 }
@@ -471,7 +481,13 @@ private fun resultChips(items: List<AggregatedMedia>): List<Pair<String, Int>> =
         .entries.sortedByDescending { it.value }
         .map { it.key to it.value }
 
-/** 可点筛选芯片（选中态用底色 + 文字双重表达，不单靠颜色）。 */
+/**
+ * 可点筛选芯片（选中态用底色 + 文字双重表达，不单靠颜色）。
+ *
+ * 但「底色 + 文字」是**看**得见的那一层；读屏软件看不见颜色，只会把这一排念成
+ * 一串一样的词。所以这里用 [Modifier.selectable] 把「选中了」这件事也说出去，
+ * 读屏会念成「已选中」。
+ */
 @Composable
 private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
     Text(
@@ -481,7 +497,9 @@ private fun CatChip(label: String, on: Boolean, onClick: () -> Unit) {
         fontWeight = FontWeight.SemiBold,
         modifier = Modifier.clip(R.full)
             .background(if (on) T.Play500.copy(alpha = .16f) else T.Surface2)
-            .clickable(onClick = onClick)
+            .selectable(selected = on, onClick = onClick)
+            // 44dp：这一排芯片是筛选用的高频点击目标
+            .heightIn(min = Touch.min)
             .padding(horizontal = 12.dp, vertical = 6.dp),
     )
 }

@@ -60,25 +60,53 @@ object LocalKeyProxy {
     /**
      * 拿到这个源该用的代理根地址；同一源并发要几次都返回同一个。
      *
-     * 引用计数：播放器起播时 acquire，停/换源时 release。最后一次 release
-     * 才真的关端口 —— 换集、换线路都会重放一次媒体源，那期间不能让端口消失。
+     * **幂等**：同一个源重复 acquire，返回的是**同一个** `baseUrl`，而且不会
+     * 多记一次引用。
+     *
+     * 原来这里是「拿到就 `refs++`」，而 acquire 的唯一调用点
+     * （`PpnixAdapter.resolveStream`）在**每次起播/换集/换线路**时都会调一次，
+     * 放手的唯一调用点（`AppViewModel` 整屏退场）却只放一次 ——
+     * 于是引用计数**只增不减**，`refs` 永远大于 0，`close()` 永远不跑，
+     * 端口和线程池就一直留着。
+     *
+     * 实机复现（bb 模拟器，PPnix 源：起播 → 退出播放器）：线程 `cinehub-key-pro`
+     * 起播后是 1，退出播放器之后**还是 1** —— 端口没关。
+     *
+     * 现在的语义：**这一路代理归这个源所有**，而它归���么时候存在由
+     * [release] / [forget] 说了算。所以 acquire 只做两件事：保证有一台活的，
+     * 把地址给你。重复调多少次都不多记引用。
+     *
+     * 换集、换线路时端口不能消失这条要求，靠的是「端口的生命周期跟着**源**，
+     * 不跟着每一次 acquire」—— 换集时不调 release，端口自然还在。
      */
     fun acquire(cfg: SourceConfig): String = synchronized(lock) {
         val held = PROXIES[cfg.id]
         if (held != null) {
-            held.refs++
-            return@synchronized held.baseUrl
+            // 已经有一台。要先确认它**还活着**：台账里可能躺着一个已关的。
+            // 原来不看这个标记，于是关掉之后的那台被当成「还在用」，
+            // 下一个 acquire 会拿到一个**没人监听的端口** ——
+            // 播放器连上去直接超时，界面上是「解析直链失败」。
+            if (!held.stopped.get()) return@synchronized held.baseUrl
+            // 它已经关了：把这条死记录清掉，重新起一台。
+            PROXIES.remove(cfg.id, held)
+            close(held)
         }
         val fresh = openServer(cfg)
         PROXIES[cfg.id] = fresh
         fresh.baseUrl
     }
 
-    /** 放手一次；这是最后一次时关端口、停线程。 */
+    /**
+     * 放手：这一路代理没人要了 —— 关端口、停线程、**并把台账里的那条记录摘掉**。
+     *
+     * 原来只关不停：台账里那条记录还指着已经关掉的 `ServerSocket`，
+     * 下一个 acquire 会拿到一个死端口（见 [acquire]）。
+     */
     fun release(cfg: SourceConfig) = synchronized(lock) {
         val held = PROXIES[cfg.id] ?: return@synchronized
-        held.refs--
-        if (held.refs > 0) return@synchronized
+        // 先摘记录，再关：万一关的过程中有人来 acquire，拿到的就是新起的一台，
+        // 而不是一台正在被关掉的。
+        PROXIES.remove(cfg.id, held)
         close(held)
     }
 
@@ -90,16 +118,36 @@ object LocalKeyProxy {
     /** 测试用：直接给一个已起好的端口号，不起真 socket。 */
     internal fun baseUrlForTest(port: Int) = "http://127.0.0.1:$port"
 
+    /**
+     * 关掉一台代理：停标志、关 socket、停线程池。
+     *
+     * **顺带保证台账里不留死记录**：台账以 `cfg.id` 为键，而 [Held] 自己是知道
+     * 自己属于哪个源的，所以这里能把那条记录摘掉。
+     *
+     * 之所以在 [close] 里也做这件事，而不是只靠 [release] / [forget]：
+     * 关端口这件事有**好几个**入口（release、forget、acquire 发现它已经死了），
+     * 只要漏掉一个，台账里就会留下一条指着死端口的记录 —— 而台账
+     * （`PROXIES`）是「这个源现在有没有代理」的唯一事实来源，
+     * 留一条死记录就等于对外谎报。
+     */
     private fun close(held: Held) {
         held.stopped.set(true)
         runCatching { held.server.close() }
         held.pool.shutdownNow()
+        // 摘掉台账里指向它的记录（摘的是**它这一条**，别把新起的那台误摘）。
+        PROXIES.remove(held.cfg.id, held)
     }
 
     private val lock = Any()
     private val PROXIES = ConcurrentHashMap<String, Held>()
 
     private class Held(val server: ServerSocket, val cfg: SourceConfig) : Closeable {
+        /**
+         * 还有几个持有者。
+         *
+         * 现在**不参与**决定端口的生死（端口跟着源走，见 [acquire] / [release]），
+         * 但仍然记着：它是「有几路在用这个端口」的实况，排查端口占用时要看它。
+         */
         var refs: Int = 0
         val stopped = AtomicBoolean(false)
         lateinit var baseUrl: String

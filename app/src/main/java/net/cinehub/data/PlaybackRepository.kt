@@ -10,10 +10,13 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val Context.playbackStore by preferencesDataStore(name = "cinehub_playback")
 
@@ -33,6 +36,59 @@ class PlaybackRepository(private val context: Context) {
     private val keyAutoNextChosen = booleanPreferencesKey("auto_next_chosen_v1")
     private val keyResize = stringPreferencesKey("resize_mode_v1")
     private val keySkip = intPreferencesKey("skip_intro_outro_v1")
+
+    /**
+     * 这一份仓库退休了没有。
+     *
+     * 和 `WatchRepository` 同一个理由：[scope] 的根是 [SupervisorJob]，它**永远不会自己结束**，
+     * 不显式取消就等于每次 Activity 重建都留下一套还活着的协程。
+     */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * 这一份仓库退休：把还在跑的协程全停掉。
+     *
+     * 幂等：调几次都是同一个结果 —— [closed] 的 compareAndSet 只让第一次真正生效，
+     * `scope.cancel()` 对一个已取消的作用域再调一次也没有副作用。
+     *
+     * **关之前先把待写的落盘做掉**。这几份偏好（倍速、连播、画面比例、片头片尾）
+     * 每改一次都起一个写盘协程，而那一笔是异步的：用户在写盘落地之前退出应用，
+     * 这一档就跟着被取消的协程一起没了 —— 用户明明刚把倍速调到 1.5x，
+     * 下次进来又回到 1.0。
+     *
+     * 所以这里先同步落一次盘（见 [flushNow]），再取消作用域。
+     */
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        flushNow()
+        scope.cancel()
+    }
+
+    /**
+     * 立刻把内存里那几档偏好落盘，**等它真的落完才回来**。
+     *
+     * 和 `WatchRepository.flushNow` 同一个道理：关仓库时可能正有一笔写盘协程在飞，
+     * 把它取消掉就等于把这一档丢了。用 `runBlocking` 而不是 `scope.launch`：
+     * 后者是异步的，close 紧接着就把作用域取消了，那一笔多半还没开始跑就被取消掉。
+     * DataStore 内部自己走 Dispatchers.IO，不靠调用方的线程，所以不会死锁。
+     *
+     * 读盘还没回来之前**不写**（见 [loaded]）：内存这份还是默认值，
+     * 写下去就是拿默认值盖掉用户盘上已经挑好的那一档。
+     */
+    private fun flushNow() {
+        if (!loaded) return
+        runCatching {
+            runBlocking {
+                context.playbackStore.edit {
+                    it[keySpeed] = _speed.value
+                    it[keyAutoNext] = _autoNext.value
+                    it[keyAutoNextChosen] = true
+                    it[keyResize] = _resizeMode.value
+                    it[keySkip] = _skipSec.value
+                }
+            }
+        }
+    }
 
     private val _speed = MutableStateFlow(DEFAULT_SPEED)
 
@@ -138,6 +194,7 @@ class PlaybackRepository(private val context: Context) {
         val v = sanitize(value)
         loaded = true
         _speed.value = v
+        if (closed.get()) return
         scope.launch { runCatching { context.playbackStore.edit { it[keySpeed] = v } } }
     }
 
@@ -145,6 +202,7 @@ class PlaybackRepository(private val context: Context) {
     fun setAutoNext(value: Boolean) {
         loaded = true
         _autoNext.value = value
+        if (closed.get()) return
         scope.launch {
             runCatching {
                 context.playbackStore.edit {
@@ -162,6 +220,7 @@ class PlaybackRepository(private val context: Context) {
         val v = sanitizeResize(value)
         loaded = true
         _resizeMode.value = v
+        if (closed.get()) return
         scope.launch { runCatching { context.playbackStore.edit { it[keyResize] = v } } }
     }
 
@@ -177,6 +236,7 @@ class PlaybackRepository(private val context: Context) {
         val v = sanitizeSkip(value)
         loaded = true
         _skipSec.value = v
+        if (closed.get()) return
         scope.launch { runCatching { context.playbackStore.edit { it[keySkip] = v } } }
     }
 
