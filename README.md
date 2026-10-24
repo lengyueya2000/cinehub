@@ -16,7 +16,7 @@ Android 视频聚合播放器。核心产品逻辑只有一句话：**用户自�
 ```bash
 ./gradlew :app:assembleDebug        # 调试包
 ./gradlew :app:assembleRelease      # 发布包（需要签名凭据，见下）
-./gradlew :app:testDebugUnitTest    # 单元测试（约 258 例，不碰网络）
+./gradlew :app:testDebugUnitTest    # 单元测试（约 261 例，不碰网络）
 ```
 
 产物在 `app/build/outputs/apk/{debug,release}/`。
