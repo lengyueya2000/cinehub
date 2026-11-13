@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.media.AudioManager
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -974,12 +975,60 @@ fun PlayerScreen(
         activity?.window?.let { WindowCompat.getInsetsController(it, it.decorView) }
     }
 
+    /**
+     * 进小窗之前用户那一档全屏。
+     *
+     * 小窗里要借 `fullscreen = true` 把顶栏、右侧切源栏、选集抽屉全收掉（那颗窗只装画面），
+     * 但「借来的 true」不是用户要的形态 —— 出小窗时要按用户那一档把窗口重新立一遍，
+     * 而那时 [fullscreen] 可能还是借来的值。所以这一档单独记下来。
+     */
+    var fullscreenBeforePip by remember { mutableStateOf<Boolean?>(null) }
+
+    /**
+     * 窗口该按哪一档摆 —— 用户真正要的形态，不是小窗借用的那个。
+     *
+     * 抽成一个派生值而不是让两条 effect 各自去判：出小窗那一拍 [fullscreen] 还是借来的
+     * `true`，[fullscreenBeforePip] 才写着用户要什么；等小窗那条 effect 把借来的值还回去，
+     * 两者又一致。两条路读同一个数，就不会因为 effect 的启动先后不同而摆错一帧。
+     */
+    val windowFullscreen = fullscreenBeforePip ?: fullscreen
+
     // 全屏：横屏 + 隐藏系统栏 + 常亮。退出时逐项还原，不能只还原一半 ——
     // 否则从播放器返回后状态栏一直不回来，看起来像应用卡死了。
-    LaunchedEffect(fullscreen) {
+    //
+    // 键里必须带上 [inPip]。小窗一来一回**不改 fullscreen 的值**（进去借成 true、
+    // 出来再原样还回去，见下面那条 effect），只认 fullscreen 的话这里一次都不会重跑 ——
+    // 而进出小窗是把 Activity 塞进一颗系统小窗、再拽回全屏，窗口那一套（横屏、系统栏、
+    // 常亮）并不保证原样跟着回来。实测症状：在小窗里点「展开」回到应用，人是竖着回来的，
+    // 而 fullscreen 还是 true —— 状态与窗口对不上，接着点那颗「全屏」只会把它翻成 false，
+    // 越点越竖。带上 inPip 之后，出小窗那一刻这里会按 [windowFullscreen] 重新立一遍窗口状态。
+    //
+    // 小窗**期间**不动窗口：那颗窗的形状由系统按比例定（见 MainActivity.pipParams），
+    // 此刻去请求横屏只会跟它打架，而且系统在小窗里本来也不收这类请求。
+    LaunchedEffect(windowFullscreen, inPip) {
+        if (inPip) return@LaunchedEffect
         val a = activity ?: return@LaunchedEffect
-        if (fullscreen) {
-            a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        val target = if (windowFullscreen) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            // 回到竖屏用 PORTRAIT 而不是 UNSPECIFIED：模拟器上自动旋转关着时，
+            // UNSPECIFIED 会留在当前横屏不动，退出全屏看起来像没生效。
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+        // 实际屏幕方向与要的不一致时，光把 requestedOrientation 再写一遍是不够的：
+        // `setRequestedOrientation` 见值没变就当没这回事（小窗期间它就是横屏那档，
+        // 而小窗里系统并不认方向请求）—— 于是展开回来屏幕停在竖的、状态却写着全屏，
+        // 接着点那颗「全屏」只会把标志位翻成 false，越点越竖。
+        // 先把值挪到 UNSPECIFIED 再落回目标档，逼系统重新评估一次方向。
+        // 只在**真的不一致**时才走这一绕：正常点全屏 / 退出全屏时方向本来就要变，
+        // 那两档靠最后那句直接落下去，不会多出一次翻转。
+        val isLandscape =
+            a.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (windowFullscreen != isLandscape) {
+            a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        a.requestedOrientation = target
+        if (windowFullscreen) {
             insetsController?.apply {
                 systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -987,9 +1036,6 @@ fun PlayerScreen(
             }
             a.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
-            // 回到竖屏用 PORTRAIT 而不是 UNSPECIFIED：模拟器上自动旋转关着时，
-            // UNSPECIFIED 会留在当前横屏不动，退出全屏看起来像没生效。
-            a.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             insetsController?.show(WindowInsetsCompat.Type.systemBars())
             a.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             // 亮度交还给系统，否则退出播放器后整个手机都跟着变暗
@@ -1010,11 +1056,11 @@ fun PlayerScreen(
      * 小窗里只留画面。
      *
      * 不是一块一块去收：全屏那份开关本来就把顶栏、右侧竖排切源和下方选集抽屉全关掉了，
-     * 借它一次就够，出小窗再把用户刚才那一档原样还回去。
+     * 借它一次就够，出小窗再把用户刚才那一档原样还回去（[fullscreenBeforePip] 在
+     * 上面那条窗口 effect 旁边声明，两处共读同一份）。
      * 控件、浮层和手势反馈另收 —— 那颗小窗只收得到系统的拖动和关闭，
      * 在里面摆一颗点不动的「重试」比什么都不摆更骗人。
      */
-    var fullscreenBeforePip by remember { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(inPip) {
         if (inPip) {
             if (fullscreenBeforePip == null) fullscreenBeforePip = fullscreen
@@ -1330,8 +1376,13 @@ fun PlayerScreen(
             // ---------- 触屏锁：锁屏/解锁同一颗按钮 ----------
             //
             // 位置固定在画面右中：锁着的时候它是唯一还能点的东西（用户伸手就能摸到，
-            // 不必等控件弹出 —— 控件在锁定态根本不弹）；没锁的时候它是颗低调的图标，
-            // 点一下即锁。锁屏期间它不自动隐藏 —— 一隐藏就再没有人能打开这一屏。
+            // 不必等控件弹出 —— 控件在锁定态根本不弹）；锁屏期间它不自动隐藏 ——
+            // 一隐藏就再没有人能打开这一屏。
+            //
+            // **没锁时它跟着控件一起显隐**（screenLocked || controls）：常驻一颗锁形图标
+            // 白占着画面右中，而要点锁的人本来就刚碰过屏幕 —— 控件弹出来那一下
+            // （点画面、解锁、拖进度）它一并出现，3.5 秒不操作又随控件一起收回去。
+            // 锁定态不看 controls：那一态下控件被强制收起，图标一跟着收就把人锁死了。
             //
             // 小窗里不摆：那颗窗只有巴掌大，图标比画面还占地方；而小窗本来就是为了
             // 「盯着它」才开的，那种场合下锁不锁无差别。
@@ -1340,7 +1391,7 @@ fun PlayerScreen(
             // 底部控件不走 [controls] 那道闸（它们本来就该常驻），锁了也拦不住它们 ——
             // 半锁比不锁更骗人。而锁的场景（揣兜里、横着放）本来就只发生在全屏，
             // 竖屏预览是「正在用这台手机看详情」，不是口袋。
-            if (fullscreen && !inPip) {
+            if (fullscreen && !inPip && (screenLocked || controls)) {
                 // 这一颗要贴在**画面**的右中，不是整个 Box 的右中。
                 //
                 // 画面区收缩之后两者不再是同一个地方：Box 还撑着整块屏幕，而画面只占上面
